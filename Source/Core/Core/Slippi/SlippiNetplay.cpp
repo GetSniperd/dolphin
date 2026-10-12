@@ -1790,34 +1790,37 @@ SlippiDesyncRecoveryResp SlippiNetplayClient::GetDesyncRecoveryState()
 
     for (int j = 0; j < 4; j++)
     {
-      auto& fighter = result.state.fighters[i];
-      auto& i_fighter = s.fighters[i];
+      // merged_fighter starts as our own synced state for fighter j and ends up as the reconciled
+      // state that will be used for the recovery game. remote_fighter is what remote player i
+      // reported for that fighter
+      auto& merged_fighter = result.state.fighters[j];
+      auto& remote_fighter = s.fighters[j];
 
-      if (fighter.stocks_remaining != i_fighter.stocks_remaining)
+      if (merged_fighter.stocks_remaining != remote_fighter.stocks_remaining)
       {
         // This might actually happen sometimes if a desync happens right as someone is KO'd...
         // should be quite rare though in a 1v1 situation.
         ERROR_LOG_FMT(SLIPPI_ONLINE,
                       "Stocks remaining for desync recovery do not match: [Player {}] {}, {}",
-                      j + 1, fighter.stocks_remaining, i_fighter.stocks_remaining);
+                      j + 1, merged_fighter.stocks_remaining, remote_fighter.stocks_remaining);
         result.is_error = true;
         return result;
       }
 
-      if (abs(static_cast<int>(fighter.current_health) -
-              static_cast<int>(i_fighter.current_health)) > 25)
+      if (abs(static_cast<int>(merged_fighter.current_health) -
+              static_cast<int>(remote_fighter.current_health)) > 25)
       {
         ERROR_LOG_FMT(SLIPPI_ONLINE,
                       "Current health for desync recovery too different: [Player {}] {}, {}", j + 1,
-                      fighter.current_health, i_fighter.current_health);
+                      merged_fighter.current_health, remote_fighter.current_health);
         result.is_error = true;
         return result;
       }
 
       // Use the lower health value
-      if (i_fighter.current_health < fighter.current_health)
+      if (remote_fighter.current_health < merged_fighter.current_health)
       {
-        result.state.fighters[i].current_health = i_fighter.current_health;
+        merged_fighter.current_health = remote_fighter.current_health;
       }
     }
   }

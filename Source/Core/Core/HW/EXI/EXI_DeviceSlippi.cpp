@@ -2526,12 +2526,10 @@ void CEXISlippi::prepareOnlineMatchState()
       alt_stage_mode = 0;
     }
 
-    // Handle desync recovery. The default values in desync_recovery.state are 480 seconds (8 min
-    // timer) and 4-stock/0 percent damage for the fighters. That means if we are not in a desync
-    // recovery state, the state of the timer and fighters will be restored to the defaults
-    u32* seconds_remaining = reinterpret_cast<u32*>(&online_match_block[0x10]);
-    *seconds_remaining = Common::swap32(desync_recovery.state.seconds_remaining);
-
+    // Handle desync recovery. The default values in desync_recovery.state are 4-stock/0 percent
+    // damage for the fighters. That means if we are not in a desync recovery state, the state of
+    // the fighters will be restored to the defaults. The timer is handled further down, after the
+    // mode's default timer is set
     for (int i = 0; i < 4; i++)
     {
       online_match_block[0x62 + i * 0x24] = desync_recovery.state.fighters[i].stocks_remaining;
@@ -2558,6 +2556,14 @@ void CEXISlippi::prepareOnlineMatchState()
     online_match_block[0x3] = 0x4C;  // Hide score UI
     u32* match_timer = reinterpret_cast<u32*>(&online_match_block[0x10]);
     *match_timer = Common::swap32(8 * 60);  // 8 Minute timer
+  }
+
+  // Restore the timer if recovering from a desync. This must happen after the mode configuration
+  // above, which sets the default timer and would otherwise reset the clock on every desync
+  if (desync_recovery.is_recovering && local_player_ready && remote_players_ready)
+  {
+    u32* seconds_remaining = reinterpret_cast<u32*>(&online_match_block[0x10]);
+    *seconds_remaining = Common::swap32(desync_recovery.state.seconds_remaining);
   }
 
   // Configure items. Have to reset things when there are no items.
