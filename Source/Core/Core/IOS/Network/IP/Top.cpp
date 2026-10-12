@@ -733,7 +733,7 @@ IPCReply NetIPTopDevice::HandleGetSockNameRequest(const IOCtlRequest& request)
 
   request.Log(GetDeviceName(), Common::Log::LogType::IOS_WC24);
 
-  sockaddr sa;
+  sockaddr sa{};
   socklen_t sa_len = sizeof(sa);
   const int ret =
       getsockname(GetEmulationKernel().GetSocketManager()->GetHostSocket(fd), &sa, &sa_len);
@@ -761,7 +761,7 @@ IPCReply NetIPTopDevice::HandleGetPeerNameRequest(const IOCtlRequest& request)
 
   u32 fd = memory.Read_U32(request.buffer_in);
 
-  sockaddr sa;
+  sockaddr sa{};
   socklen_t sa_len = sizeof(sa);
   const int ret =
       getpeername(GetEmulationKernel().GetSocketManager()->GetHostSocket(fd), &sa, &sa_len);
