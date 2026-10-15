@@ -1,0 +1,67 @@
+# Windows build of the Rev3 rollback fork of Slippi's Dolphin (docs/rollback_fork_plan.md). This file lives in rev3-mod
+# (fork/workflows/) and is copied to .github/workflows/rev3-windows.yml on the fork's rev3 branch (GetSniperd's fork of
+# project-slippi/dolphin). It is Slippi's own Windows job (.github/workflows/main.yml, job "windows", Netplay only) without the
+# duplicate-skip, code signing and Playback build: one job, about 40-60 minutes on windows-2022, free on a public fork.
+# Result: the run's "rev3-dolphin-windows" artifact, a zip with Slippi_Dolphin.exe + Sys (portable.txt included, so it keeps its
+# settings in its own folder). Download it from the run's page on GitHub (Actions tab).
+# Change: the branches below if the fork's work branch is renamed; build_config for a Debug build (-DCMAKE_BUILD_TYPE="Debug").
+name: Rev3 Windows build
+
+on:
+  push:
+    branches: ["rev3", "rev3-*"]
+  workflow_dispatch:
+
+concurrency:
+  group: rev3-windows-${{ github.ref }}
+  cancel-in-progress: true          # a newer push replaces a running build
+
+jobs:
+  windows:
+    name: "Windows Netplay (Rev3)"
+    runs-on: windows-2022
+    env:
+      BUILD_CONFIG: -G "Ninja" -DCMAKE_BUILD_TYPE="Release" -DSLIPPI_PLAYBACK=false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - id: rust_ver
+        name: Rust version pinned by SlippiRustExtensions
+        shell: bash
+        run: echo "rust_ver=$(sed -rn 's/^channel = "(.*)"/\1/p' ./Externals/SlippiRustExtensions/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ steps.rust_ver.outputs.rust_ver }}
+          rustflags: ""
+      - name: Version strings
+        shell: bash
+        run: |
+          git fetch --prune --unshallow --tags || git fetch --tags
+          echo "GIT_HASH=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          echo "CURR_DATE=$(date +%Y-%m-%d)" >> $GITHUB_ENV
+      - uses: egor-tensin/vs-shell@v2
+      - name: Build
+        shell: cmd
+        run: |
+          mkdir build
+          cd build
+          cmake %BUILD_CONFIG% ..
+          cmake --build . --target dolphin-emu
+      - name: Package
+        shell: pwsh
+        run: |
+          Xcopy /Y /E /I .\Data\Sys .\Binary\x64\Sys
+          $name = "${{ env.CURR_DATE }}-${{ env.GIT_HASH }}-rev3-dolphin-windows.zip"
+          mkdir artifact
+          cd .\Binary\x64\
+          fsutil file createnew portable.txt 0
+          7z a $name .\*
+          move $name ..\..\artifact\
+      - name: Publish
+        uses: actions/upload-artifact@v4
+        with:
+          name: rev3-dolphin-windows
+          path: ./artifact/
