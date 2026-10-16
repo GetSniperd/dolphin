@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -80,6 +81,17 @@ public:
   {
     const u8 b[4] = {u8(v >> 24), u8(v >> 16), u8(v >> 8), u8(v)};
     Write(addr, b, 4);
+  }
+  u32 U16(u32 addr) const
+  {
+    u8 b[2] = {};
+    Read(addr, b, 2);
+    return (u32(b[0]) << 8) | b[1];
+  }
+  void SetU16(u32 addr, u32 v)
+  {
+    const u8 b[2] = {u8(v >> 8), u8(v)};
+    Write(addr, b, 2);
   }
 
 private:
@@ -331,8 +343,14 @@ public:
   // From this frame on every frame writes one constant word into a new page: LATE_WALK + (frame - from) * stride.
   void SetWalker(u32 from_frame, u32 stride) { m_walk_from = from_frame, m_walk_stride = stride; }
 
+  // Called at the start of every game step with the frame being simulated (also for replayed frames): extra game state, deterministic
+  // in the frame number and the memory.
+  void SetStepHook(std::function<void(FakeMemory&, u32)> hook) { m_step_hook = std::move(hook); }
+
   void Step(const std::array<PadBytes, 2>& pads)
   {
+    if (m_step_hook)
+      m_step_hook(m_mem, m_counter);
     if (m_quiet)
       return;
     if (m_late_page_from != 0 && m_counter >= m_late_page_from)
@@ -368,6 +386,7 @@ private:
   bool m_leak;
   u32 m_late_from;
   bool m_quiet = false;
+  std::function<void(FakeMemory&, u32)> m_step_hook;
   u32 m_late_page_from = 0;
   u32 m_walk_from = 0;
   u32 m_walk_stride = 0;
@@ -384,6 +403,166 @@ private:
   u32 m_hw_ticks = 0;
   bool m_hw_word_intact = true;
   int m_restores_seen = 0;
+};
+
+// A synthetic nw4r::ef image, laid out the way FindEfPool / CheckEfLists read it (all addresses and offsets from Rev3Rollback.h): the
+// EffectSystem singleton with the manager pointer and the activity groups, the manager (heap bounds, pool counts, pool objects), one
+// object array per pool allocated from the heap, intrusive lists with the nw4r::ut::List semantics (Remove clears the node's links),
+// and the handle table behind the heap. It is built in a FakeMemory, so tests can break it byte by byte.
+class FakeEf
+{
+public:
+  static constexpr u32 kEffects = 4;
+  static constexpr u32 kEmitters = 4;
+  static constexpr u32 kPms = 4;
+  static constexpr u32 kParticles = 40;
+  static constexpr u32 kStride[4] = {0xA0, 0x154, 0xBC, 0xE4};
+  static constexpr u32 kCounts[4] = {kEffects, kEmitters, kPms, kParticles};
+
+  explicit FakeEf(FakeMemory& mem, u32 mm = 0x80B00000, u32 heap_size = 0x40000, u32 groups = 1) : m_mem(mem), m_mm(mm)
+  {
+    m_heap_start = mm + 0x40;
+    m_heap_end = m_heap_start + heap_size;
+    m_next = m_heap_start;
+    mem.SetU32(EF_SYSTEM_ADDR, mm);
+    mem.SetU32(EF_BLOCK_GLOBAL, mm);
+    mem.SetU32(mm + EF_MM_HEAP_START, m_heap_start);
+    mem.SetU32(mm + EF_MM_HEAP_END, m_heap_end);
+    mem.SetU32(EF_HANDLE_TABLE_GLOBAL, m_heap_end);  // the handle table follows the heap, inside the allocation's tail
+    mem.SetU32(EF_SYSTEM_ADDR + 0xC014, groups);
+    m_activity = Alloc(groups * 0x1C);
+    mem.SetU32(EF_SYSTEM_ADDR + 0xC018, m_activity);
+    for (u32 g = 0; g < groups; ++g)
+    {
+      ListInit(m_activity + g * 0x1C, 0x14);
+      ListInit(m_activity + g * 0x1C + 0xC, 0x14);
+    }
+    for (u32 k = 0; k < 4; ++k)
+      m_pool[k] = Alloc(0x24);  // the four pool objects first: they share the heap's first page with the manager's other bookkeeping
+    for (u32 k = 0; k < 4; ++k)
+    {
+      m_array[k] = Alloc(kStride[k] * kCounts[k]);
+      mem.SetU32(mm + EF_MM_COUNTS[k], kCounts[k]);
+      mem.SetU32(mm + EF_MM_POOLS[k], m_pool[k]);
+      mem.SetU32(m_pool[k], m_array[k]);
+      ListInit(m_pool[k] + 4, 0);     // free
+      ListInit(m_pool[k] + 0x10, 0);  // in use
+      mem.SetU32(m_pool[k] + 0x1C, kStride[k]);
+      for (u32 i = 0; i < kCounts[k]; ++i)
+        Append(m_pool[k] + 4, m_array[k] + i * kStride[k]);
+    }
+  }
+
+  u32 Alloc(u32 size)
+  {
+    const u32 at = m_next;
+    m_next += (size + 0x1F) & ~0x1Fu;
+    EXPECT_LE(m_next, m_heap_end);
+    return at;
+  }
+  void ListInit(u32 list, u32 offset)
+  {
+    m_mem.SetU32(list, 0);
+    m_mem.SetU32(list + 4, 0);
+    m_mem.SetU16(list + 8, 0);
+    m_mem.SetU16(list + 0xA, offset);
+  }
+  u32 Head(u32 list) const { return m_mem.U32(list); }
+  u32 Tail(u32 list) const { return m_mem.U32(list + 4); }
+  u32 Count(u32 list) const { return m_mem.U16(list + 8); }
+  u32 Next(u32 list, u32 node) const { return m_mem.U32(node + m_mem.U16(list + 0xA) + 4); }
+  void Append(u32 list, u32 node)
+  {
+    const u32 off = m_mem.U16(list + 0xA);
+    const u32 tail = Tail(list);
+    m_mem.SetU32(node + off, tail);
+    m_mem.SetU32(node + off + 4, 0);
+    if (tail != 0)
+      m_mem.SetU32(tail + off + 4, node);
+    else
+      m_mem.SetU32(list, node);
+    m_mem.SetU32(list + 4, node);
+    m_mem.SetU16(list + 8, Count(list) + 1);
+  }
+  void Remove(u32 list, u32 node)
+  {
+    const u32 off = m_mem.U16(list + 0xA);
+    const u32 prev = m_mem.U32(node + off);
+    const u32 next = m_mem.U32(node + off + 4);
+    if (prev != 0)
+      m_mem.SetU32(prev + off + 4, next);
+    else
+      m_mem.SetU32(list, next);
+    if (next != 0)
+      m_mem.SetU32(next + off, prev);
+    else
+      m_mem.SetU32(list + 4, prev);
+    m_mem.SetU32(node + off, 0);
+    m_mem.SetU32(node + off + 4, 0);
+    m_mem.SetU16(list + 8, Count(list) - 1);
+  }
+  // Takes the first free object of pool k (0 effect, 1 emitter, 2 pm, 3 particle), moves it to the in-use list and returns it.
+  u32 AllocObject(u32 k)
+  {
+    const u32 node = Head(m_pool[k] + 4);
+    if (node == 0)
+      return 0;
+    Remove(m_pool[k] + 4, node);
+    Append(m_pool[k] + 0x10, node);
+    return node;
+  }
+  // The usual chain: effect in group 0, emitter in the effect, pm in the emitter, `particles` particles in the pm. Returns the pm.
+  u32 BuildChain(u32 particles)
+  {
+    m_effect = AllocObject(0);
+    Append(m_activity, m_effect);
+    ListInit(m_effect + 0x24, 0x14);
+    ListInit(m_effect + 0x30, 0x14);
+    m_emitter = AllocObject(1);
+    Append(m_effect + 0x24, m_emitter);
+    ListInit(m_emitter + 0xC0, 0x14);
+    ListInit(m_emitter + 0xCC, 0x14);
+    m_pm = AllocObject(2);
+    Append(m_emitter + 0xC0, m_pm);
+    ListInit(m_pm + 0x38, 0x14);
+    ListInit(m_pm + 0x44, 0x14);
+    for (u32 i = 0; i < particles; ++i)
+      Append(m_pm + 0x38, AllocObject(3));
+    return m_pm;
+  }
+  // The game allocates one more particle into the pm's list: free list -> in-use list and the pm's list (what CreateParticle does).
+  u32 CreateParticle()
+  {
+    const u32 node = AllocObject(3);
+    if (node != 0)
+      Append(m_pm + 0x38, node);
+    return node;
+  }
+
+  u32 mm() const { return m_mm; }
+  u32 heap_start() const { return m_heap_start; }
+  u32 heap_end() const { return m_heap_end; }
+  u32 activity() const { return m_activity; }
+  u32 pool(u32 k) const { return m_pool[k]; }
+  u32 array(u32 k) const { return m_array[k]; }
+  u32 effect() const { return m_effect; }
+  u32 emitter() const { return m_emitter; }
+  u32 pm() const { return m_pm; }
+  u32 particles_list() const { return m_pm + 0x38; }
+  u32 particle(u32 i) const { return m_array[3] + i * kStride[3]; }
+
+private:
+  FakeMemory& m_mem;
+  u32 m_mm;
+  u32 m_heap_start = 0;
+  u32 m_heap_end = 0;
+  u32 m_next = 0;
+  u32 m_activity = 0;
+  std::array<u32, 4> m_array{};
+  std::array<u32, 4> m_pool{};
+  u32 m_effect = 0;
+  u32 m_emitter = 0;
+  u32 m_pm = 0;
 };
 
 SyncTestOptions Options(int k, int every = 1)
@@ -2886,6 +3065,93 @@ TEST(Rev3Rollback, NetModeLearnedPagesAreDeferredUntilTheNextClear)
   EXPECT_TRUE(rig.test.NetRestore(f + 1));
 }
 
+TEST(Rev3Rollback, NetPrepareArmForcesTheEfPoolAndLogsIt)
+{
+  NetRig rig(AdaptiveOptions(6));
+  FakeEf ef(rig.game.Mem());
+  ef.BuildChain(3);
+  u32 f = 1000;
+  for (int i = 0; i < 330; ++i, ++f)  // a learning phase in which nothing in the ef pool ever changes
+  {
+    rig.Observe(f);
+    rig.Advance(f);
+  }
+  ASSERT_TRUE(rig.test.NetPrepareArm());
+  EXPECT_TRUE(rig.test.EfPoolFound());
+  EXPECT_TRUE(rig.sink.Contains("NOTE ef pool 0x80B00000-"));
+  EXPECT_FALSE(rig.sink.Contains("NOTE ef pool not found"));
+  ASSERT_FALSE(rig.test.EfPoolInfo().ranges.empty());
+  for (const Range& r : rig.test.EfPoolInfo().ranges)
+    EXPECT_TRUE(SetContains(rig.test.Ranges(), r.start, r.end - r.start)) << std::hex << r.start;
+  EXPECT_TRUE(SetContains(rig.test.Ranges(), 0x80B00040 + 0x20000));  // a heap page nothing wrote: only the forced range has it
+}
+
+TEST(Rev3Rollback, NetPrepareArmSaysWhyTheEfPoolIsMissingAndOffSwitchWorks)
+{
+  {
+    NetRig rig(AdaptiveOptions(6));  // no EffectSystem in this memory
+    for (u32 f = 1000; f < 1330; ++f)
+    {
+      rig.Observe(f);
+      rig.Advance(f);
+    }
+    ASSERT_TRUE(rig.test.NetPrepareArm());
+    EXPECT_FALSE(rig.test.EfPoolFound());
+    EXPECT_TRUE(rig.sink.Contains("NOTE ef pool not found: "));
+  }
+  {
+    SyncTestOptions o = AdaptiveOptions(6);
+    o.ef_pool = false;
+    NetRig rig(o);
+    FakeEf ef(rig.game.Mem());
+    for (u32 f = 1000; f < 1330; ++f)
+    {
+      rig.Observe(f);
+      rig.Advance(f);
+    }
+    ASSERT_TRUE(rig.test.NetPrepareArm());
+    EXPECT_TRUE(rig.sink.Contains("NOTE ef pool off"));
+    EXPECT_FALSE(SetContains(rig.test.Ranges(), 0x80B00040 + 0x20000));
+  }
+}
+
+TEST(Rev3Rollback, NetModeRestoreWithAPendingSetIsCountedAndTheStatsLineCarriesTheEfCounters)
+{
+  NetRig rig(AdaptiveOptions(6));
+  u32 f = 1000;
+  for (int i = 0; i < 330; ++i, ++f)
+  {
+    rig.Observe(f);
+    rig.Advance(f);
+  }
+  ASSERT_TRUE(rig.test.NetPrepareArm());
+  rig.game.Mem().SetU32(LATE_PAGE, 1);
+  bool pending = false;
+  for (int i = 0; i < 600 && !pending; ++i, ++f)
+  {
+    if (i != 0)
+      rig.Observe(f);
+    ASSERT_TRUE(rig.Capture(f));
+    rig.Advance(f, true);
+    pending = rig.test.NetLayoutPending();
+  }
+  ASSERT_TRUE(pending);
+  rig.Observe(f);
+  ASSERT_TRUE(rig.Capture(f));
+  ASSERT_TRUE(rig.test.NetRestore(f));
+  EXPECT_EQ(rig.test.Stats().late_learn_rollbacks, 1u);
+  const std::string line = rig.test.NetStatsLine();
+  EXPECT_NE(line.find("restores_with_pending_set=1"), std::string::npos) << line;
+  EXPECT_NE(line.find("ef_bad=0"), std::string::npos) << line;
+  EXPECT_NE(line.find("layout_refused=0"), std::string::npos) << line;
+  rig.test.NetClear();
+  rig.Observe(f + 1);
+  ASSERT_TRUE(rig.Capture(f + 1));
+  const u32 before = rig.test.Stats().late_learn_rollbacks;
+  ASSERT_TRUE(rig.test.NetRestore(f + 1));
+  EXPECT_EQ(rig.test.Stats().late_learn_rollbacks, before);  // the set is current again: sound
+}
+
 TEST(Rev3Rollback, NetModeResimulatedCallsAreNotScanned)
 {
   NetRig rig(AdaptiveOptions(6));
@@ -3621,4 +3887,543 @@ TEST(Rev3Rollback, FreezeDumpShowsTheWordsAroundTheDvdAndStreamQueuesAndTheExtra
   EXPECT_TRUE(HasLine(lines, "hw di fake racy"));
   EXPECT_TRUE(HasLine(dump.Lines(false, false), "hw di fake"));
   EXPECT_FALSE(HasLine(dump.Lines(false, false), "fake racy"));
+}
+
+// ---- the nw4r::ef effect pool: range computation, inclusion file, list check, forced inclusion, EFCHECK ------------------------------
+
+TEST(Rev3Rollback, EfPoolRangesComeFromTheEffectSystemSingleton)
+{
+  FakeMemory mem;
+  FakeEf ef(mem);
+  ef.BuildChain(3);
+  EfPool pool;
+  std::string why;
+  ASSERT_TRUE(FindEfPool(mem, &pool, &why)) << why;
+  EXPECT_EQ(pool.mm, 0x80B00000u);
+  EXPECT_EQ(pool.heap_start, 0x80B00040u);
+  EXPECT_EQ(pool.heap_end, 0x80B00040u + 0x40000u);
+  EXPECT_EQ(pool.counts[0], FakeEf::kEffects);
+  EXPECT_EQ(pool.counts[1], FakeEf::kEmitters);
+  EXPECT_EQ(pool.counts[2], FakeEf::kPms);
+  EXPECT_EQ(pool.counts[3], FakeEf::kParticles);
+  // The allocation: mm .. heap end + the 0xC20 tail (handle table and slack), widened to pages.
+  EXPECT_EQ(pool.main.start, 0x80B00000u);
+  EXPECT_EQ(pool.main.end, 0x80B41000u);
+  // Plus the singleton itself (0x803D9588 + 0xC070, widened).
+  ASSERT_EQ(pool.ranges.size(), 2u);
+  EXPECT_EQ(pool.ranges[0].start, 0x803D9000u);
+  EXPECT_EQ(pool.ranges[0].end, 0x803E6000u);
+  EXPECT_EQ(pool.ranges[1].start, pool.main.start);
+  EXPECT_EQ(pool.ranges[1].end, pool.main.end);
+  EXPECT_EQ(pool.bytes, (0x803E6000u - 0x803D9000u) + (0x80B41000u - 0x80B00000u));
+  for (const Range& r : pool.ranges)
+  {
+    EXPECT_EQ(r.start % PAGE_SIZE, 0u);
+    EXPECT_EQ(r.end % PAGE_SIZE, 0u);
+  }
+  EXPECT_NE(pool.detail.find("instance=0x803D9000-0x803E6000"), std::string::npos) << pool.detail;
+  EXPECT_NE(pool.detail.find("handle_table=0x80B40040(inside the block)"), std::string::npos) << pool.detail;
+  EXPECT_NE(pool.detail.find("handle_pool0=none"), std::string::npos) << pool.detail;
+}
+
+TEST(Rev3Rollback, EfPoolRangeIsClippedToTheRegionAndTakesTheHandlePools)
+{
+  FakeMemory mem;
+  FakeEf ef(mem, 0x817E0000, 0x1FF00);  // heap end 0x817FFF40: the tail runs past the end of MEM1
+  EfPool pool;
+  std::string why;
+  ASSERT_TRUE(FindEfPool(mem, &pool, &why)) << why;
+  EXPECT_EQ(pool.main.end, 0x81800000u);
+  EXPECT_EQ(pool.heap_end, 0x817FFF40u);
+
+  // A handle pool outside the block: {free, first, n = 4, payload = 0x20} = 0x10 + 4 * 0x24 bytes.
+  mem.SetU32(EF_HANDLE_POOL_GLOBALS[0], 0x80C20F80);
+  mem.SetU32(0x80C20F80 + 8, 4);
+  mem.SetU32(0x80C20F80 + 0xC, 0x20);
+  // A second one with n = 0 does not validate.
+  mem.SetU32(EF_HANDLE_POOL_GLOBALS[1], 0x80C30000);
+  ASSERT_TRUE(FindEfPool(mem, &pool, &why)) << why;
+  EXPECT_TRUE(SetContains(pool.ranges, 0x80C20F80, 0x10 + 4 * 0x24));  // crosses a page border: both pages
+  EXPECT_TRUE(SetContains(pool.ranges, 0x80C21000));
+  EXPECT_FALSE(SetContains(pool.ranges, 0x80C30000));
+  EXPECT_NE(pool.detail.find("handle_pool0=0x80C20F80(n=4,payload=0x20)"), std::string::npos) << pool.detail;
+  EXPECT_NE(pool.detail.find("handle_pool1=none"), std::string::npos) << pool.detail;
+
+  // The handle table pointer elsewhere: its own pages.
+  mem.SetU32(EF_HANDLE_TABLE_GLOBAL, 0x80C40010);
+  ASSERT_TRUE(FindEfPool(mem, &pool, &why)) << why;
+  EXPECT_TRUE(SetContains(pool.ranges, 0x80C40010, EF_HANDLE_TABLE_BYTES));
+  EXPECT_EQ(pool.detail.find("(inside the block)"), std::string::npos) << pool.detail;
+}
+
+TEST(Rev3Rollback, EfPoolIsNotFoundWhenTheEffectSystemIsNotSetUp)
+{
+  EfPool pool;
+  std::string why;
+  {
+    FakeMemory mem;  // all zero: the singleton has no manager yet
+    EXPECT_FALSE(FindEfPool(mem, &pool, &why));
+    EXPECT_NE(why.find("0x803D9588 is 0"), std::string::npos) << why;
+  }
+  {
+    FakeMemory mem;
+    mem.SetU32(EF_SYSTEM_ADDR, 0x80B00010);  // not 32-byte aligned
+    EXPECT_FALSE(FindEfPool(mem, &pool, &why));
+    EXPECT_NE(why.find("32-byte aligned"), std::string::npos) << why;
+    mem.SetU32(EF_SYSTEM_ADDR, 0x12345600);  // not guest RAM
+    EXPECT_FALSE(FindEfPool(mem, &pool, &why));
+    EXPECT_NE(why.find("MEM1 / MEM2"), std::string::npos) << why;
+  }
+  {
+    FakeMemory mem;
+    mem.SetU32(EF_SYSTEM_ADDR, 0x80B00000);  // a manager whose heap fields are zero
+    EXPECT_FALSE(FindEfPool(mem, &pool, &why));
+    EXPECT_NE(why.find("implausible heap"), std::string::npos) << why;
+    mem.SetU32(0x80B00000 + EF_MM_HEAP_START, 0x80B00040);
+    mem.SetU32(0x80B00000 + EF_MM_HEAP_END, 0x80B00040 + 0x4000000);  // 64 MB: far too big, and past MEM1
+    EXPECT_FALSE(FindEfPool(mem, &pool, &why));
+    EXPECT_NE(why.find("implausible heap"), std::string::npos) << why;
+  }
+  EXPECT_TRUE(pool.ranges.empty());
+}
+
+TEST(Rev3Rollback, InclusionFileTakesTheSameEntriesAsTheExclusionFile)
+{
+  FakeSink sink;
+  std::vector<Range> fixed;
+  std::vector<PtrExclusion> ptrs;
+  std::string error;
+  ASSERT_TRUE(LoadInclusions(R"({"ranges":[{"start":"0x80700000","end":"0x80701000"},
+      {"ptr":"0x8049D000","size":"0x3F0000","note":"snd"},{"start":2415919104,"end":"0x90001000"}]})",
+                             sink, &fixed, &ptrs, &error))
+      << error;
+  ASSERT_EQ(fixed.size(), 2u);
+  EXPECT_EQ(fixed[0].start, 0x80700000u);
+  EXPECT_EQ(fixed[0].end, 0x80701000u);
+  EXPECT_EQ(fixed[1].start, 0x90000000u);
+  EXPECT_EQ(fixed[1].end, 0x90001000u);
+  ASSERT_EQ(ptrs.size(), 1u);
+  EXPECT_EQ(ptrs[0].ptr, 0x8049D000u);
+  EXPECT_EQ(ptrs[0].size, 0x3F0000u);
+  EXPECT_EQ(ptrs[0].note, "snd");
+  EXPECT_TRUE(sink.Contains("NOTE include user 0x80700000-0x80701000 (4096 bytes"));
+  EXPECT_TRUE(sink.Contains("NOTE include user 0x90000000-0x90001000 (4096 bytes"));
+  EXPECT_TRUE(sink.Contains("NOTE include ptr entry 0x8049D000 size=0x3F0000 note=snd"));
+
+  const char* const bad[] = {
+      "not json",
+      R"({"ranges":[]})",
+      R"({"nothing":1})",
+      R"({"ranges":[{"start":"0x00001000","end":"0x00002000"}]})",                       // not guest RAM
+      R"({"ranges":[{"start":"0x80000200","end":"0x80000100"}]})",                       // backwards
+      R"({"ranges":[{"ptr":"0x8049D000"}]})",                                            // no size
+      R"({"ranges":[{"ptr":"0x00001000","size":"0x100"}]})",                             // pointer outside guest RAM
+      R"({"ranges":[{"ptr":"0x8049D000","size":0}]})",                                   // empty
+  };
+  for (const char* text : bad)
+  {
+    FakeSink quiet;
+    std::vector<Range> f = {{1, 2}};
+    std::vector<PtrExclusion> p;
+    error.clear();
+    EXPECT_FALSE(LoadInclusions(text, quiet, &f, &p, &error)) << text;
+    EXPECT_FALSE(error.empty()) << text;
+    EXPECT_TRUE(quiet.lines.empty()) << text;  // nothing logged for a file that is refused
+    ASSERT_EQ(f.size(), 1u) << text;           // outputs untouched
+    EXPECT_EQ(f[0].start, 1u) << text;
+  }
+}
+
+TEST(Rev3Rollback, EfCheckAcceptsAConsistentImageAndCountsWhatItWalked)
+{
+  FakeMemory mem;
+  FakeEf ef(mem);
+  ef.BuildChain(5);
+  const EfCheckResult r = CheckEfLists(mem);
+  EXPECT_TRUE(r.ran);
+  EXPECT_TRUE(r.ok) << r.list << " " << r.why;
+  EXPECT_EQ(r.objects[0], 1u);
+  EXPECT_EQ(r.objects[1], 1u);
+  EXPECT_EQ(r.objects[2], 1u);
+  EXPECT_EQ(r.objects[3], 5u);
+  // Lists: 2 per group + 2 per effect + 2 per emitter + 2 per pm + 2 per pool (free, in use) = 2 + 2 + 2 + 2 + 8.
+  EXPECT_EQ(r.lists, 16u);
+  // Nodes: the chain (1 + 1 + 1 + 5) plus every pool object once, in its free or in-use list (4 + 4 + 4 + 40).
+  EXPECT_EQ(r.nodes, 8u + 52u);
+
+  // An effect system that is not set up is not an error, there is just nothing to check.
+  FakeMemory empty;
+  const EfCheckResult none = CheckEfLists(empty);
+  EXPECT_FALSE(none.ran);
+  EXPECT_TRUE(none.ok);
+}
+
+TEST(Rev3Rollback, EfCheckNamesTheBrokenListAndNode)
+{
+  struct Case
+  {
+    const char* name;
+    std::function<void(FakeMemory&, FakeEf&)> damage;
+    const char* list;  // prefix of the failing list's name
+    const char* why;   // substring of the reason
+    u32 list_cap;
+  };
+  const Case cases[] = {
+      {"cycle back to the head",
+       [](FakeMemory& m, FakeEf& e) { m.SetU32(e.particle(4) + 0x14 + 4, e.particle(0)); },
+       "particles@pm=", "prev link is 0x00000000, expected", EF_CHECK_LIST_CAP},
+      {"wrong prev link", [](FakeMemory& m, FakeEf& e) { m.SetU32(e.particle(2) + 0x14, 0xDEADBEEF); }, "particles@pm=", "prev link is 0xDEADBEEF",
+       EF_CHECK_LIST_CAP},
+      {"count too big", [](FakeMemory& m, FakeEf& e) { m.SetU16(e.particles_list() + 8, 7); }, "particles@pm=", "walked 5 nodes but the count says 7",
+       EF_CHECK_LIST_CAP},
+      {"tail is not the last node", [](FakeMemory& m, FakeEf& e) { m.SetU32(e.particles_list() + 4, e.particle(2)); }, "particles@pm=",
+       "but the tail is", EF_CHECK_LIST_CAP},
+      {"link into stale memory outside the heap", [](FakeMemory& m, FakeEf& e) { m.SetU32(e.particle(1) + 0x14 + 4, 0x80100000); }, "particles@pm=",
+       "outside the ef heap", EF_CHECK_LIST_CAP},
+      {"wrong list offset", [](FakeMemory& m, FakeEf& e) { m.SetU16(e.particles_list() + 0xA, 0x10); }, "particles@pm=", "list offset is 0x10, expected 0x14",
+       EF_CHECK_LIST_CAP},
+      {"count 0 with a head", [](FakeMemory& m, FakeEf& e) { m.SetU16(e.particles_list() + 8, 0); }, "particles@pm=", "empty and non-empty",
+       EF_CHECK_LIST_CAP},
+      {"list longer than the cap", [](FakeMemory&, FakeEf&) {}, "particles@pm=", "more than 3 nodes", 3},
+      {"free list of the particle pool loops", [](FakeMemory& m, FakeEf& e) { m.SetU32(e.particle(7) + 4, e.particle(7)); }, "pool_free[particle]",
+       "prev link", EF_CHECK_LIST_CAP},
+      {"emitter list of the effect points at a particle", [](FakeMemory& m, FakeEf& e) { m.SetU32(e.effect() + 0x24, e.particle(3)); },
+       "emitters@effect=", "", EF_CHECK_LIST_CAP},
+      {"activity group count is garbage", [](FakeMemory& m, FakeEf&) { m.SetU32(EF_SYSTEM_ADDR + 0xC014, 1000); }, "EffectSystem", "activity groups",
+       EF_CHECK_LIST_CAP},
+      {"manager without a heap", [](FakeMemory& m, FakeEf& e) { m.SetU32(e.mm() + EF_MM_HEAP_END, 0); }, "EffectSystem", "no usable heap",
+       EF_CHECK_LIST_CAP},
+  };
+  for (const Case& c : cases)
+  {
+    FakeMemory mem;
+    FakeEf ef(mem);
+    ef.BuildChain(5);
+    c.damage(mem, ef);
+    const EfCheckResult r = CheckEfLists(mem, c.list_cap);
+    EXPECT_TRUE(r.ran) << c.name;
+    EXPECT_FALSE(r.ok) << c.name;
+    EXPECT_EQ(r.list.rfind(c.list, 0), 0u) << c.name << ": " << r.list;
+    EXPECT_NE(r.why.find(c.why), std::string::npos) << c.name << ": " << r.why;
+  }
+  // The node is named too: a link into stale memory names the stale address; a prev mismatch names the node whose link is wrong.
+  FakeMemory mem;
+  FakeEf ef(mem);
+  ef.BuildChain(5);
+  mem.SetU32(ef.particle(2) + 0x14, 0xDEADBEEF);
+  const EfCheckResult r = CheckEfLists(mem);
+  EXPECT_EQ(r.node, ef.particle(2));
+  EXPECT_EQ(r.list_addr, ef.particles_list());
+  char name[64];
+  std::snprintf(name, sizeof(name), "particles@pm=0x%08X", ef.pm());
+  EXPECT_EQ(r.list, name);
+}
+
+TEST(Rev3Rollback, EfDumpLinesShowTheSingletonTheHeadsAndTheCheck)
+{
+  FakeMemory mem;
+  {
+    const std::vector<std::string> lines = EfDumpLines(mem);
+    ASSERT_EQ(lines.size(), 1u);
+    EXPECT_EQ(lines[0], "ef sys=0x803D9588 mm=0x00000000 (effect system not set up)");
+  }
+  FakeEf ef(mem);
+  ef.BuildChain(5);
+  std::vector<std::string> lines = EfDumpLines(mem);
+  EXPECT_TRUE(HasLine(lines, "ef sys=0x803D9588 mm=0x80B00000 heap=0x80B00040-0x80B40040 pool_sizes effect=4 emitter=4 pm=4 particle=40 groups=1"));
+  EXPECT_TRUE(HasLine(lines, "ef group0 effects head=0x"));
+  EXPECT_TRUE(HasLine(lines, "n=1 off=0x14"));
+  EXPECT_TRUE(HasLine(lines, "ef pool particle obj=0x"));
+  EXPECT_TRUE(HasLine(lines, "ef pool effect obj=0x"));
+  EXPECT_TRUE(HasLine(lines, "ef check ok lists=16 nodes=60 effects=1 emitters=1 pms=1 particles=5"));
+
+  mem.SetU32(ef.particle(4) + 0x14 + 4, ef.particle(0));  // the freeze: a cyclic particle list
+  lines = EfDumpLines(mem);
+  EXPECT_TRUE(HasLine(lines, "ef check BAD list=particles@pm=0x"));
+  EXPECT_TRUE(HasLine(lines, "list_addr=0x"));
+}
+
+TEST(Rev3Rollback, FreezeDumpCarriesTheEfLines)
+{
+  FakeMemory mem;
+  MakeFakeOs(mem);
+  FakeEf ef(mem);
+  ef.BuildChain(2);
+  FakeSink sink;
+  FakeDumpSource src;
+  src.cpu = MakeFakeCpu();
+  FreezeDump dump(mem, sink, src);
+  EXPECT_TRUE(HasLine(dump.Lines(false, true), "ef sys=0x803D9588 mm=0x80B00000"));
+  EXPECT_TRUE(HasLine(dump.Lines(true, false), "ef check ok"));
+  dump.Dump("stall", true, false);
+  EXPECT_TRUE(sink.Contains("DUMP stall ef sys=0x803D9588"));
+}
+
+namespace
+{
+// A game whose frames allocate one particle per frame from `first` on (the fake's CreateParticle) and keep a counter in the pm struct and in
+// the particle pool object, so that the pages holding the list heads are dynamic long before: only the particle array's later pages are fresh.
+void EfStepHook(FakeGame* game, FakeEf* ef, u32 first)
+{
+  game->SetStepHook([ef, first](FakeMemory& mem, u32 frame) {
+    mem.SetU32(ef->pm() + 0xA0, frame);
+    mem.SetU32(ef->pool(3) + 0x20, frame);
+    if (frame >= first)
+      ef->CreateParticle();
+  });
+}
+
+bool LinesContain(const FakeSink& sink, const std::string& a, const std::string& b)
+{
+  for (const std::string& l : sink.lines)
+  {
+    if (l.find(a) != std::string::npos && l.find(b) != std::string::npos)
+      return true;
+  }
+  return false;
+}
+}  // namespace
+
+TEST(Rev3Rollback, ArmForcesTheEfPoolIntoTheSetThatNothingHasTouched)
+{
+  const auto run = [](bool forced, std::vector<Range>* set, std::vector<std::string>* log, EfPool* info) {
+    FakeGame game(false);
+    FakeEf ef(game.Mem());
+    ef.BuildChain(3);
+    FakeSink sink;
+    SyncTestOptions o = AdaptiveOptions(3);
+    o.ef_pool = forced;
+    SyncTest test(o, {}, game.Mem(), sink, FakeClock());
+    for (int i = 0; i < 330; ++i)
+      game.Frame(test);
+    EXPECT_TRUE(test.Active());
+    *set = test.Ranges();
+    *log = sink.lines;
+    *info = test.EfPoolInfo();
+    EXPECT_EQ(test.EfPoolFound(), forced);
+  };
+  std::vector<Range> with;
+  std::vector<Range> without;
+  std::vector<std::string> log_with;
+  std::vector<std::string> log_without;
+  EfPool info_with;
+  EfPool info_without;
+  run(true, &with, &log_with, &info_with);
+  run(false, &without, &log_without, &info_without);
+
+  // Nothing in the pool ever changed, so the page tracker alone leaves it out ...
+  EXPECT_FALSE(SetContains(without, 0x80B00000));
+  EXPECT_FALSE(SetContains(without, 0x80B00040 + 0x20000));
+  // ... and the forced run has all of it: the manager page, the heap, the tail and the singleton.
+  ASSERT_FALSE(info_with.ranges.empty());
+  for (const Range& r : info_with.ranges)
+    EXPECT_TRUE(SetContains(with, r.start, r.end - r.start)) << std::hex << r.start;
+  EXPECT_TRUE(SetContains(with, 0x80B00000, 0x41000));
+  EXPECT_TRUE(SetContains(with, EF_SYSTEM_ADDR, 0x100));
+
+  const auto has = [](const std::vector<std::string>& lines, const std::string& needle) {
+    for (const std::string& l : lines)
+    {
+      if (l.find(needle) != std::string::npos)
+        return true;
+    }
+    return false;
+  };
+  EXPECT_TRUE(has(log_with, "NOTE ef pool 0x80B00000-0x80B41000 bytes=266240"));
+  EXPECT_TRUE(has(log_with, "NOTE ef pool total bytes=319488 ranges=2 mm=0x80B00000 heap=0x80B00040-0x80B40040 effects=4 emitters=4 particle_managers=4 particles=40"));
+  EXPECT_TRUE(has(log_with, "NOTE forced include: ranges=2 bytes=319488; the snapshot set grows by "));
+  EXPECT_TRUE(has(log_without, "NOTE ef pool off (REV3_EF_POOL=0)"));
+  EXPECT_FALSE(has(log_without, "NOTE ef pool 0x"));
+}
+
+TEST(Rev3Rollback, MissingEfPoolIsLoggedAndHarmless)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTest test(AdaptiveOptions(3), {}, game.Mem(), sink, FakeClock());
+  for (int i = 0; i < 450; ++i)
+    game.Frame(test);
+  ASSERT_TRUE(test.Active());
+  EXPECT_FALSE(test.EfPoolFound());
+  EXPECT_TRUE(test.ForcedRanges().empty());
+  EXPECT_TRUE(sink.Contains("NOTE ef pool not found: the memory manager pointer at EffectSystem 0x803D9588 is 0"));
+  EXPECT_FALSE(sink.Contains("NOTE forced include"));
+  EXPECT_GT(test.Stats().rollbacks, 5u);
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u);
+  EXPECT_EQ(test.Stats().ef_checks, test.Stats().restores);  // the check ran (and found nothing to check)
+  EXPECT_EQ(test.Stats().ef_bad, 0u);
+  EXPECT_FALSE(sink.Contains("EFCHECK"));
+}
+
+TEST(Rev3Rollback, EfPoolIsForcedIntoTheClassicSetToo)
+{
+  FakeGame game(false);
+  FakeEf ef(game.Mem());
+  ef.BuildChain(3);
+  FakeSink sink;
+  SyncTest test(Options(3), game.Ranges(), game.Mem(), sink, FakeClock());  // fixed whitelist, no page tracker
+  for (int i = 0; i < 120; ++i)
+    game.Frame(test);
+  ASSERT_TRUE(test.Active());
+  EXPECT_TRUE(SetContains(test.Ranges(), 0x80B00000, 0x41000));
+  EXPECT_TRUE(SetContains(test.Ranges(), STATE_A, 0x100));  // the whitelist is still there
+  EXPECT_TRUE(SetContains(test.Ranges(), STATE_B, 0x40));
+  EXPECT_GT(test.Stats().rollbacks, 5u);
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u);
+}
+
+TEST(Rev3Rollback, UserInclusionsAreForcedAtArmAndTheCutsStillWin)
+{
+  FakeGame game(false);
+  game.Mem().SetU32(0x80E00000, 0x80E10000);  // a pointer to a block the game allocated
+  FakeSink sink;
+  FakeHardware hw;
+  hw.list.push_back({"test_dma", 0x80D01000, 0x80D01800});
+  SyncTestOptions o = AdaptiveOptions(3);
+  o.ef_pool = false;
+  SyncTest test(o, {}, game.Mem(), sink, FakeClock(), &hw);
+  test.SetUserInclusions({{0x80D00000, 0x80D02000}, {0x80002000, 0x80003000}},
+                         {{0x80E00000, 0x3000, "block"}, {0x80E00100, 0x1000, "unset"}});  // the second pointer holds 0
+  for (int i = 0; i < 330; ++i)
+    game.Frame(test);
+  ASSERT_TRUE(test.Active());
+  const std::vector<Range>& set = test.Ranges();
+  EXPECT_TRUE(SetContains(set, 0x80D00000, 0x1000));
+  EXPECT_TRUE(SetContains(set, 0x80D01800, 0x800));
+  EXPECT_FALSE(SetContains(set, 0x80D01000, 4));  // the hardware cut wins over the inclusion
+  EXPECT_FALSE(SetContains(set, 0x80D017FC, 4));
+  EXPECT_TRUE(SetContains(set, 0x80002000, 0x400));  // the hook region 0x80002400-0x80002A00 is cut out of it
+  EXPECT_FALSE(SetContains(set, HOOK_REGION_START, 4));
+  EXPECT_TRUE(SetContains(set, 0x80002A00, 0x600));
+  EXPECT_TRUE(SetContains(set, 0x80E10000, 0x3000));  // the pointer entry, resolved when arming
+  EXPECT_FALSE(SetContains(set, 0x80E13000, 4));
+  EXPECT_TRUE(sink.Contains("NOTE include ptr 0x80E00000 -> 0x80E10000-0x80E13000 (12288 bytes) note=block"));
+  EXPECT_TRUE(sink.Contains("NOTE include ptr 0x80E00100 skipped: pointer is 0"));
+  EXPECT_TRUE(sink.Contains("NOTE forced include: ranges=3"));
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u);
+}
+
+TEST(Rev3Rollback, WithoutThePoolARollbackLeavesBrokenEfListsAndEfCheckSaysWhere)
+{
+  FakeGame game(false);
+  FakeEf ef(game.Mem());
+  ef.BuildChain(3);
+  EfStepHook(&game, &ef, 1200);  // from frame 1200 one new particle per frame; the third one lives in a page nothing has touched yet
+  FakeSink sink;
+  SyncTestOptions o = AdaptiveOptions(3, 64, 3);  // a scan cycle is 64 calls: the fresh page is noticed late, as in the real run
+  o.ef_pool = false;
+  o.ef_check_restores = EF_CHECK_ALL;
+  SyncTest test(o, {}, game.Mem(), sink, FakeClock());
+  for (int i = 0; i < 260 && test.Stats().ef_bad == 0; ++i)
+    game.Frame(test);
+  ASSERT_TRUE(test.Active());
+  EXPECT_GE(test.Stats().rollbacks, 1u);
+  EXPECT_GE(test.Stats().ef_bad, 1u);
+  // The failing list is named, with the node and the fact that its page is not in the snapshot.
+  EXPECT_TRUE(LinesContain(sink, "EFCHECK bad after restore", "in_snapshot=0"));
+  EXPECT_TRUE(LinesContain(sink, "EFCHECK bad after restore", "pool_free[particle]") || LinesContain(sink, "EFCHECK bad after restore", "particles@pm="));
+}
+
+TEST(Rev3Rollback, WithThePoolForcedTheEfListsSurviveEveryRollback)
+{
+  FakeGame game(false);
+  FakeEf ef(game.Mem());
+  ef.BuildChain(3);
+  EfStepHook(&game, &ef, 1200);
+  FakeSink sink;
+  SyncTestOptions o = AdaptiveOptions(3, 64, 3);
+  o.ef_check_restores = EF_CHECK_ALL;
+  SyncTest test(o, {}, game.Mem(), sink, FakeClock());
+  for (int i = 0; i < 800; ++i)
+    game.Frame(test);
+  ASSERT_TRUE(test.Active());
+  EXPECT_GT(test.Stats().rollbacks, 100u);
+  EXPECT_GT(test.Stats().ef_checks, 100u);
+  EXPECT_EQ(test.Stats().ef_bad, 0u);
+  EXPECT_EQ(test.Stats().ef_bad_before, 0u);
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u);
+  EXPECT_FALSE(sink.Contains("EFCHECK bad"));
+  EXPECT_TRUE(sink.Contains("EFCHECK ok after restore"));
+  // The particles really were allocated by the game, and the replays agree with the first run: the pool ends up with the same lists.
+  EXPECT_GT(ef.Count(ef.particles_list()), 10u);
+  EXPECT_TRUE(CheckEfLists(game.Mem()).ok);
+  test.Finish();
+  EXPECT_TRUE(sink.Contains("ef_checks="));
+}
+
+TEST(Rev3Rollback, EfCheckRunsForTheFirstNRestoresOnlyAndCanBeSwitchedOff)
+{
+  const auto run = [](u32 limit) {
+    FakeGame game(false);
+    FakeEf ef(game.Mem());
+    ef.BuildChain(3);
+    FakeSink sink;
+    SyncTestOptions o = AdaptiveOptions(3);
+    o.ef_check_restores = limit;
+    SyncTest test(o, {}, game.Mem(), sink, FakeClock());
+    for (int i = 0; i < 700; ++i)
+      game.Frame(test);
+    EXPECT_GT(test.Stats().restores, 20u);
+    return std::make_pair(test.Stats().ef_checks, test.Stats().restores);
+  };
+  EXPECT_EQ(run(5).first, 5u);
+  EXPECT_EQ(run(0).first, 0u);
+  const auto all = run(EF_CHECK_ALL);
+  EXPECT_EQ(all.first, all.second);
+}
+
+TEST(Rev3Rollback, EfCheckAlsoLooksAtTheStateBeforeTheWriteBack)
+{
+  // A first run that already left a broken list (the game's own state, not the restore's doing) is reported as `before`.
+  FakeGame game(false);
+  FakeEf ef(game.Mem());
+  ef.BuildChain(3);
+  FakeSink sink;
+  SyncTestOptions o = AdaptiveOptions(3);
+  o.ef_check_restores = EF_CHECK_ALL;
+  SyncTest test(o, {}, game.Mem(), sink, FakeClock());
+  for (int i = 0; i < 330 && !test.Active(); ++i)
+    game.Frame(test);
+  ASSERT_TRUE(test.Active());
+  game.Mem().SetU16(ef.particles_list() + 8, 9);  // count says 9, the list holds 3
+  // Snapshots taken from here on all carry the bad count, so before AND after fail; the first restore's `before` is the one that matters.
+  for (int i = 0; i < 20; ++i)
+    game.Frame(test);
+  EXPECT_GE(test.Stats().ef_bad_before, 1u);
+  EXPECT_TRUE(LinesContain(sink, "EFCHECK bad before restore", "walked 3 nodes but the count says 9"));
+}
+
+TEST(Rev3Rollback, LearningAPageWhileArmedBlocksRollbacksToOlderSnapshots)
+{
+  FakeGame game(false);
+  game.SetLatePage(1500);
+  FakeSink sink;
+  const int k = 3;
+  SyncTest test(AdaptiveOptions(k), {}, game.Mem(), sink, FakeClock());
+  Reply last;
+  while (game.Counter() < 1500)
+    last = game.Frame(test);
+  ASSERT_TRUE(test.Active());
+  EXPECT_GT(test.Stats().rollbacks, 50u);
+  EXPECT_FALSE(sink.Contains("NOTE learned +"));
+  for (int i = 0; i < 400 && !sink.Contains("NOTE learned +"); ++i)
+    last = game.Frame(test);
+  ASSERT_TRUE(sink.Contains("NOTE learned +"));
+  // The layout changed: every older snapshot is gone. No restore in the call that learned, nor in the next k - 1 calls; the first one may
+  // come once k new frames are captured, and it restores a snapshot of the NEW layout.
+  const u32 rollbacks = test.Stats().rollbacks;
+  EXPECT_EQ(last.flags, 0u);
+  for (int i = 0; i < k - 1; ++i)
+    EXPECT_EQ(game.Frame(test).flags, 0u) << i;
+  EXPECT_EQ(test.Stats().rollbacks, rollbacks);
+  for (int i = 0; i < 10; ++i)
+    game.Frame(test);
+  EXPECT_GT(test.Stats().rollbacks, rollbacks);
+  EXPECT_EQ(test.Stats().layout_refused, 0u);
+  // The page was noticed up to one scan cycle late and rollbacks had been running meanwhile: logged as a warning and counted.
+  EXPECT_GE(test.Stats().late_learn_rollbacks, 1u);
+  EXPECT_TRUE(LinesContain(sink, "NOTE learned +1 pages", "new=[0x80A00000-0x80A01000]"));
+  EXPECT_TRUE(LinesContain(sink, "NOTE learned +1 pages", "WARNING a rollback ran within the last scan cycle"));
+  test.Finish();
+  EXPECT_TRUE(sink.Contains("layout_refused=0 late_learn_rollbacks="));
 }
