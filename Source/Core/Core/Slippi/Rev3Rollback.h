@@ -21,8 +21,15 @@
 //   REV3_SYNCTEST_EVERY=N    roll back when frame % N == 0 (default 1 = every frame)
 //   REV3_STACK_WINDOW=bytes  bytes saved and restored from the hook's sp upward (default 0x4000; decimal or 0x hex)
 //   REV3_SYNCTEST_LOG=path   log file (default <User>/Logs/rev3_synctest.log); appended to, flushed after every line
-//   SyncTest only runs inside a fight (both fighters found through the TEAMS pointers for 60 consecutive commands); menus
-//   and loading screens (DVD DMA) are never rolled back. See REV3.md for what a clean run looks like.
+//   REV3_SYNCTEST_ARM=N|pad  when SyncTest arms: N = after N consecutive hook calls with both fighters found (default 600 =
+//                            10 s; the stage must have finished loading); pad = when P1 presses Z (and disarm on the next
+//                            press) while fighters are present
+//   REV3_SYNCTEST_NOOP=1     diagnosis: every frame capture and immediately restore the same frame (RESTORED reply, frame n,
+//                            inputs n); exercises the game hook's register reload without any real rollback; no comparisons
+//   REV3_SYNCTEST_HW_EXCLUDE=0   do not cut hardware-DMA regions (GX FIFO, audio DMA, XFB, DVD DMA) out of the snapshot
+//   REV3_SYNCTEST_ICACHE=0       do not invalidate the JIT for restored ranges
+//   SyncTest only runs once armed (both fighters found through the TEAMS pointers); menus and loading screens are never
+//   rolled back. See REV3.md for what a clean run looks like.
 //
 // HOW IT FITS IN
 //   Protocol and field table: GetSniperd/rev3-mod rev3mod/rbhook.py (game side), rev3mod/rbchecksum.py (FIELDS, TEAMS chain),
@@ -123,6 +130,25 @@ public:
   // Copies n bytes at guest address addr; false (and nothing touched) when the range is not entirely inside MEM1 or MEM2.
   virtual bool Read(u32 addr, void* dst, size_t n) const = 0;
   virtual bool Write(u32 addr, const void* src, size_t n) = 0;
+  // Called after a restore wrote [addr, addr + n): drop any translated code for it (the Dolphin JIT). Default: nothing to do.
+  virtual void InvalidateCode(u32 /*addr*/, size_t /*n*/) {}
+};
+
+// A memory region that emulated hardware reads or writes on its own (GX FIFO, audio DMA, XFB, DVD DMA). It must not be rewound
+// under the hardware, so it is cut out of the snapshot ranges.
+struct Exclusion
+{
+  std::string what;  // "gx_fifo", "audio_dma", "xfb_top", ...
+  u32 start = 0;
+  u32 end = 0;       // exclusive
+};
+
+class HardwareView
+{
+public:
+  virtual ~HardwareView() = default;
+  // Appends the regions the hardware uses right now (guest addresses 0x80.. / 0x90..). Called on the CPU thread.
+  virtual void Query(std::vector<Exclusion>* out) = 0;
 };
 
 class Sink
@@ -140,7 +166,14 @@ struct SyncTestOptions
   int every = 1;                  // roll back when frame % every == 0
   u32 stack_window = 0x4000;      // bytes saved from the hook's sp upward (clipped at the end of its memory region)
   std::string whitelist_path;     // only printed in the header line
+  u32 arm_commands = 600;         // arm after this many consecutive hook calls with both fighters found (ignored with arm_by_pad)
+  bool arm_by_pad = false;        // arm / disarm on P1's Z press (edge) while fighters are present
+  bool noop = false;              // capture then restore the same frame every frame; no comparisons
+  bool invalidate_code = true;    // call GuestMemory::InvalidateCode for every restored range
+  u32 hardware_check_every = 600; // hook calls between two hardware exclusion checks while armed
 };
+
+constexpr u16 PAD_BUTTON_Z = 0x0010;  // PADStatus button bit of the Z trigger
 
 struct SyncTestStats
 {
@@ -148,16 +181,22 @@ struct SyncTestStats
   u32 frames_compared = 0;
   u32 mismatching_frames = 0;
   u32 sp_mismatches = 0;
-  u64 restore_us_total = 0;
+  u32 noop_restores = 0;
+  u32 restores = 0;               // rollbacks + noop restores (the divisor of the *_mean values)
+  u64 restore_us_total = 0;       // writing the ranges back
   u64 restore_us_max = 0;
+  u64 icache_us_total = 0;        // JIT invalidation of the restored ranges
+  u64 icache_us_max = 0;
 };
 
 class SyncTest
 {
 public:
   // `micros` returns a monotonic clock in microseconds (restore times); the default is std::chrono::steady_clock.
+  // `hardware` (optional) names the regions emulated hardware uses on its own; they are subtracted from the snapshot ranges when
+  // SyncTest arms, re-checked every options.hardware_check_every hook calls, and only ever grow.
   SyncTest(const SyncTestOptions& options, std::vector<Range> ranges, GuestMemory& memory, Sink& sink,
-           std::function<u64()> micros = {});
+           std::function<u64()> micros = {}, HardwareView* hardware = nullptr);
 
   // One command in, one reply out. All work (reads, snapshots, restores, logging) happens inside this call.
   Reply OnCommand(const Command& command);
@@ -166,7 +205,8 @@ public:
   void Finish();
 
   const SyncTestStats& Stats() const { return m_stats; }
-  bool Active() const { return m_was_active; }
+  bool Active() const { return m_armed; }  // armed (a fight, past the arm delay or toggled on by Z)
+  const std::vector<Range>& Ranges() const { return m_ranges; }  // the current snapshot ranges (whitelist minus exclusions)
   bool Resimulating() const { return m_resim; }
   size_t SnapshotBytes() const { return m_snapshot_bytes; }
 
@@ -191,7 +231,11 @@ private:
   Reply Echo(const Command& command) const;
   Reply Normal(const Command& command, const std::array<u32, 2>& fighters);
   Reply Resim(const Command& command, const std::array<u32, 2>& fighters);
-  bool Rollback(const Command& command);
+  bool Restore(const Slot& s, const Command& command, u32 to);
+  Reply Noop(const Command& command);
+  void RebuildLayout();
+  void RefreshExclusions();
+  void ClearHistory();
   void Compare(const Slot& reference, const Slot& live, u32 frame);
   void SummaryLine(const char* tag);
   Slot& SlotFor(u32 frame) { return m_ring[frame % m_ring.size()]; }
@@ -209,8 +253,17 @@ private:
   Slot m_scratch;            // the live capture of a resimulated frame, swapped into the ring after the comparison
   std::vector<u8> m_span;    // one fighter's field span, read in one go
 
+  HardwareView* m_hardware;
+  std::vector<Exclusion> m_exclusions_logged;  // every (what, range) already reported
+  u32 m_exclusion_lines = 0;
+  u32 m_armed_calls = 0;     // hook calls since arming
+  bool m_hardware_due = false;  // an exclusion re-check is waiting for a call outside a resimulation
+  bool m_prev_z = false;     // Z was down on the previous command
+  bool m_z_pending = false;  // a Z press not yet acted on (acted on outside a resimulation)
+  u32 m_restore_logs = 0;    // RESTORE lines written (the first 10 only)
+
   u32 m_streak = 0;          // consecutive commands with both fighters found
-  bool m_was_active = false;  // streak >= 60 on the previous command
+  bool m_armed = false;
   bool m_have_history = false;
   u32 m_first_n = 0;         // first frame of the current history
   u32 m_last_frame = 0;      // frame of the previous command

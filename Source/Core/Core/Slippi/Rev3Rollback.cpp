@@ -12,6 +12,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -26,8 +27,12 @@
 #include "Common/Hash.h"
 #include "Common/Logging/Log.h"
 #include "Core/Core.h"
+#include "Core/HW/MMIO.h"
 #include "Core/HW/Memmap.h"
+#include "Core/HW/VideoInterface.h"
+#include "Core/PowerPC/JitInterface.h"
 #include "Core/System.h"
+#include "VideoCommon/CommandProcessor.h"
 #include "VideoCommon/OnScreenDisplay.h"
 
 namespace Rev3
@@ -40,9 +45,12 @@ constexpr u32 MEM1_END = 0x81800000;
 constexpr u32 MEM2_BASE = 0x90000000;
 constexpr u32 MEM2_END = 0x94000000;
 
-// Both fighters must be found for this many consecutive commands (hook calls, one per game frame) before SyncTest runs: the
-// fight must be set up, not loading (loading fills memory by DVD DMA, which a memory snapshot knows nothing about).
-constexpr u32 FIGHT_STABLE_COMMANDS = 60;
+// SyncTest arms after SyncTestOptions::arm_commands consecutive hook calls (one per game frame) with both fighters found (default
+// 600): the stage must be loaded and the fight running, not loading (loading fills memory by DVD DMA and runs threads, which a
+// memory snapshot knows nothing about). The first real run froze at the end of a stage load with a 60 call delay.
+constexpr u32 HEARTBEAT_EVERY = 300;              // "HB" log line every this many hook calls while armed (finds where a hang is)
+constexpr u32 MAX_RESTORE_LOGS = 10;              // the first restores log a RESTORE line (bytes, microseconds)
+constexpr u32 MAX_EXCLUSION_LINES = 64;           // "NOTE exclude" lines (buffers that alternate would otherwise flood the log)
 
 constexpr u32 MAX_DETAILED_MISMATCH_FRAMES = 20;  // full field / range detail for this many mismatching frames, then counts only
 constexpr u32 MAX_LOGGED_ERRORS = 50;             // error lines (sp mismatch, capture failure ...) before they go silent
@@ -288,35 +296,88 @@ const std::array<FieldDef, FIELD_COUNT> FIELDS = {{
 // ---- (4) SyncTest -------------------------------------------------------------------------------------------------------
 
 SyncTest::SyncTest(const SyncTestOptions& options, std::vector<Range> ranges, GuestMemory& memory, Sink& sink,
-                   std::function<u64()> micros)
-    : m_options(options), m_ranges(std::move(ranges)), m_memory(memory), m_sink(sink), m_micros(std::move(micros))
+                   std::function<u64()> micros, HardwareView* hardware)
+    : m_options(options), m_ranges(std::move(ranges)), m_memory(memory), m_sink(sink), m_micros(std::move(micros)),
+      m_hardware(hardware)
 {
   if (!m_micros)
     m_micros = SteadyMicros;
   m_options.k = std::clamp(m_options.k, 1, 8);
   m_options.every = std::max(m_options.every, 1);
+  m_options.hardware_check_every = std::max<u32>(m_options.hardware_check_every, 1);
+  m_span.resize(FIELD_SPAN_HI - FIELD_SPAN_LO);
 
+  // Allocated once: k + 1 slots of ~2.3 MB, plus the scratch slot used while comparing a resimulated frame. Exclusions only
+  // shrink the ranges, so RebuildLayout never has to grow them.
+  m_ring.resize(static_cast<size_t>(m_options.k) + 1);
+  RebuildLayout();
+
+  m_sink.Line(Format("SYNCTEST start K=%d EVERY=%d window=0x%X whitelist=%s ranges=%zu bytes=%zu snapshot_bytes=%zu slots=%zu "
+                     "arm=%s noop=%d hw_exclude=%d icache=%d",
+                     m_options.k, m_options.every, m_options.stack_window, m_options.whitelist_path.c_str(), m_ranges.size(),
+                     m_ranges_bytes, m_snapshot_bytes, m_ring.size(),
+                     m_options.arm_by_pad ? "pad" : Format("%u", m_options.arm_commands).c_str(), m_options.noop ? 1 : 0,
+                     m_hardware != nullptr ? 1 : 0, m_options.invalidate_code ? 1 : 0));
+}
+
+// Recomputes the offsets and buffer sizes for the current m_ranges. Every slot is invalidated: its data has the old layout.
+void SyncTest::RebuildLayout()
+{
+  m_range_offsets.clear();
+  m_ranges_bytes = 0;
   for (const Range& r : m_ranges)
   {
     m_range_offsets.push_back(m_ranges_bytes);
     m_ranges_bytes += r.end - r.start;
   }
   m_snapshot_bytes = m_ranges_bytes + m_options.stack_window;
-  m_span.resize(FIELD_SPAN_HI - FIELD_SPAN_LO);
-
-  // Allocated once: k + 1 slots of ~2.3 MB, plus the scratch slot used while comparing a resimulated frame.
-  m_ring.resize(static_cast<size_t>(m_options.k) + 1);
   for (Slot& s : m_ring)
   {
+    s.valid = false;
     s.data.resize(m_snapshot_bytes);
-    s.crc.resize(m_ranges.size());
+    s.crc.assign(m_ranges.size(), 0);
   }
+  m_scratch.valid = false;
   m_scratch.data.resize(m_snapshot_bytes);
-  m_scratch.crc.resize(m_ranges.size());
+  m_scratch.crc.assign(m_ranges.size(), 0);
+}
 
-  m_sink.Line(Format("SYNCTEST start K=%d EVERY=%d window=0x%X whitelist=%s ranges=%zu bytes=%zu snapshot_bytes=%zu slots=%zu",
-                     m_options.k, m_options.every, m_options.stack_window, m_options.whitelist_path.c_str(), m_ranges.size(),
-                     m_ranges_bytes, m_snapshot_bytes, m_ring.size()));
+// Asks the emulated hardware which memory it uses on its own and cuts it out of the snapshot ranges. The set only grows (double
+// buffers alternate; seeing both once is enough), and a change that touches the snapshot clears the history.
+void SyncTest::RefreshExclusions()
+{
+  if (m_hardware == nullptr)
+    return;
+  std::vector<Exclusion> found;
+  m_hardware->Query(&found);
+  bool layout_changed = false;
+  for (const Exclusion& e : found)
+  {
+    if (e.end <= e.start)
+      continue;
+    bool known = false;
+    for (const Exclusion& old : m_exclusions_logged)
+      known = known || (old.what == e.what && old.start == e.start && old.end == e.end);
+    if (known)
+      continue;
+    m_exclusions_logged.push_back(e);
+    const u64 removed = SubtractRange(&m_ranges, e.start, e.end);
+    layout_changed = layout_changed || removed != 0;
+    ++m_exclusion_lines;
+    if (m_exclusion_lines <= MAX_EXCLUSION_LINES)
+    {
+      m_sink.Line(Format("NOTE exclude %s 0x%08X-0x%08X (%llu bytes were in the whitelist)", e.what.c_str(), e.start, e.end,
+                         static_cast<unsigned long long>(removed)));
+      if (m_exclusion_lines == MAX_EXCLUSION_LINES)
+        m_sink.Line("NOTE further exclusions are not logged");
+    }
+  }
+  if (!layout_changed)
+    return;
+  RebuildLayout();
+  ClearHistory();
+  m_sink.Line(Format("NOTE snapshot now ranges=%zu bytes=%zu snapshot_bytes=%zu (history cleared, frame %u)", m_ranges.size(),
+                     m_ranges_bytes, m_snapshot_bytes, m_last_frame));
 }
 
 Reply SyncTest::Echo(const Command& command) const
@@ -339,13 +400,18 @@ void SyncTest::Error(const std::string& text)
   }
 }
 
-void SyncTest::Reset(const char* why)
+void SyncTest::ClearHistory()
 {
   for (Slot& s : m_ring)
     s.valid = false;
   m_scratch.valid = false;
   m_resim = false;
   m_have_history = false;
+}
+
+void SyncTest::Reset(const char* why)
+{
+  ClearHistory();
   m_sink.Line(Format("NOTE history cleared: %s (frame %u)", why, m_last_frame));
 }
 
@@ -432,13 +498,13 @@ bool SyncTest::Capture(Slot& slot, const Command& command, const std::array<u32,
   return true;
 }
 
-bool SyncTest::Rollback(const Command& command)
+// Writes the snapshot `s` (ranges, then the stack window) back, invalidates the JIT for the restored ranges, and times the two
+// steps separately. `to` is the frame the game continues from (only used for the log). False: nothing was (fully) restored.
+bool SyncTest::Restore(const Slot& s, const Command& command, u32 to)
 {
-  const u32 target = command.frame - static_cast<u32>(m_options.k);
-  Slot& s = SlotFor(target);
-  if (!s.valid || s.frame != target)
+  if (!s.valid || s.frame != to)
   {
-    Error(Format("frame %u: no snapshot of frame %u to restore", command.frame, target));
+    Error(Format("frame %u: no snapshot of frame %u to restore", command.frame, to));
     return false;
   }
   if (s.sp != command.sp)
@@ -446,9 +512,13 @@ bool SyncTest::Rollback(const Command& command)
     // The hook's saved registers live at sp..sp+0x200; restoring them under a different sp would hand the hook garbage.
     ++m_stats.sp_mismatches;
     Error(Format("frame %u: sp 0x%08X differs from the snapshot of frame %u (0x%08X); not restoring", command.frame,
-                 command.sp, target, s.sp));
+                 command.sp, to, s.sp));
     return false;
   }
+
+  const bool log_it = m_restore_logs < MAX_RESTORE_LOGS;
+  if (log_it)
+    m_sink.Line(Format("RESTORE %u -> %u begin", command.frame, to));
 
   const u64 t0 = m_micros();
   size_t offset = 0;
@@ -467,12 +537,46 @@ bool SyncTest::Rollback(const Command& command)
     Error(Format("frame %u: cannot write the stack window at 0x%08X", command.frame, s.sp));
     return false;
   }
-  const u64 us = m_micros() - t0;
+  const u64 t1 = m_micros();
+  if (m_options.invalidate_code)
+  {
+    for (const Range& r : m_ranges)
+      m_memory.InvalidateCode(r.start, r.end - r.start);
+  }
+  const u64 t2 = m_micros();
+  const u64 us = t1 - t0;
+  const u64 icache_us = t2 - t1;
 
-  ++m_stats.rollbacks;
+  ++m_stats.restores;
   m_stats.restore_us_total += us;
   m_stats.restore_us_max = std::max(m_stats.restore_us_max, us);
+  m_stats.icache_us_total += icache_us;
+  m_stats.icache_us_max = std::max(m_stats.icache_us_max, icache_us);
+  if (log_it)
+  {
+    ++m_restore_logs;
+    m_sink.Line(Format("RESTORE %u -> %u bytes=%zu us=%llu icache_us=%llu", command.frame, to, m_ranges_bytes + s.stack_len,
+                       static_cast<unsigned long long>(us), static_cast<unsigned long long>(icache_us)));
+  }
   return true;
+}
+
+// Diagnosis mode: the state just captured for this frame is written straight back and the game is told it was restored (same
+// frame, same inputs). Memory is unchanged in effect, but the hook's RESTORED path (register reload from its stack frame) runs.
+Reply SyncTest::Noop(const Command& command)
+{
+  const u32 n = command.frame;
+  const Slot& slot = SlotFor(n);
+  if (n % static_cast<u32>(m_options.every) != 0 || !Restore(slot, command, n))
+    return Echo(command);
+  ++m_stats.noop_restores;
+  if (m_stats.noop_restores % SUMMARY_EVERY_COMPARED == 0)
+    SummaryLine("SUMMARY");
+  Reply r;
+  r.flags = REPLY_FLAG_RESTORED;
+  r.frame = n;
+  r.pads = command.pads;
+  return r;
 }
 
 Reply SyncTest::Normal(const Command& command, const std::array<u32, 2>& fighters)
@@ -492,10 +596,14 @@ Reply SyncTest::Normal(const Command& command, const std::array<u32, 2>& fighter
   }
   m_last_frame = n;
 
+  if (m_options.noop)
+    return Noop(command);
+
   const u32 k = static_cast<u32>(m_options.k);
-  if (n >= m_first_n + k && n % static_cast<u32>(m_options.every) == 0 && Rollback(command))
+  if (n >= m_first_n + k && n % static_cast<u32>(m_options.every) == 0 && Restore(SlotFor(n - k), command, n - k))
   {
     const u32 target = n - k;
+    ++m_stats.rollbacks;
     m_resim = true;
     m_resim_target = n;
     m_last_frame = target;  // the next command must be target + 1
@@ -634,11 +742,13 @@ void SyncTest::Compare(const Slot& reference, const Slot& live, u32 frame)
 
 void SyncTest::SummaryLine(const char* tag)
 {
-  const double mean = m_stats.rollbacks != 0 ? static_cast<double>(m_stats.restore_us_total) / m_stats.rollbacks : 0.0;
+  const double n = m_stats.restores != 0 ? static_cast<double>(m_stats.restores) : 1.0;
   m_sink.Line(Format("%s frame=%u rollbacks=%u frames_compared=%u mismatching_frames=%u restore_us_mean=%.1f restore_us_max=%llu "
-                     "sp_mismatches=%u",
-                     tag, m_last_frame, m_stats.rollbacks, m_stats.frames_compared, m_stats.mismatching_frames, mean,
-                     static_cast<unsigned long long>(m_stats.restore_us_max), m_stats.sp_mismatches));
+                     "icache_us_mean=%.1f icache_us_max=%llu sp_mismatches=%u noop_restores=%u",
+                     tag, m_last_frame, m_stats.rollbacks, m_stats.frames_compared, m_stats.mismatching_frames,
+                     m_stats.restore_us_total / n, static_cast<unsigned long long>(m_stats.restore_us_max),
+                     m_stats.icache_us_total / n, static_cast<unsigned long long>(m_stats.icache_us_max),
+                     m_stats.sp_mismatches, m_stats.noop_restores));
 }
 
 void SyncTest::Finish()
@@ -663,20 +773,63 @@ Reply SyncTest::OnCommand(const Command& command)
     m_streak = 0;
   }
 
-  const bool active = m_streak >= FIGHT_STABLE_COMMANDS;
-  if (!active)
+  // P1's Z, edge triggered. A press is remembered until it can be acted on (not in the middle of a resimulation).
+  if (m_options.arm_by_pad)
   {
-    if (m_was_active)
+    const u16 buttons = static_cast<u16>((command.pads[0][0] << 8) | command.pads[0][1]);
+    const bool z = (buttons & PAD_BUTTON_Z) != 0;
+    if (z && !m_prev_z)
+      m_z_pending = true;
+    m_prev_z = z;
+  }
+
+  if (!found)
+  {
+    m_z_pending = false;
+    if (m_armed)
     {
-      m_was_active = false;
+      m_armed = false;
       Reset("fighters lost");
     }
     return Echo(command);
   }
-  if (!m_was_active)
+
+  if (!m_armed)
   {
-    m_was_active = true;
-    m_sink.Line(Format("NOTE fight detected, SyncTest active from frame %u", command.frame));
+    const bool arm = m_options.arm_by_pad ? m_z_pending : m_streak >= std::max<u32>(m_options.arm_commands, 1);
+    if (!arm)
+      return Echo(command);
+    m_z_pending = false;
+    m_armed = true;
+    m_armed_calls = 0;
+    m_last_frame = command.frame;
+    ClearHistory();
+    if (m_options.arm_by_pad)
+      m_sink.Line(Format("NOTE armed by Z at frame %u", command.frame));
+    else
+      m_sink.Line(Format("NOTE armed at frame %u (%u hook calls with both fighters)", command.frame, m_streak));
+    RefreshExclusions();
+  }
+  else if (m_options.arm_by_pad && m_z_pending && !m_resim)
+  {
+    m_z_pending = false;
+    m_armed = false;
+    ClearHistory();
+    m_sink.Line(Format("NOTE disarmed by Z at frame %u", command.frame));
+    return Echo(command);
+  }
+
+  ++m_armed_calls;
+  if (m_armed_calls % HEARTBEAT_EVERY == 0)
+    m_sink.Line(Format("HB frame=%u calls=%u rollbacks=%u noop_restores=%u", command.frame, m_armed_calls, m_stats.rollbacks,
+                       m_stats.noop_restores));
+  // Due every hardware_check_every calls; done on the next call that is not a resimulation (the layout must not change there).
+  if (m_armed_calls % m_options.hardware_check_every == 0)
+    m_hardware_due = true;
+  if (m_hardware_due && !m_resim)
+  {
+    m_hardware_due = false;
+    RefreshExclusions();
   }
 
   if (m_resim)
@@ -713,9 +866,13 @@ public:
     auto& memory = m_system.GetMemory();
     if (!Inside(memory, addr, n))
       return false;
-    memory.CopyToEmu(addr, src, n);  // a plain memcpy: no JIT invalidation, so the whitelist must not contain code
+    memory.CopyToEmu(addr, src, n);  // a plain memcpy: no JIT invalidation (InvalidateCode below does that)
     return true;
   }
+
+  // Forced invalidation (the code bytes are restored to what they were, not modified by the game): the JIT drops every block
+  // translated from the range, so overlays / RELs in a restored heap are recompiled from the restored bytes.
+  void InvalidateCode(u32 addr, size_t n) override { m_system.GetJitInterface().InvalidateICache(addr, static_cast<u32>(n), true); }
 
 private:
   // The range must lie entirely in the emulated MEM1 or MEM2 (checked here so MemoryManager never raises a panic alert).
@@ -729,6 +886,85 @@ private:
     else
       return false;
     return static_cast<u64>(addr) + n <= end;
+  }
+
+  Core::System& m_system;
+};
+
+// The memory emulated hardware reads or writes by itself, read from Dolphin's hardware state at the time of the query:
+//   GX command processor FIFO   System::GetCommandProcessor().GetFifo().CPBase / CPEnd (public, atomics)
+//   VI external framebuffers    System::GetVideoInterface().GetXFBAddressTop() / Bottom() (public); size is not exposed, so a
+//                               generous 640*576*2 bytes each is used
+//   audio DMA source block      DSP registers AUDIO_DMA_START_HI / LO / CONTROL_LEN through the MMIO mapping (0x0C005030..36;
+//                               the DSPManager's own state is private), length = NumBlocks * 32
+//   DVD DMA destination         DI registers DIMAR / DILENGTH / DICR through the MMIO mapping (0x0C006014..1C, plus 0x0D006014..1C
+//                               on a Wii); only while TSTART is set (a transfer in flight)
+// Not reachable: Wii IOS /dev/di reads (their output address lives inside IOS HLE, not in DIMAR), ARAM DMA, and GPU-thread
+// writes into texture memory (EFB copies); these are reported once in the log.
+class DolphinHardware final : public HardwareView
+{
+public:
+  DolphinHardware(Core::System& system, Sink& sink) : m_system(system)
+  {
+    sink.Line("NOTE hardware: GX FIFO via GetCommandProcessor().GetFifo(), XFB via GetVideoInterface().GetXFBAddressTop/Bottom(), "
+              "audio DMA and DVD DMA via MMIO registers 0x0C005030 / 0x0C006014");
+    sink.Line("NOTE hardware: not reachable: Wii IOS /dev/di read destinations, ARAM DMA, GPU-thread texture copies");
+  }
+
+  void Query(std::vector<Exclusion>* out) override
+  {
+    // GX command processor FIFO. CPEnd is the last 32-byte block of the FIFO, hence the + 32.
+    {
+      auto& fifo = m_system.GetCommandProcessor().GetFifo();
+      const u32 base = fifo.CPBase.load();
+      const u32 end = fifo.CPEnd.load();
+      if (base != 0 && end > base)
+        Add(out, "gx_fifo", base, static_cast<u64>(end) - base + 32);
+    }
+    // VI external framebuffers.
+    {
+      auto& vi = m_system.GetVideoInterface();
+      constexpr u64 XFB_BYTES = 640ull * 576 * 2;
+      if (const u32 top = vi.GetXFBAddressTop(); top != 0)
+        Add(out, "xfb_top", top, XFB_BYTES);
+      if (const u32 bottom = vi.GetXFBAddressBottom(); bottom != 0)
+        Add(out, "xfb_bottom", bottom, XFB_BYTES);
+    }
+    MMIO::Mapping* mmio = m_system.GetMemory().GetMMIOMapping();
+    if (mmio == nullptr)
+      return;
+    // Audio DMA (DSP registers).
+    {
+      const u32 start = (static_cast<u32>(mmio->Read<u16>(m_system, 0x0C005030)) << 16) | mmio->Read<u16>(m_system, 0x0C005032);
+      const u32 blocks = mmio->Read<u16>(m_system, 0x0C005036) & 0x7FFF;
+      if (start != 0 && blocks != 0)
+        Add(out, "audio_dma", start & ~0x1Fu, static_cast<u64>(blocks) * 32);
+    }
+    // DVD DMA in flight.
+    QueryDvd(out, mmio, 0x0C006000, "dvd_dma");
+    if (m_system.IsWii())
+      QueryDvd(out, mmio, 0x0D006000, "dvd_dma_wii");
+  }
+
+private:
+  void QueryDvd(std::vector<Exclusion>* out, MMIO::Mapping* mmio, u32 base, const char* what)
+  {
+    const u32 address = mmio->Read<u32>(m_system, base + 0x14);
+    const u32 length = mmio->Read<u32>(m_system, base + 0x18);
+    const u32 control = mmio->Read<u32>(m_system, base + 0x1C);
+    if ((control & 1) != 0 && address != 0 && length != 0)  // TSTART: a command is running
+      Add(out, what, address, length);
+  }
+
+  // `physical` is a hardware (physical) address; Rev3 sees it at 0x80000000 | physical (MEM1 0x00.., MEM2 0x10.. -> 0x90..).
+  static void Add(std::vector<Exclusion>* out, const char* what, u32 physical, u64 length)
+  {
+    const u32 start = 0x80000000u | (physical & 0x1FFFFFFFu);
+    const u32 region_end = RegionEnd(start);
+    if (region_end == 0 || length == 0)
+      return;
+    const u64 end = std::min<u64>(static_cast<u64>(start) + length, region_end);
+    out->push_back({what, start, static_cast<u32>(end)});
   }
 
   Core::System& m_system;
@@ -765,6 +1001,7 @@ struct Module
 {
   bool initialized = false;
   std::unique_ptr<DolphinMemory> memory;
+  std::unique_ptr<DolphinHardware> hardware;
   std::unique_ptr<FileSink> sink;
   std::unique_ptr<SyncTest> synctest;  // null = off
 };
@@ -842,6 +1079,22 @@ void Initialize(Module& module, Core::System& system)
       ERROR_LOG_FMT(SLIPPI, "Rev3 SyncTest: ignoring REV3_STACK_WINDOW={} (0x200..0x100000)", window);
   }
 
+  const std::string arm = GetEnv("REV3_SYNCTEST_ARM");
+  if (!arm.empty())
+  {
+    std::string lower = arm;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (lower == "pad")
+      options.arm_by_pad = true;
+    else if (ParseInt(arm, &value) && value >= 0 && value <= 100000000)
+      options.arm_commands = static_cast<u32>(value);
+    else
+      ERROR_LOG_FMT(SLIPPI, "Rev3 SyncTest: ignoring REV3_SYNCTEST_ARM={} (a number or pad)", arm);
+  }
+  options.noop = GetEnv("REV3_SYNCTEST_NOOP") == "1";
+  options.invalidate_code = GetEnv("REV3_SYNCTEST_ICACHE") != "0";
+  const bool hardware_exclude = GetEnv("REV3_SYNCTEST_HW_EXCLUDE") != "0";
+
   std::string log_path = GetEnv("REV3_SYNCTEST_LOG");
   if (log_path.empty())
     log_path = File::GetUserPath(D_LOGS_IDX) + "rev3_synctest.log";
@@ -880,7 +1133,10 @@ void Initialize(Module& module, Core::System& system)
                              static_cast<unsigned long long>(hook_bytes), HOOK_REGION_START, HOOK_REGION_END));
   }
   module.memory = std::make_unique<DolphinMemory>(system);
-  module.synctest = std::make_unique<SyncTest>(options, std::move(ranges), *module.memory, *module.sink);
+  if (hardware_exclude)
+    module.hardware = std::make_unique<DolphinHardware>(system, *module.sink);
+  module.synctest = std::make_unique<SyncTest>(options, std::move(ranges), *module.memory, *module.sink, std::function<u64()>(),
+                                               module.hardware.get());
   module.sink->Osd(Format("Rev3 SyncTest on: K=%d, every %d frame(s), log %s", options.k, options.every, log_path.c_str()));
 }
 }  // namespace
@@ -920,6 +1176,7 @@ void Shutdown()
   if (module.synctest != nullptr)
     module.synctest->Finish();
   module.synctest.reset();
+  module.hardware.reset();
   module.memory.reset();
   module.sink.reset();
   module.initialized = false;  // the next command reads the environment again and appends to the log

@@ -6,6 +6,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -39,6 +40,9 @@ public:
     std::memcpy(&m_mem1[addr - 0x80000000], src, n);
     return true;
   }
+
+  void InvalidateCode(u32 addr, size_t n) override { invalidated.emplace_back(addr, n); }
+  std::vector<std::pair<u32, size_t>> invalidated;  // every InvalidateCode call, in order
 
   u32 U32(u32 addr) const
   {
@@ -77,6 +81,19 @@ public:
   std::vector<std::string> osd;
 };
 
+// Hardware that uses memory on its own: Query returns whatever `list` holds right now.
+class FakeHardware final : public HardwareView
+{
+public:
+  void Query(std::vector<Exclusion>* out) override
+  {
+    ++queries;
+    out->insert(out->end(), list.begin(), list.end());
+  }
+  std::vector<Exclusion> list;
+  int queries = 0;
+};
+
 // The layout of the fake game's memory.
 constexpr u32 TEAM[2] = {0x80400000, 0x80401000};
 constexpr u32 NODE[2] = {0x80410000, 0x80411000};
@@ -87,6 +104,7 @@ constexpr u32 HIDDEN = 0x80700000;   // NOT whitelisted
 constexpr u32 SP = 0x80800000;       // the hook's stack pointer
 constexpr u32 WINDOW = 0x400;
 
+constexpr u32 HW_WORD = STATE_A + 0x44;  // a word "hardware" writes by itself every frame (inside the excluded 0x40..0x80)
 constexpr u32 FIELD_X = 0x84;
 constexpr u32 FIELD_HEALTH = 0x28;
 
@@ -127,18 +145,32 @@ public:
     Command c;
     c.frame = m_counter;
     c.pads = PadsFor(m_counter);
+    if (m_z.has_value())
+    {
+      c.pads[0][0] = 0;
+      c.pads[0][1] = *m_z ? 0x10 : 0x00;
+    }
     c.sp = sp;
     const Reply r = test.OnCommand(c);
     if (r.flags & REPLY_FLAG_RESTORED)
     {
+      ++m_restores_seen;
+      m_hw_word_intact = m_hw_word_intact && m_mem.U32(HW_WORD) == m_hw_ticks;
       EXPECT_EQ(m_mem.U32(sp), r.frame) << "stack frame not restored";
       EXPECT_EQ(m_mem.U32(sp + 4), 0xC0FFEE00 + r.frame);
       m_counter = r.frame;
     }
     Step(r.pads);
+    if (m_hw_writes)
+      m_mem.SetU32(HW_WORD, ++m_hw_ticks);  // the hardware's own write, after the frame
     ++m_counter;
     return r;
   }
+
+  void EnableHardwareWord() { m_hw_writes = true; }  // "hardware" starts writing HW_WORD every frame
+  void SetZ(bool down) { m_z = down; }  // from now on port 0's buttons carry Z (0x0010) or nothing
+  bool HwWordIntact() const { return m_hw_word_intact; }  // every RESTORED reply left the hardware word alone
+  int RestoresSeen() const { return m_restores_seen; }
 
   void Step(const std::array<PadBytes, 2>& pads)
   {
@@ -161,6 +193,11 @@ private:
   FakeMemory m_mem;
   bool m_leak;
   u32 m_counter = 1000;
+  std::optional<bool> m_z;
+  bool m_hw_writes = false;
+  u32 m_hw_ticks = 0;
+  bool m_hw_word_intact = true;
+  int m_restores_seen = 0;
 };
 
 SyncTestOptions Options(int k, int every = 1)
@@ -170,6 +207,7 @@ SyncTestOptions Options(int k, int every = 1)
   o.every = every;
   o.stack_window = WINDOW;
   o.whitelist_path = "test.json";
+  o.arm_commands = 60;  // the product default is 600; most tests do not need to wait that long
   return o;
 }
 
@@ -379,6 +417,10 @@ TEST(Rev3Rollback, CleanRunHasNoMismatches)
   EXPECT_FALSE(sink.Contains("MISMATCH"));
   EXPECT_TRUE(sink.osd.empty());
   EXPECT_TRUE(sink.Contains("SYNCTEST start K=2 EVERY=1 window=0x400 whitelist=test.json ranges=2 bytes=320"));
+  EXPECT_TRUE(sink.Contains("arm=60 noop=0"));
+  EXPECT_TRUE(sink.Contains("NOTE armed at frame 1059 (60 hook calls with both fighters)"));
+  EXPECT_EQ(s.icache_us_max, 7u);
+  EXPECT_EQ(s.noop_restores, 0u);
   EXPECT_TRUE(sink.Contains("SUMMARY frame="));  // 600 frames compared were passed
 
   test.Finish();
@@ -509,4 +551,262 @@ TEST(Rev3Rollback, GameThatIgnoresTheRestoreIsDetected)
   EXPECT_EQ(r2.flags, 0u);
   EXPECT_FALSE(test.Resimulating());
   EXPECT_TRUE(sink.Contains("ERROR resimulation expected frame"));
+}
+
+// ---- arm delay, noop mode, hardware exclusions, pad toggle, JIT invalidation ------------------------------------------------
+
+TEST(Rev3Rollback, ArmsOnlyAfterTheConfiguredDelay)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTestOptions o = Options(2);
+  o.arm_commands = 600;  // the product default
+  SyncTest test(o, game.Ranges(), game.Mem(), sink, FakeClock());
+  for (int i = 0; i < 599; ++i)
+    EXPECT_EQ(game.Frame(test).flags, 0u);
+  EXPECT_FALSE(test.Active());
+  EXPECT_EQ(test.Stats().rollbacks, 0u);
+  EXPECT_FALSE(sink.Contains("NOTE armed"));
+
+  game.Frame(test);  // the 600th call arms
+  EXPECT_TRUE(test.Active());
+  EXPECT_TRUE(sink.Contains("NOTE armed at frame 1599"));
+  for (int i = 0; i < 30; ++i)
+    game.Frame(test);
+  EXPECT_GT(test.Stats().rollbacks, 5u);
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u);
+
+  // Losing the fighters disarms and the delay starts over.
+  game.Mem().SetU32(0x8038FE50 + 4, 0);
+  game.Frame(test);
+  EXPECT_FALSE(test.Active());
+  EXPECT_TRUE(sink.Contains("fighters lost"));
+  game.Mem().SetU32(0x8038FE50 + 4, TEAM[1]);
+  const u32 rollbacks = test.Stats().rollbacks;
+  for (int i = 0; i < 599; ++i)
+    game.Frame(test);
+  EXPECT_EQ(test.Stats().rollbacks, rollbacks);
+  EXPECT_FALSE(test.Active());
+}
+
+TEST(Rev3Rollback, HeartbeatEvery300CallsWhileArmed)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTest test(Options(2), game.Ranges(), game.Mem(), sink, FakeClock());
+  for (int i = 0; i < 60 + 899; ++i)  // armed on call 60; 899 armed calls after it plus the arming call = 900
+    game.Frame(test);
+  int hb = 0;
+  for (const std::string& l : sink.lines)
+    hb += l.rfind("HB frame=", 0) == 0;
+  EXPECT_EQ(hb, 3);
+}
+
+TEST(Rev3Rollback, FirstTenRestoresAreLogged)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTest test(Options(2), game.Ranges(), game.Mem(), sink, FakeClock());
+  for (int i = 0; i < 200; ++i)
+    game.Frame(test);
+  int done = 0, begin = 0;
+  for (const std::string& l : sink.lines)
+  {
+    done += l.rfind("RESTORE ", 0) == 0 && l.find(" bytes=") != std::string::npos;
+    begin += l.rfind("RESTORE ", 0) == 0 && l.find(" begin") != std::string::npos;
+  }
+  EXPECT_EQ(done, 10);
+  EXPECT_EQ(begin, 10);
+  EXPECT_TRUE(sink.Contains("RESTORE 1061 -> 1059 bytes=" + std::to_string(320 + WINDOW) + " us=7 icache_us=7"));
+}
+
+TEST(Rev3Rollback, NoopModeRestoresTheSameFrameEveryFrame)
+{
+  FakeGame game(true);  // even a leaky game cannot mismatch: nothing is compared
+  FakeSink sink;
+  SyncTestOptions o = Options(2);
+  o.noop = true;
+  SyncTest test(o, game.Ranges(), game.Mem(), sink, FakeClock());
+  for (int i = 0; i < 59; ++i)
+    EXPECT_EQ(game.Frame(test).flags, 0u);
+
+  for (int i = 0; i < 700; ++i)
+  {
+    const u32 frame = game.Counter();
+    const Reply r = game.Frame(test);  // checks that the stack frame came back
+    EXPECT_EQ(r.flags, REPLY_FLAG_RESTORED);
+    EXPECT_EQ(r.frame, frame);                       // same frame ...
+    EXPECT_EQ(r.pads, FakeGame::PadsFor(frame));     // ... same inputs
+    EXPECT_EQ(game.Counter(), frame + 1);            // the game moves on normally
+  }
+  const SyncTestStats& s = test.Stats();
+  EXPECT_EQ(s.noop_restores, 700u);
+  EXPECT_EQ(s.rollbacks, 0u);
+  EXPECT_EQ(s.frames_compared, 0u);
+  EXPECT_EQ(s.mismatching_frames, 0u);
+  EXPECT_FALSE(test.Resimulating());
+  EXPECT_FALSE(sink.Contains("MISMATCH"));
+  EXPECT_FALSE(sink.Contains("ERROR"));
+  EXPECT_TRUE(sink.Contains("noop=1"));
+  EXPECT_TRUE(sink.Contains("SUMMARY frame="));  // every 600 noop restores
+  test.Finish();
+  EXPECT_TRUE(sink.Contains("noop_restores=700"));
+}
+
+TEST(Rev3Rollback, HardwareRegionsAreSubtractedFromTheSnapshot)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  FakeHardware hw;
+  game.EnableHardwareWord();
+  hw.list = {{"gx_fifo", STATE_A + 0x40, STATE_A + 0x80},  // inside a whitelist range: 0x40 bytes go
+             {"xfb_top", 0x80900000, 0x80980000}};          // not in the whitelist at all: logged, nothing removed
+  SyncTest test(Options(2), game.Ranges(), game.Mem(), sink, FakeClock(), &hw);
+  for (int i = 0; i < 300; ++i)
+    game.Frame(test);
+
+  EXPECT_GT(hw.queries, 0);
+  EXPECT_TRUE(sink.Contains("NOTE exclude gx_fifo 0x80500040-0x80500080 (64 bytes were in the whitelist)"));
+  EXPECT_TRUE(sink.Contains("NOTE exclude xfb_top 0x80900000-0x80980000 (0 bytes were in the whitelist)"));
+  EXPECT_TRUE(sink.Contains("NOTE snapshot now ranges=3"));
+  size_t bytes = 0;
+  for (const Range& r : test.Ranges())
+  {
+    bytes += r.end - r.start;
+    EXPECT_TRUE(r.end <= STATE_A + 0x40 || r.start >= STATE_A + 0x80);
+  }
+  EXPECT_EQ(bytes, 320u - 0x40u);
+  EXPECT_EQ(test.SnapshotBytes(), bytes + WINDOW);
+
+  // The hardware's own word was never rewound, and since it is not in the snapshot the replay does not differ because of it.
+  EXPECT_GT(game.RestoresSeen(), 20);
+  EXPECT_TRUE(game.HwWordIntact());
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u);
+  EXPECT_EQ(test.Stats().sp_mismatches, 0u);
+  EXPECT_FALSE(sink.Contains("ERROR"));
+
+  // Control: without the exclusion the same word is rewound and the replay differs.
+  FakeGame game2(false);
+  game2.EnableHardwareWord();
+  FakeSink sink2;
+  SyncTest test2(Options(2), game2.Ranges(), game2.Mem(), sink2, FakeClock());
+  for (int i = 0; i < 300; ++i)
+    game2.Frame(test2);
+  EXPECT_FALSE(game2.HwWordIntact());
+  EXPECT_GT(test2.Stats().mismatching_frames, 0u);
+}
+
+TEST(Rev3Rollback, NewHardwareRegionsClearTheHistoryAndOnlyGrow)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  FakeHardware hw;
+  hw.list = {{"audio_dma", STATE_B + 0x08, STATE_B + 0x10}};  // the game's own state at STATE_B + 4 stays in
+  SyncTestOptions o = Options(2);
+  o.hardware_check_every = 50;
+  SyncTest test(o, game.Ranges(), game.Mem(), sink, FakeClock(), &hw);
+  for (int i = 0; i < 100; ++i)
+    game.Frame(test);
+  EXPECT_EQ(test.Ranges().size(), 3u);  // STATE_A, STATE_B + 0 .. 8, STATE_B + 0x10 .. 0x40
+  const u32 rollbacks = test.Stats().rollbacks;
+  EXPECT_GT(rollbacks, 0u);
+
+  // A second buffer shows up (double buffering); the first stays excluded even when the hardware no longer reports it.
+  hw.list = {{"audio_dma", STATE_B + 0x20, STATE_B + 0x30}};
+  for (int i = 0; i < 100; ++i)
+    game.Frame(test);
+  EXPECT_TRUE(sink.Contains("NOTE exclude audio_dma 0x80600020-0x80600030"));
+  EXPECT_TRUE(sink.Contains("history cleared, frame"));
+  const std::vector<Range> want = {{STATE_A, STATE_A + 0x100}, {STATE_B, STATE_B + 0x08}, {STATE_B + 0x10, STATE_B + 0x20}, {STATE_B + 0x30, STATE_B + 0x40}};
+  ASSERT_EQ(test.Ranges().size(), want.size());
+  for (size_t i = 0; i < want.size(); ++i)
+  {
+    EXPECT_EQ(test.Ranges()[i].start, want[i].start) << i;
+    EXPECT_EQ(test.Ranges()[i].end, want[i].end) << i;
+  }
+  EXPECT_GT(test.Stats().rollbacks, rollbacks);
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u);
+  EXPECT_FALSE(sink.Contains("ERROR"));
+  // Seeing the same region again is not news.
+  int lines = 0;
+  for (const std::string& l : sink.lines)
+    lines += l.rfind("NOTE exclude", 0) == 0;
+  EXPECT_EQ(lines, 2);
+}
+
+TEST(Rev3Rollback, PadZArmsAndDisarms)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTestOptions o = Options(2);
+  o.arm_by_pad = true;
+  SyncTest test(o, game.Ranges(), game.Mem(), sink, FakeClock());
+  game.SetZ(false);
+  for (int i = 0; i < 300; ++i)  // fighters present for a long time, no press: never armed
+    EXPECT_EQ(game.Frame(test).flags, 0u);
+  EXPECT_FALSE(test.Active());
+  EXPECT_TRUE(sink.Contains("arm=pad"));
+
+  game.SetZ(true);  // press: armed
+  game.Frame(test);
+  EXPECT_TRUE(test.Active());
+  EXPECT_TRUE(sink.Contains("NOTE armed by Z at frame 1300"));
+  for (int i = 0; i < 20; ++i)  // holding Z does nothing
+    game.Frame(test);
+  EXPECT_TRUE(test.Active());
+  game.SetZ(false);
+  for (int i = 0; i < 20; ++i)
+    game.Frame(test);
+  EXPECT_TRUE(test.Active());
+  EXPECT_GT(test.Stats().rollbacks, 5u);
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u);
+
+  // A press in the middle of a resimulation waits until it is over.
+  while (!test.Resimulating())
+    game.Frame(test);
+  game.SetZ(true);
+  game.Frame(test);
+  EXPECT_TRUE(test.Active());
+  game.SetZ(false);
+  for (int i = 0; i < 6; ++i)
+    game.Frame(test);
+  EXPECT_FALSE(test.Active());
+  EXPECT_TRUE(sink.Contains("NOTE disarmed by Z"));
+  EXPECT_FALSE(test.Resimulating());
+  const u32 rollbacks = test.Stats().rollbacks;
+  for (int i = 0; i < 50; ++i)
+    EXPECT_EQ(game.Frame(test).flags, 0u);
+  EXPECT_EQ(test.Stats().rollbacks, rollbacks);
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u);
+
+  // And a new press arms again.
+  game.SetZ(true);
+  game.Frame(test);
+  EXPECT_TRUE(test.Active());
+}
+
+TEST(Rev3Rollback, RestoredRangesAreInvalidatedInTheJit)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTest test(Options(2), game.Ranges(), game.Mem(), sink, FakeClock());
+  for (int i = 0; i < 70; ++i)
+    game.Frame(test);
+  const u32 rollbacks = test.Stats().rollbacks;
+  ASSERT_GT(rollbacks, 0u);
+  // Two ranges per restore, each invalidated once with its own start and length.
+  ASSERT_EQ(game.Mem().invalidated.size(), rollbacks * 2);
+  EXPECT_EQ(game.Mem().invalidated[0], std::make_pair(STATE_A, size_t(0x100)));
+  EXPECT_EQ(game.Mem().invalidated[1], std::make_pair(STATE_B, size_t(0x40)));
+  EXPECT_EQ(test.Stats().icache_us_total, test.Stats().restore_us_total);  // the fake clock: 7 us each
+
+  FakeGame game2(false);
+  FakeSink sink2;
+  SyncTestOptions o = Options(2);
+  o.invalidate_code = false;
+  SyncTest test2(o, game2.Ranges(), game2.Mem(), sink2, FakeClock());
+  for (int i = 0; i < 70; ++i)
+    game2.Frame(test2);
+  EXPECT_GT(test2.Stats().rollbacks, 0u);
+  EXPECT_TRUE(game2.Mem().invalidated.empty());
 }
