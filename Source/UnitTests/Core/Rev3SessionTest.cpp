@@ -13,6 +13,7 @@
 // MAXR, (d) never log DESYNC / ERROR / LEAVE.
 
 #include <algorithm>
+#include <cmath>
 #include <array>
 #include <cstring>
 #include <deque>
@@ -2131,15 +2132,17 @@ TEST(Rev3Session, DecidePaceHardInTheFirst120FramesThenGentle)
   // The 120th frame after the gate is still hard, the 121st is gentle.
   EXPECT_STREQ(DecidePace(c, 120, 40000).action, "hard");
   EXPECT_STREQ(DecidePace(c, 121, 40000).action, "gentle");
-  // Gentle: nothing inside the dead band (8 ms), then proportional up to 1 % of the interval at a lead of 3 frames and beyond.
+  // Gentle: nothing inside the dead band (8 ms), then proportional up to 2 % of the interval at a lead of 2 frames and beyond.
   EXPECT_STREQ(DecidePace(c, 121, 8000).action, "none");
   EXPECT_STREQ(DecidePace(c, 121, 8001).action, "gentle");
-  EXPECT_GE(DecidePace(c, 121, 8001).delay_us, 799);
-  EXPECT_LE(DecidePace(c, 121, 8001).delay_us, 801);
-  EXPECT_EQ(DecidePace(c, 500, 50000).delay_us, 5000);
-  const s32 most = DecidePace(c, 500, 50049).delay_us;
+  EXPECT_GE(DecidePace(c, 121, 8001).delay_us, 2399);
+  EXPECT_LE(DecidePace(c, 121, 8001).delay_us, 2401);
+  EXPECT_EQ(DecidePace(c, 500, 16683).delay_us, 5004);  // half the window: half the maximum
+  const s32 most = DecidePace(c, 500, 2 * PACE_FRAME_US).delay_us;
+  EXPECT_EQ(most, 10009);
+  EXPECT_EQ(DecidePace(c, 500, 50000).delay_us, most);
   EXPECT_EQ(DecidePace(c, 500, 1000000).delay_us, most);
-  EXPECT_LE(most, c.interval_frames * PACE_FRAME_US / 100);  // never more than 1 % of an interval
+  EXPECT_LE(most, c.interval_frames * PACE_FRAME_US * 2 / 100);  // never more than 2 % of an interval
   EXPECT_STREQ(DecidePace(c, 500, -8001).action, "behind");
   EXPECT_STREQ(DecidePace(c, 500, -8000).action, "none");
   // A hard correction is bounded by one hard_max however large the offset is.
@@ -2188,6 +2191,37 @@ TEST(Rev3Session, TimeSyncDropsJitterSpikesAtBothEnds)
   s32 off = 0;
   ASSERT_TRUE(t.OffsetUs(&off));
   EXPECT_EQ(off, 5000);
+}
+
+TEST(Rev3Session, TimeSyncAfterAResetIgnoresRemoteFramesWeSentBeforeThePacingDelay)
+{
+  // Frames the peer sent before our correction arrive for a while after it (half an RTT in flight); our send time of THOSE frames is the old
+  // timing, so they would describe the skew we just removed. After Reset() only remote frames above our newest sent one are sampled.
+  TimeSync t;
+  constexpr u64 RTT = 40000;
+  for (s32 f = 0; f < 10; ++f)
+  {
+    t.OnLocalSend(f, 100000 + static_cast<u64>(f) * PACE_FRAME_US);
+    t.OnRemote(f, 100000 + static_cast<u64>(f) * PACE_FRAME_US + 20000 + RTT / 2, RTT);
+  }
+  EXPECT_EQ(t.Samples(), 10u);
+  t.Reset();  // we delayed ourselves; our newest sent frame is 9
+  for (s32 f = 10; f < 14; ++f)  // our frames 10..13 go out after the correction
+    t.OnLocalSend(f, 500000 + static_cast<u64>(f) * PACE_FRAME_US);
+  t.OnRemote(5, 900000, RTT);   // older than the newest remote seen: ignored as before
+  t.OnRemote(10, 900000, RTT);  // not older, and above our newest frame at the Reset: a sample
+  EXPECT_EQ(t.Samples(), 1u);
+  TimeSync u;
+  for (s32 f = 0; f < 10; ++f)
+    u.OnLocalSend(f, 100000 + static_cast<u64>(f) * PACE_FRAME_US);
+  u.OnRemote(4, 400000, RTT);
+  u.Reset();                    // newest sent frame: 9
+  u.OnRemote(7, 500000, RTT);   // sent by the peer before our correction: skipped
+  u.OnRemote(9, 500000, RTT);   // skipped (our frame 9 went out before the Reset)
+  EXPECT_EQ(u.Samples(), 0u);
+  u.OnLocalSend(10, 600000);
+  u.OnRemote(10, 700000, RTT);  // a frame we sent after the Reset: counts
+  EXPECT_EQ(u.Samples(), 1u);
 }
 
 TEST(Rev3Session, TimeSyncNeedsAnRttAndALocalSendAndFallsBackToSlippisFormulaForFramesNotSentYet)
@@ -2252,8 +2286,8 @@ TEST(Rev3Session, PacingTurnsGentleAfter120FramesAndNeverAsksForMoreThanASlicePe
   ArmedFrames(rig, 160 - 10 + 12);  // calls 10..161: checks at 40, 70, 100, 130 (since_gate 120: still hard) and 160 (gentle)
   EXPECT_EQ(rig.session->stats().pace_checks, 5u);
   EXPECT_TRUE(rig.sink.Has("PACE frame=130 since_gate=120 offset_us=50000 adv=3.00 rtt_ms=100.0 samples=30 action=hard sleep_us=45000"));
-  EXPECT_TRUE(rig.sink.Has("PACE frame=160 since_gate=150 offset_us=50000 adv=3.00 rtt_ms=100.0 samples=30 action=gentle sleep_us=5000"));
-  EXPECT_EQ(pacer.total, 4u * 45000u + 5000u);
+  EXPECT_TRUE(rig.sink.Has("PACE frame=160 since_gate=150 offset_us=50000 adv=3.00 rtt_ms=100.0 samples=30 action=gentle sleep_us=10009"));
+  EXPECT_EQ(pacer.total, 4u * 45000u + 10009u);
   for (u32 d : pacer.delays)
     EXPECT_LE(d, 4000u);
 }
@@ -2963,7 +2997,11 @@ struct SimParams
   // pacing is about cannot exist (the older tests keep the simple model: next call = this call + period).
   bool catch_up = false;
   u64 compute_us[2] = {2000, 2000};    // what one frame of work costs on each host when nothing throttles it (catch_up only)
-  u64 resim_compute_us[2] = {2000, 2000};  // what one hidden resimulated frame costs (catch_up only; the throttle clock restarts when it ends)
+  u64 resim_compute_us[2] = {2000, 2000};  // what one hidden resimulated frame costs (catch_up only)
+  bool resim_restarts_clock = false;   // catch_up only. false: Dolphin as built since M5 fix 2 (CoreTimingManager::BeginResim / EndResim): the re-run frames
+                                       // do not count as schedule time, so a machine that rolled back pays for the re-run out of the next frames and stays
+                                       // on its schedule. true: the M4/M5 behaviour (every Throttle during the resimulation resets the clock): the re-run
+                                       // time is lost for good, a machine that rolls back often drifts later (~2 % in D's first loopback)
   u64 max_fallback_us = 100000;        // MAIN_MAX_FALLBACK: a lag beyond this is forgiven (catch_up only)
   bool pace = false;                   // pacing on (Config::pace.enabled) with a simulated actuator; false: the sessions only measure
   u64 gate_skew_us[2] = {0, 0};        // catch_up only: when machine i first turns ARMED its throttle schedule restarts at "now + this", i.e. it is that
@@ -3236,14 +3274,16 @@ bool RunSim(const SimParams& p, SimResult* out)
         }
         if (m.session->Resimulating())
         {
-          // Hidden resimulation (v1): the throttle is off, so the frames run back to back and every Throttle call restarts the clock.
-          m.target_us = net.now;
+          // Hidden resimulation (v1): the throttle is off, so the frames run back to back. Either every Throttle call restarts the clock (legacy)
+          // or the schedule is left alone and put back at the end (BeginResim / EndResim): the target does not move here.
+          if (p.resim_restarts_clock)
+            m.target_us = net.now;
           m.next_at = net.now + p.resim_compute_us[m.idx];
         }
         else
         {
-          if (shift != 0 || resim_call)
-            m.target_us = net.now + shift;  // a pacing delay (sleep, then the throttle clock restarts) or the end of a resimulation (the clock was restarted)
+          if (shift != 0 || (resim_call && p.resim_restarts_clock))
+            m.target_us = net.now + shift;  // a pacing delay (sleep, then the throttle clock restarts) or, legacy, the end of a resimulation
           m.target_us += m.period;
           if (m.target_us + p.max_fallback_us < net.now)
             m.target_us = net.now - p.max_fallback_us;  // lagging by more than MAIN_MAX_FALLBACK: the lag is forgiven
@@ -3659,11 +3699,15 @@ TEST(Rev3Session, MismatchingHellosEndBothSessionsBeforeFrameZero)
   EXPECT_TRUE(kb.Has("HELLO item cpu_core: own=CachedInterpreter peer=JIT64"));
 }
 // ---- M5: pacing in the closed loop --------------------------------------------------------------------------------------------
-// D's loopback (two Dolphins, 80 ms delay, 30 ms jitter, 5 % loss, input delay 2, MAXR 5): the host stalled 1902 of 7788 frames and never rolled
-// back, the guest stalled 5 times and rolled back 42 times. The host's pads were the ones that kept changing, the guest's stayed the same; the
-// host sat at the stall limit all match long because Dolphin's throttle lets a machine that waited run the next frames unthrottled, so two
-// greedy machines settle with the leader pinned. Every guest rollback restarts the guest's throttle clock (the hidden resimulation runs with the
-// throttle off), which moves the guest LATER again and again: the guest can never catch up on its own.
+// D's first loopback (two Dolphins, 80 ms delay, 30 ms jitter, 5 % loss, input delay 2, MAXR 5): the host stalled 1902 of 7788 frames and never rolled
+// back, the guest stalled 5 times and rolled back 42 times. The host's pads were the ones that kept changing, the guest's stayed the same. With pacing
+// (1 % at most) the second run was no better: host 1691 stalls, 130 slowdowns that were all at the maximum, the host's lead (+2.5 frames, the stall limit)
+// never went away. Two causes, both modelled by the test network (SimMachine with Dolphin's catch-up throttle):
+//  1. Dolphin's throttle lets a machine that waited run the next frames unthrottled, so a machine that starts ahead sits at the stall limit for good (the
+//     gate-open skew: `lead_frames` below).
+//  2. The hidden resimulation ran with the throttle off and every Throttle call restarted the clock, so the re-run time was lost for good: a machine
+//     that rolled back 120 times at ~7 ms lost about 2 % of its speed and drifted later and later, more than the 1 % pacing could take back
+//     (`resim_restarts_clock = true` is that old behaviour; since the fix CoreTimingManager::BeginResim / EndResim keep the schedule).
 SimParams LoopbackLikeParams(u64 seed, u64 lead_frames, u64 resim_us, bool pace)
 {
   SimParams p;
@@ -3690,7 +3734,9 @@ SimParams LoopbackLikeParams(u64 seed, u64 lead_frames, u64 resim_us, bool pace)
 TEST(Rev3Session, PacingRemovesTheLeadersPersistentStallsWhenOneSideStartsFiveFramesAhead)
 {
   u32 compared = 0;
-  for (u64 seed : {11ull, 12ull, 13ull, 14ull})
+  // (A start 5 frames ahead is not always persistent: a long jitter stall can make the leader's lag exceed MAIN_MAX_FALLBACK, which shifts its schedule
+  // back and ends the lead on its own. These seeds are the ones where it persists with pacing off, which is the case worth fixing.)
+  for (u64 seed : {12ull, 13ull, 15ull, 16ull})
     for (u64 resim_us : {2000ull, 8000ull})
     {
       SimResult off, on;
@@ -3710,10 +3756,11 @@ TEST(Rev3Session, PacingRemovesTheLeadersPersistentStallsWhenOneSideStartsFiveFr
       EXPECT_LT(off.m[1].stats.stalls, 20u) << what;
       EXPECT_EQ(off.m[0].stats.rollbacks, 0u) << what;
       // Pacing: the leader's stalls drop by a large factor (and the time it spends waiting with them).
-      EXPECT_LE(on.m[0].stats.stalls * (resim_us <= 2000 ? 8 : 4), off.m[0].stats.stalls) << what;
+      EXPECT_LE(on.m[0].stats.stalls * 8, off.m[0].stats.stalls) << what;
       EXPECT_LE(on.m[0].stats.stall_us_total * 4, off.m[0].stats.stall_us_total) << what;
       // The lead was turned into delay on the leader's side only.
       EXPECT_GT(on.m[0].stats.pace_slowdowns, 0u) << what;
+      EXPECT_LT(std::abs(static_cast<double>(on.m[0].stats.pace_offset_sum_us) / std::max<u32>(on.m[0].stats.pace_checks, 1) / PACE_FRAME_US), 1.0) << what;  // level on average
       EXPECT_GT(on.m[0].slept_us, 0u) << what;
       EXPECT_EQ(on.m[0].stats.pace_sleep_us_total, on.m[0].slept_us) << what;
       EXPECT_EQ(off.m[0].slept_us, 0u) << what;
@@ -3738,6 +3785,76 @@ TEST(Rev3Session, PacingRemovesTheLeadersPersistentStallsWhenOneSideStartsFiveFr
       ++compared;
     }
   EXPECT_EQ(compared, 8u);
+}
+
+TEST(Rev3Session, ARollbackThatKeepsTheThrottleScheduleLeavesTheMachineLevelWithoutAnyPacing)
+{
+  // The cause of the drift in D's first loopback. The guest rolls back on ~8 % of the frames (the host's pad moves), each re-run costs 2 or 8 ms per
+  // frame. Old model (every Throttle call of the resimulation restarts the clock): the re-run time is lost for good, the guest falls behind by a
+  // few frames and the host sits at the stall limit. Model of the fix (the schedule is left alone and put back, CoreTimingManager::BeginResim /
+  // EndResim): the guest pays for the re-run out of the following frames (it runs them unthrottled until it is back on its schedule) and stays level
+  // with no pacing at all.
+  // (Seeds where the two machines happen to come out of the lockstep level: the question here is what the rollbacks do, not the gate skew.)
+  for (u64 seed : {12ull, 13ull})
+    for (u64 resim_us : {2000ull, 8000ull})
+    {
+      SimParams keep = LoopbackLikeParams(seed, 0, resim_us, false);
+      SimParams restart = keep;
+      restart.resim_restarts_clock = true;
+      SimResult a, b;
+      ASSERT_TRUE(RunSim(keep, &a));
+      ASSERT_TRUE(RunSim(restart, &b));
+      const std::string what = "seed " + std::to_string(seed) + " resim " + std::to_string(resim_us) + " us";
+      EXPECT_EQ(CheckHealthy(keep, a), "") << what;
+      EXPECT_EQ(CheckHealthy(restart, b), "") << what;
+      EXPECT_GT(a.m[1].stats.rollbacks, 100u) << what;  // the guest really rolls back a lot
+      EXPECT_LT(a.m[0].stats.stalls + a.m[1].stats.stalls, 60u) << what;  // nobody pinned (which side leads a little varies with the seed)
+      EXPECT_LT(std::abs(static_cast<double>(a.m[0].stats.pace_offset_sum_us) / std::max<u32>(a.m[0].stats.pace_checks, 1) / PACE_FRAME_US), 1.6) << what;
+      EXPECT_GT(b.m[0].stats.stalls, 500u) << what;      // the old behaviour: the host pinned, as in D's loopback
+      EXPECT_EQ(b.m[0].stats.rollbacks, 0u) << what;
+      EXPECT_TRUE(a.m[0].state == a.m[1].state) << what;
+    }
+}
+
+TEST(Rev3Session, WhenARollbackRestartsTheClockPacingStillRemovesMostOfTheLeadersStalls)
+{
+  // The old throttle behaviour (resim_restarts_clock): pacing at up to 2 % takes back what a machine loses to its rollbacks.
+  for (u64 resim_us : {2000ull, 8000ull})
+  {
+    SimParams off = LoopbackLikeParams(12, 0, resim_us, false);
+    off.resim_restarts_clock = true;
+    SimParams on = off;
+    on.pace = true;
+    SimResult a, b;
+    ASSERT_TRUE(RunSim(off, &a));
+    ASSERT_TRUE(RunSim(on, &b));
+    EXPECT_EQ(CheckHealthy(off, a), "") << resim_us;
+    EXPECT_EQ(CheckHealthy(on, b), "") << resim_us;
+    EXPECT_GT(a.m[0].stats.stalls, 500u) << resim_us;
+    EXPECT_LE(b.m[0].stats.stalls * 8, a.m[0].stats.stalls) << resim_us;
+    EXPECT_TRUE(b.m[0].state == b.m[1].state) << resim_us;
+    EXPECT_EQ(b.m[0].bad_delay_calls, 0u) << resim_us;
+  }
+}
+
+TEST(Rev3Session, PacingFollowsAPeerWhoseClockRunsOnePointFivePercentSlower)
+{
+  // A machine that is simply slower (here the guest's frame is 1.5 % longer) pins the faster one at the stall limit for good; the leader's gentle
+  // slowdown (up to 2 %) takes the difference back, a 1 % cap (the first M5 build) could not.
+  SimParams off = LoopbackLikeParams(13, 0, 2000, false);
+  off.period_us[1] = off.period_us[0] + off.period_us[0] * 15 / 1000;
+  SimParams on = off;
+  on.pace = true;
+  SimResult a, b;
+  ASSERT_TRUE(RunSim(off, &a));
+  ASSERT_TRUE(RunSim(on, &b));
+  EXPECT_EQ(CheckHealthy(off, a), "");
+  EXPECT_EQ(CheckHealthy(on, b), "");
+  EXPECT_GT(a.m[0].stats.stalls, 300u);
+  EXPECT_LE(b.m[0].stats.stalls * 8, a.m[0].stats.stalls);
+  EXPECT_TRUE(b.m[0].state == b.m[1].state);
+  EXPECT_LE(b.m[0].largest_delay_us, 4000u);
+  EXPECT_LT(b.m[0].slept_us * 50, b.end_us);  // under 2 % of the run
 }
 
 TEST(Rev3Session, PacingBarelyActsOnABalancedPairAndStillAgrees)
@@ -3785,6 +3902,7 @@ TEST(Rev3Session, ThousandSeedsWithThrottleAndPacingAgreeWithTheReferenceAndNeve
     p.resim_compute_us[0] = 500 + r.Below(9000);
     p.resim_compute_us[1] = 500 + r.Below(9000);
     p.max_fallback_us = 50000 + r.Below(100000);
+    p.resim_restarts_clock = r.Below(2) == 0;  // the old throttle behaviour for half of the seeds
     p.gate_skew_us[0] = r.Below(3) == 0 ? r.Below(8 * 16683) : 0;
     p.gate_skew_us[1] = r.Below(3) == 0 ? r.Below(8 * 16683) : 0;
     SimResult res;
@@ -3821,6 +3939,8 @@ TEST(Rev3Session, ThousandSeedsWithThrottleAndPacingAgreeWithTheReferenceAndNeve
   EXPECT_GT(resims, 5000u);
   EXPECT_GT(reopens, 100u);
 }
+
+
 
 }  // namespace
 

@@ -740,9 +740,11 @@ host stalls 1902, predicted 3147, rollbacks 0; guest stalls 5, predicted 403, ro
 
 Dolphin's throttle makes up lost time: a machine that waited for the peer (a stall) runs the next frames without sleeping until it is back on its
 schedule (a lag beyond `MAIN_MAX_FALLBACK`, 100 ms, is forgiven). Two such machines settle with the leader at the stall limit (`N - R > MAXR`: it
-waits, catches up, waits again) and the follower never predicting. A hidden resimulation runs with the throttle off and the throttle clock restarts at its end, so
-the machine that rolls back often loses the re-run time for good and drifts later; the one that never rolls back stays ahead. The rollback itself
-works; the pair is just not balanced. So a delay must (1) go to the machine that is ahead and (2) survive the throttle's catch-up:
+waits, catches up, waits again) and the follower never predicting. A hidden resimulation used to run with the throttle off and every Throttle call restarted the clock, so
+the machine that rolls back often lost the re-run time for good and drifted later; the one that never rolls back stayed ahead (D's first M5 loopback: 120 rollbacks of
+~7 ms = ~2 % of the guest's speed, host stalls 1691 of 8650 frames, adv +2.45 / -2.75 for the whole match, pacing at 1 % always at its maximum and never enough).
+The rollback itself works; the pair was just not balanced. Two fixes (M5 fix 2, below): the throttle keeps its schedule through a resimulation, and pacing gets more
+authority. And a delay must (1) go to the machine that is ahead and (2) survive the throttle's catch-up:
 `CoreTimingManager::SleepAndResetThrottle(delay)` sleeps and then restarts the throttle clock at the current cycle (the emulated clock is untouched;
 CPU thread only; `DolphinPacer` calls it, and does nothing while the limiter is off). The actuator is a `PaceActuator` interface, so the session stays pure.
 
@@ -755,6 +757,18 @@ while it is still known (last 64 frames) and Slippi's formula only for a frame w
 none without an RTT estimate, a window of the last 30 samples is sorted and the **middle third averaged** (jitter spikes and late re-sends fall out at both ends).
 The RTT is the ACK time minus the FIRST send of the acked frame (EWMA 7/8); only pads re-sent by the resend timer give no sample (Karn). (Until M5 the sample needed
 a pad sent exactly once, which in ARMED, with a packet per frame repeating every unacked pad and an RTT longer than a frame, almost never happens: the RTT stayed 0.)
+
+### The throttle keeps its schedule through a resimulation (M5 fix 2)
+
+`Core::SetIsThrottlerResimDisabled(true/false)` (the hider's switch) now also calls `CoreTimingManager::BeginResim()` / `EndResim()`. While a resimulation runs, `Throttle()`
+returns at once (no sleep, no reset); `EndResim()` adds the emulated cycles the re-run frames took to the throttle's reference cycle. The schedule (reference time + cycles / clock) is then
+exactly what it would have been without the rollback: the machine that rolled back pays for the re-run out of the next frames (it runs them unthrottled until it is back on its schedule,
+like after any stall, bounded by `MAIN_MAX_FALLBACK`) instead of restarting its clock and being later by the cost of every rollback for the rest of the match. No game state is touched;
+only host wall time. In the test network a guest that rolls back on 8 % of the frames, 2 or 8 ms per re-run frame, now stays level with **no pacing at all** (stalls under 60 on both
+sides together), where the old behaviour pinned the host (over 500 stalls).
+
+Also: after a correction `TimeSync::Reset()` now ignores remote frames up to our newest sent one (their send times on our side are from before the delay), so the window after a correction
+holds only samples that describe the new timing.
 
 ### What it does (`RollbackSession::Pace()`, `DecidePace`)
 
@@ -772,13 +786,13 @@ than 4 ms; when the last slice is out, the offset window is cleared (the next ch
 | `hard_target_us` | 5000 | microseconds | hard: leave this much lead after the correction |
 | `hard_max_us` | 83415 (5 frames) | microseconds | hard: most delay one check may ask for (EXI:1451) |
 | `gentle_deadband_us` | 8000 | microseconds | gentle: ahead by this much or less = nothing (EXI:1521) |
-| `gentle_window_frames` | 3 | frames of lead | lead at which the gentle correction reaches its maximum (EXI:1514) |
-| `gentle_max_permille` | 10 | thousandths of the 30-frame interval | largest gentle slowdown, 1.0 % = 5 ms per check (Slippi 0.5 %) |
+| `gentle_window_frames` | 2 | frames of lead | lead at which the gentle correction reaches its maximum (Slippi 3, EXI:1514; the lead cannot grow past the stall limit, about 3 frames, so 3 never reached the maximum) |
+| `gentle_max_permille` | 20 | thousandths of the 30-frame interval | largest gentle slowdown, 2.0 % = 10 ms per check (Slippi 0.5 %; the first M5 build had 1.0 %) |
 | `slice_us` | 4000 | microseconds | most one hook call is delayed |
 | `min_samples` | 15 | offsets | needed in the window before a check may decide |
 
 Hard: ahead by more than `t1_us` loses `min(offset - hard_target_us, hard_max_us)`. Gentle: ahead by more than the dead band loses
-`interval * permille/1000 * min(offset, 3 frames) / 3 frames`. Worst case in the hard window: about 4 checks x 83 ms; afterwards at most 5 ms per 500 ms (1 %).
+`interval * permille/1000 * min(offset, 2 frames) / 2 frames`. Worst case in the hard window: about 4 checks x 83 ms; afterwards at most 10 ms per 500 ms (2 %).
 
 **Skew at the gate.** In lockstep every call waits for the peer's pad and then runs unthrottled until it is back on its schedule, so neither machine's throttle
 clock says anything about the other. When the gate opens (both at the same frame) the two are some frames apart (about the one-way latency plus jitter plus the START_CHECK
@@ -790,7 +804,7 @@ at once (at most 5 frames per check), the one that is behind does nothing.
 | variable | default | meaning |
 |---|---|---|
 | `REV3_NET_PACE=0\|1` | 1 | 0: measure and log, never delay (`action=off ... would=hard:35000`), the A/B baseline. Local to a machine, not part of HELLO (pacing changes no game state) |
-| `REV3_NET_PACE_T1_US`, `_HARD_MAX_US`, `_SLICE_US`, `_GENTLE_PERMILLE` | 10000, 83415, 4000, 10 | the numbers of the table above (0..100000, 0..300000, 100..16000, 0..100) |
+| `REV3_NET_PACE_T1_US`, `_HARD_MAX_US`, `_SLICE_US`, `_GENTLE_PERMILLE` | 10000, 83415, 4000, 20 | the numbers of the table above (0..100000, 0..300000, 100..16000, 0..100) |
 | `REV3_NET_ROLLBACK_MAX` | 5 | MAXR, 1..7 (Slippi's `ROLLBACK_MAX_FRAMES`). **Both machines must use the same value**: the gate close is scheduled MAXR + 1 frames after a final frame, so HELLO now carries `maxr` and a difference refuses the session and names it |
 | `REV3_NET_MAXR_ADAPT=1` | 0 | adaptive `MAXR_eff` (below), local |
 | `REV3_NET_MAXR_BUDGET_US` | 14000 | microseconds: the resimulation of K frames should cost less than this at its p95 (1000..100000) |
@@ -840,9 +854,9 @@ was ahead (and few on the other) with `pace_sleep_ms_total` a small part of the 
   Slippi's fallback), checks every 30 armed frames in slices and a cleared window, hard then gentle, never for a machine that is behind, pacing off, no RTT / too few samples, nothing in LOCKSTEP, 420 stalled calls leave while
   slow short stalls and interrupted runs do not, window close sends BYE and the peer logs the reason, resimulation cost percentiles, adaptive MAXR down / up / bounds, PACE log volume and the SUMMARY keys; PadLink RTT while streaming, timer
   re-sends, offsets through two links; option parsing; HELLO `maxr`.
-- Closed-loop test network (`SimMachine` with Dolphin's catch-up throttle, a restart of the throttle clock after a resimulation, the actual `TimeSync` and RTT estimator): with the host's pad moving, the guest's still and one side starting 5 frames
-  ahead (50 ms + 30 ms jitter, 5 % loss, D=2, MAXR=5) the host stalls 838 / 1837 / 1869 / 789 (resimulation 2 ms per frame) and 1629 / 1837 / 1869 / 1334 (8 ms) times with pacing off, 16 / 196 / 42 / 20 and 183 / 391 / 290 / 188 with it on;
-  the host sleeps 214-362 ms in a 41 s run; both sides end in the reference state. 1000 seeds of lossy, jittery runs (gate re-opens, busy hardware, relayouts, random throttle and resimulation costs, start skews) still agree with the reference and no
+- Closed-loop test network (`SimMachine` with Dolphin's catch-up throttle, the throttle schedule kept through a resimulation (or, `resim_restarts_clock`, restarted as before the fix), the actual `TimeSync` and RTT estimator): with the host's pad moving, the guest's still and one side starting 5 frames
+  ahead (50 ms + 30 ms jitter, 5 % loss, D=2, MAXR=5) the host stalls 1837 / 1869 / 1855 / 1847 times with pacing off (pinned for the whole run) and 168 / 22 / 22 / 22 with it on (mean advantage under 1 frame, the host sleeps 51-74 ms in a 41 s run); a peer whose clock is 1.5 % slower is followed;
+  with the old restart behaviour pacing still removes most of the stalls but runs at its maximum (adv_mean stays near 2 frames at 8 ms per re-run frame). Both sides end in the reference state. 1000 seeds of lossy, jittery runs (gate re-opens, busy hardware, relayouts, random throttle and resimulation costs, start skews) still agree with the reference and no
   delay is ever requested outside a normal ARMED call, nor larger than one slice. The 1000 seeds without the throttle model pass as before.
 - Not yet run: two real Dolphin processes with pacing (D does that), `SleepAndResetThrottle` under a real audio/video backend. The thresholds are the model's and Slippi's; D's numbers will retune them.
 

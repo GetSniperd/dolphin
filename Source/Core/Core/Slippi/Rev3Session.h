@@ -76,9 +76,10 @@
 //   first PaceConfig::hard_frames (120) frames are the hard window: the machine that is ahead gives the difference back at once (at most 5
 //   frames per check, in slices of 4 ms), the one that is behind does nothing. Every correction clears the offset window, so the next check
 //   waits for min_samples (15) fresh samples measured with the new timing. Pacing needs an RTT estimate (no decision without one: a
-//   missing RTT would make both machines believe they are ahead and both slow down). A hidden resimulation restarts the guest's throttle
-//   clock when it ends, which moves THAT machine later by the time the re-run took; that is why a machine that rolls back often is the one that
-//   ends up behind and the one that predicts and never rolls back is the one that has to slow down.
+//   missing RTT would make both machines believe they are ahead and both slow down). The throttle keeps its schedule through a hidden
+//   resimulation (CoreTimingManager::BeginResim / EndResim: the re-run frames do not count as schedule time). Until M5 fix 2 the clock was
+//   restarted at the end of every resimulation, which lost the re-run time for good: D's guest rolled back 120 times at ~7 ms, about 2 % of
+//   its speed, drifted later and later and left the host pinned at the stall limit, more than a 1 % pacing could take back.
 //
 // MAXR (M5)
 //   Config::max_rollback (REV3_NET_ROLLBACK_MAX, 1..7 = Slippi's ROLLBACK_MAX_FRAMES) is shared by both machines (HELLO checks it): the
@@ -155,9 +156,11 @@ struct PaceConfig
   s32 hard_target_us = 5000;         // hard sync: a correction aims to leave this much lead (microseconds); Slippi leaves up to t1
   s32 hard_max_us = 5 * PACE_FRAME_US;  // hard sync: most delay one check may ask for (microseconds; Slippi: 5 frames at most early on, EXI:1451)
   s32 gentle_deadband_us = 8000;     // later: ahead by this much or less = nothing (microseconds; Slippi: 8000, EXI:1521)
-  s32 gentle_window_frames = 3;      // later: the lead (in frames) at which the correction reaches its maximum (Slippi slow_down_frame_window, EXI:1514)
-  s32 gentle_max_permille = 10;      // later: largest slowdown, thousandths of the interval (10 = 1.0 %; Slippi uses 0.5 % = 5, EXI:1513). 1.0 % of a
-                                     // 30 frame interval is 5 ms: the gentle regime can never cost more than that per check
+  s32 gentle_window_frames = 2;      // later: the lead (in frames) at which the correction reaches its maximum (Slippi slow_down_frame_window = 3, EXI:1514; 2 here:
+                                     // the lead cannot grow past the stall limit, about 3 frames, so a 3 frame window never reached its maximum)
+  s32 gentle_max_permille = 20;      // later: largest slowdown, thousandths of the interval (20 = 2.0 %; Slippi uses 0.5 % = 5, EXI:1513). 2.0 % of a
+                                     // 30 frame interval is 10 ms: the gentle regime can never cost more than that per check. (D's first loopback with 1.0 %: the
+                                     // lead stayed at the stall limit; a machine that rolls back loses up to ~2 % of its speed unless the throttle keeps its schedule)
   s32 slice_us = 4000;               // the most one hook call is delayed (microseconds). A correction is spread over calls of this size, so a hard
                                      // one (83 ms) takes 21 calls, inside one interval, and a frame is never stretched by more than 4 ms
   u32 min_samples = 15;              // offsets needed in the window before a check may decide (a correction clears the window)
@@ -192,7 +195,8 @@ public:
   void OnLocalSend(s32 frame, u64 now_us);
   void OnRemote(s32 frame, u64 now_us, u64 rtt_us);
   bool OffsetUs(s32* out, u32* samples = nullptr) const;  // false: no sample yet
-  void Reset();                                           // forget the samples (after a correction: they describe the old timing)
+  void Reset();                                           // forget the samples (after a correction: they describe the old timing), and ignore remote
+                                                          // frames up to our newest sent one: our send time of those is from before the correction
   u32 Samples() const { return static_cast<u32>(m_count); }
 
 private:
@@ -206,6 +210,7 @@ private:
   size_t m_next = 0;
   std::array<Sent, RING> m_sent{};
   s32 m_local_frame = -1;  // newest local frame sent
+  s32 m_min_frame = 0;     // remote frames below this are not sampled (Reset)
   s32 m_newest_remote = -1;
 };
 

@@ -620,7 +620,7 @@ TEST(Rev3NetLink, M5PacingOptionsHaveDefaultsAndCanBeSet)
   EXPECT_EQ(o.pace.t1_us, 10000);
   EXPECT_EQ(o.pace.hard_max_us, 5 * PACE_FRAME_US);
   EXPECT_EQ(o.pace.slice_us, 4000);
-  EXPECT_EQ(o.pace.gentle_max_permille, 10);
+  EXPECT_EQ(o.pace.gentle_max_permille, 20);
   EXPECT_FALSE(o.maxr_adapt);  // the adaptive MAXR is off unless switched on
   EXPECT_EQ(o.maxr_budget_us, 14000u);
   EXPECT_TRUE(o.warnings.empty());

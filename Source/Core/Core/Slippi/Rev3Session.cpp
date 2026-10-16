@@ -509,6 +509,8 @@ void TimeSync::OnRemote(s32 frame, u64 now_us, u64 rtt_us)
   if (frame <= m_newest_remote)
     return;  // a re-sent or reordered packet: not the first arrival of this frame
   m_newest_remote = frame;
+  if (frame < m_min_frame)
+    return;  // sent by the peer before our last correction took effect: our send time of the same frame is the old timing
   if (m_local_frame < 0 || rtt_us == 0)
     return;  // nothing to compare with yet (Slippi's has_game_started), or no RTT estimate: the arrival time would be wrong by RTT/2
   // Slippi (SlippiNetplay.cpp:295-316): opponent_send_time = now - ping/2; offset = opponent_send_time - our_send_time + frame_time * (our_frame - their_frame).
@@ -551,6 +553,7 @@ void TimeSync::Reset()
 {
   m_count = 0;
   m_next = 0;
+  m_min_frame = m_local_frame + 1;
 }
 
 PaceDecision DecidePace(const PaceConfig& c, s32 frames_since_gate, s32 offset_us)
