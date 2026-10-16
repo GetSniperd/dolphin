@@ -133,12 +133,25 @@ u64 SubtractRange(std::vector<Range>* ranges, u32 lo, u32 hi);
 
 class Sink;  // defined below
 
+// A REV3_SYNCTEST_EXCLUDE entry whose address is read from guest memory (see ApplyExclusions).
+struct PtrExclusion
+{
+  u32 ptr = 0;   // address of the u32 holding the start of the region
+  u32 size = 0;  // bytes to exclude from that value on
+  std::string note;
+};
+
 // REV3_SYNCTEST_EXCLUDE: parses `json_text` like a whitelist ({"ranges":[...]}) and subtracts each range from *ranges, logging one
 // "NOTE exclude user 0xSTART-0xEND (n bytes were in the whitelist)" line per range to `sink`. False (and *ranges untouched) when the
 // JSON is bad or, with require_nonempty, the exclusions would leave nothing; *error says why. `parsed` (optional) receives the
 // exclusion ranges themselves (the adaptive snapshot set subtracts them from the pages it learns too).
+//
+// An entry may also be pointer based: {"ptr":"0x8049D000","size":"0x3F0000","note":".."} = "read the u32 at ptr when SyncTest arms (and
+// on every exclusion re-check) and exclude [value, value + size)" for memory the game allocates at run time (the sound heaps). Such
+// entries go to *ptrs (which must be given when the file has any; otherwise they are an error). They are not subtracted here.
 bool ApplyExclusions(const std::string& json_text, std::vector<Range>* ranges, Sink& sink, std::string* error,
-                     std::vector<Range>* parsed = nullptr, bool require_nonempty = true);
+                     std::vector<Range>* parsed = nullptr, bool require_nonempty = true,
+                     std::vector<PtrExclusion>* ptrs = nullptr);
 
 // Sorts by start and merges overlapping or touching ranges.
 std::vector<Range> MergeRanges(std::vector<Range> ranges);
@@ -188,6 +201,9 @@ public:
   virtual ~HardwareView() = default;
   // Appends the regions the hardware uses right now (guest addresses 0x80.. / 0x90..). Called on the CPU thread.
   virtual void Query(std::vector<Exclusion>* out) = 0;
+  // True while a disc read is in flight (GC DI registers TSTART, or the Wii IOS /dev/di device has a command executing or queued).
+  // Its destination cannot be cut out of the snapshot, so SyncTest postpones rollbacks while this is true. Default: never.
+  virtual bool DiscReadInFlight() { return false; }
 };
 
 class Sink
@@ -267,6 +283,7 @@ struct SyncTestStats
   u64 scan_us_max = 0;
   u64 scans = 0;
   u32 pages_learned_armed = 0;    // pages added to the set while armed
+  u32 io_postponed = 0;           // rollbacks postponed because a disc read was in flight
 };
 
 class SyncTest
@@ -281,7 +298,8 @@ public:
 
   // REV3_SYNCTEST_EXCLUDE ranges: cut out of every snapshot set, including the pages the adaptive tracker learns. Call before the
   // first command (the layout is rebuilt; nothing is logged).
-  void SetUserExclusions(std::vector<Range> exclusions);
+  // `pointers`: REV3_SYNCTEST_EXCLUDE entries read from guest memory when SyncTest arms and at every exclusion re-check.
+  void SetUserExclusions(std::vector<Range> exclusions, std::vector<PtrExclusion> pointers = {});
 
   // One command in, one reply out. All work (reads, snapshots, restores, logging) happens inside this call.
   Reply OnCommand(const Command& command);
@@ -326,8 +344,10 @@ private:
   Reply Resim(const Command& command, const std::array<u32, 2>& fighters);
   bool Restore(const Slot& s, const Command& command, u32 to);
   Reply Noop(const Command& command);
+  bool DiscReadPostpones(u32 frame);
   void RebuildLayout();
   void RefreshExclusions(bool at_arm = false);
+  void ResolvePtrExclusions(std::vector<Exclusion>* out);
   void ClearHistory();
   void Compare(const Slot& reference, const Slot& live, u32 frame);
   void SummaryLine(const char* tag);
@@ -347,6 +367,13 @@ private:
   std::vector<Range> m_seed;    // the whitelist (after the hook region cut)
   std::vector<Range> m_ranges;  // the current snapshot ranges = ComputeRanges() at the last rebuild
   std::vector<Range> m_user_exclusions;
+  struct PtrState
+  {
+    PtrExclusion entry;
+    bool skip_logged = false;  // the current "skipped" reason was logged
+    u32 skip_value = 0;
+  };
+  std::vector<PtrState> m_ptr_exclusions;
   GuestMemory& m_memory;
   Sink& m_sink;
   std::function<u64()> m_micros;

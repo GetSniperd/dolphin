@@ -114,8 +114,10 @@ public:
     ++queries;
     out->insert(out->end(), list.begin(), list.end());
   }
+  bool DiscReadInFlight() override { return disc_busy; }
   std::vector<Exclusion> list;
   int queries = 0;
+  bool disc_busy = false;
 };
 
 // The layout of the fake game's memory.
@@ -1585,4 +1587,144 @@ TEST(Rev3Rollback, ExclusionsMayEmptyTheSeedWhenTheSetIsAdaptive)
   ASSERT_EQ(parsed.size(), 1u);
   EXPECT_EQ(parsed[0].start, STATE_A);
   EXPECT_EQ(parsed[0].end, STATE_A + 0x100);
+}
+
+// ---- pointer based exclusions and the disc I/O gate ---------------------------------------------------------------------------
+
+TEST(Rev3Rollback, PointerExclusionsAreParsedAndKeptApart)
+{
+  FakeSink sink;
+  std::vector<Range> ranges = {{STATE_A, STATE_A + 0x100}};
+  std::vector<Range> parsed;
+  std::vector<PtrExclusion> ptrs;
+  std::string error;
+  const char* const json =
+      R"({"ranges":[{"ptr":"0x8049D000","size":"0x3F0000","note":"nw4r sound system"},{"start":"0x80500040","end":"0x80500080"},)"
+      R"({"ptr":2152143696,"size":100000}]})";
+  ASSERT_TRUE(ApplyExclusions(json, &ranges, sink, &error, &parsed, false, &ptrs)) << error;
+  ASSERT_EQ(ptrs.size(), 2u);
+  EXPECT_EQ(ptrs[0].ptr, 0x8049D000u);
+  EXPECT_EQ(ptrs[0].size, 0x3F0000u);
+  EXPECT_EQ(ptrs[0].note, "nw4r sound system");
+  EXPECT_EQ(ptrs[1].ptr, 2152143696u);
+  EXPECT_EQ(ptrs[1].size, 100000u);
+  ASSERT_EQ(parsed.size(), 1u);
+  EXPECT_EQ(ranges.size(), 2u);  // the fixed entry was subtracted, the pointer ones were not
+  EXPECT_TRUE(sink.Contains("NOTE exclude user 0x80500040-0x80500080 (64 bytes were in the whitelist)"));
+  EXPECT_TRUE(sink.Contains("NOTE exclude ptr entry 0x8049D000 size=0x3F0000 note=nw4r sound system"));
+
+  // Without somewhere to put them, pointer entries are an error; so are bad ones.
+  std::vector<Range> untouched = {{STATE_A, STATE_A + 0x100}};
+  EXPECT_FALSE(ApplyExclusions(json, &untouched, sink, &error));
+  EXPECT_NE(error.find("pointer entries"), std::string::npos);
+  const char* const bad[] = {
+      R"({"ranges":[{"ptr":"0x8049D000"}]})",                       // no size
+      R"({"ranges":[{"ptr":"0x8049D000","size":0}]})",              // empty
+      R"({"ranges":[{"ptr":"0x00001000","size":"0x100"}]})",        // pointer outside MEM1 / MEM2
+      R"({"ranges":[{"ptr":"nope","size":"0x100"}]})",
+      R"({"ranges":[]})",
+  };
+  for (const char* text : bad)
+  {
+    error.clear();
+    EXPECT_FALSE(ApplyExclusions(text, &untouched, sink, &error, &parsed, false, &ptrs)) << text;
+    EXPECT_FALSE(error.empty()) << text;
+  }
+}
+
+TEST(Rev3Rollback, PointerExclusionsAreResolvedAtArmAndOnEveryRescan)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  constexpr u32 PTR = 0x80450000;  // the "game's" pointer variable
+  SyncTestOptions o = AdaptiveOptions(2);
+  o.hardware_check_every = 50;
+  SyncTest test(o, {}, game.Mem(), sink, FakeClock());  // no hardware view at all: pointer entries still work
+  // The pointer variable's own page is cut too: the test changes it by hand, which a restore would otherwise undo.
+  test.SetUserExclusions({{PTR, PTR + 0x1000}}, {{PTR, 0x2000, "heap"}});
+  game.Mem().SetU32(PTR, 0);  // not allocated yet
+  for (int i = 0; i < 400; ++i)
+    game.Frame(test);
+  ASSERT_TRUE(test.Active());
+  int skipped = 0;
+  for (const std::string& l : sink.lines)
+    skipped += l.rfind("NOTE exclude ptr 0x80450000 skipped: pointer is 0", 0) == 0;
+  EXPECT_EQ(skipped, 1);  // said once, not on every re-check
+  EXPECT_TRUE(SetContains(test.Ranges(), HIDDEN));
+
+  // The heap gets allocated over the hidden counter's page: cut at the next re-check.
+  game.Mem().SetU32(PTR, HIDDEN);
+  for (int i = 0; i < 120; ++i)
+    game.Frame(test);
+  EXPECT_TRUE(sink.Contains("NOTE exclude ptr 0x80450000 -> 0x80700000-0x80702000 (4096 bytes were in the whitelist)"));
+  for (const Range& r : test.Ranges())
+    EXPECT_FALSE(Overlaps(r, HIDDEN, HIDDEN + 0x2000));
+
+  // It moves (a new match): the new place is cut as well, the old cut stays.
+  game.Mem().SetU32(PTR, 0x80A00000 + 0x4000);
+  for (int i = 0; i < 120; ++i)
+    game.Frame(test);
+  EXPECT_TRUE(sink.Contains("NOTE exclude ptr 0x80450000 -> 0x80A04000-0x80A06000"));
+  EXPECT_FALSE(SetContains(test.Ranges(), HIDDEN));
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u);
+
+  // A garbage pointer is skipped with its own note.
+  game.Mem().SetU32(PTR, 0x12345678);
+  for (int i = 0; i < 60; ++i)
+    game.Frame(test);
+  EXPECT_TRUE(sink.Contains("NOTE exclude ptr 0x80450000 skipped: pointer is outside MEM1 / MEM2 (value 0x12345678)"));
+}
+
+TEST(Rev3Rollback, RollbacksWaitWhileADiscReadIsInFlight)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  FakeHardware hw;
+  SyncTest test(Options(2), game.Ranges(), game.Mem(), sink, FakeClock(), &hw);
+  for (int i = 0; i < 100; ++i)
+    game.Frame(test);
+  while (test.Resimulating())
+    game.Frame(test);
+  const u32 rollbacks = test.Stats().rollbacks;
+  EXPECT_GT(rollbacks, 5u);
+  EXPECT_EQ(test.Stats().io_postponed, 0u);
+
+  hw.disc_busy = true;  // a replay in progress finishes, no new rollback starts
+  for (int i = 0; i < 30; ++i)
+    game.Frame(test);
+  EXPECT_EQ(test.Stats().rollbacks, rollbacks);
+  EXPECT_EQ(test.Stats().io_postponed, 30u);
+  int lines = 0;
+  for (const std::string& l : sink.lines)
+    lines += l.rfind("NOTE rollback postponed: disc read in flight", 0) == 0;
+  EXPECT_EQ(lines, 5);  // the first few are logged, the count continues in SUMMARY
+
+  hw.disc_busy = false;  // idle again: the captures made meanwhile are valid rollback targets
+  for (int i = 0; i < 30; ++i)
+    game.Frame(test);
+  EXPECT_GT(test.Stats().rollbacks, rollbacks + 5);
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u);
+  EXPECT_EQ(test.Stats().sp_mismatches, 0u);
+  EXPECT_FALSE(sink.Contains("ERROR"));
+  test.Finish();
+  EXPECT_TRUE(sink.Contains(" io_postponed=30"));
+}
+
+TEST(Rev3Rollback, NoopRestoresAlsoWaitForTheDisc)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  FakeHardware hw;
+  SyncTestOptions o = Options(2);
+  o.noop = true;
+  SyncTest test(o, game.Ranges(), game.Mem(), sink, FakeClock(), &hw);
+  for (int i = 0; i < 80; ++i)
+    game.Frame(test);
+  const u32 noops = test.Stats().noop_restores;
+  EXPECT_GT(noops, 10u);
+  hw.disc_busy = true;
+  for (int i = 0; i < 10; ++i)
+    EXPECT_EQ(game.Frame(test).flags, 0u);
+  EXPECT_EQ(test.Stats().noop_restores, noops);
+  EXPECT_EQ(test.Stats().io_postponed, 10u);
 }

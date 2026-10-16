@@ -32,6 +32,8 @@
 #include "Core/HW/Memmap.h"
 #include "Core/HW/SystemTimers.h"
 #include "Core/HW/VideoInterface.h"
+#include "Core/IOS/DI/DI.h"
+#include "Core/IOS/IOS.h"
 #include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
@@ -58,6 +60,7 @@ constexpr u32 MAX_RESTORE_LOGS = 10;              // the first restores log REST
 constexpr u32 MAX_SHORT_RESTORE_LOGS = 30;        // restores 11..30 log one short line "RESTORE n -> m us=.." (places a later hang)
 constexpr u32 MAX_LEARN_LOGS = 10;                // "NOTE learned" lines written in full, then at most one per LEARN_LOG_EVERY armed calls
 constexpr u32 LEARN_LOG_EVERY = 300;
+constexpr u32 MAX_IO_POSTPONE_LOGS = 5;           // "NOTE rollback postponed" lines (the count continues in SUMMARY)
 constexpr u32 MAX_EXCLUSION_LINES = 64;           // "NOTE exclude" lines (buffers that alternate would otherwise flood the log)
 
 constexpr u32 MAX_DETAILED_MISMATCH_FRAMES = 20;  // full field / range detail for this many mismatching frames, then counts only
@@ -197,54 +200,101 @@ bool ParseAddress(const picojson::value& v, u32* out, std::string* error, const 
 }
 }  // namespace
 
+namespace
+{
+// One {"start","end"} item. `i` only labels error messages.
+bool ParseRangeItem(const picojson::value& item, size_t i, Range* out, std::string* error)
+{
+  if (!item.is<picojson::object>() || !item.contains("start") || !item.contains("end"))
+  {
+    *error = Format("range %zu: expected {\"start\":..., \"end\":...}", i);
+    return false;
+  }
+  Range r;
+  const std::string label_start = Format("range %zu start", i);
+  const std::string label_end = Format("range %zu end", i);
+  if (!ParseAddress(item.get("start"), &r.start, error, label_start.c_str()) ||
+      !ParseAddress(item.get("end"), &r.end, error, label_end.c_str()))
+  {
+    return false;
+  }
+  if (r.end <= r.start)
+  {
+    *error = Format("range %zu: end 0x%08X is not after start 0x%08X", i, r.end, r.start);
+    return false;
+  }
+  // end is exclusive, so the last byte is end - 1 and it must be in the same region as start.
+  const u32 region_end = RegionEnd(r.start);
+  if (region_end == 0 || r.end > region_end)
+  {
+    *error = Format("range %zu: 0x%08X-0x%08X is not inside MEM1 (0x80000000-0x81800000) or MEM2 (0x90000000-0x94000000)", i,
+                    r.start, r.end);
+    return false;
+  }
+  *out = r;
+  return true;
+}
+
+// One {"ptr","size","note"} item.
+bool ParsePtrItem(const picojson::value& item, size_t i, PtrExclusion* out, std::string* error)
+{
+  PtrExclusion e;
+  const std::string label_ptr = Format("range %zu ptr", i);
+  const std::string label_size = Format("range %zu size", i);
+  if (!item.is<picojson::object>() || !item.contains("size") ||
+      !ParseAddress(item.get("ptr"), &e.ptr, error, label_ptr.c_str()))
+  {
+    if (error->empty())
+      *error = Format("range %zu: expected {\"ptr\":..., \"size\":...}", i);
+    return false;
+  }
+  if (!ParseAddress(item.get("size"), &e.size, error, label_size.c_str()))
+    return false;
+  if (!PointerOk(e.ptr) || !PointerOk(e.ptr + 3) || e.size == 0 || e.size > 0x4000000)
+  {
+    *error = Format("range %zu: ptr 0x%08X must be a MEM1 / MEM2 address and size 0x%X in 1..0x4000000", i, e.ptr, e.size);
+    return false;
+  }
+  if (item.contains("note") && item.get("note").is<std::string>())
+    e.note = item.get("note").get<std::string>();
+  *out = e;
+  return true;
+}
+
+// {"ranges":[...]} -> the array, or false with *error.
+bool ParseRangeArray(const std::string& json_text, picojson::value* root, const picojson::array** list, std::string* error)
+{
+  const std::string parse_error = picojson::parse(*root, json_text);
+  if (!parse_error.empty())
+  {
+    *error = "JSON error: " + parse_error;
+    return false;
+  }
+  if (!root->is<picojson::object>() || !root->contains("ranges") || !root->get("ranges").is<picojson::array>())
+  {
+    *error = "expected {\"ranges\": [...]}";
+    return false;
+  }
+  *list = &root->get("ranges").get<picojson::array>();
+  return true;
+}
+}  // namespace
+
 bool ParseWhitelist(const std::string& json_text, std::vector<Range>* ranges, std::string* error)
 {
   std::string scratch;
   if (error == nullptr)
     error = &scratch;
   picojson::value root;
-  const std::string parse_error = picojson::parse(root, json_text);
-  if (!parse_error.empty())
-  {
-    *error = "JSON error: " + parse_error;
+  const picojson::array* list = nullptr;
+  if (!ParseRangeArray(json_text, &root, &list, error))
     return false;
-  }
-  if (!root.is<picojson::object>() || !root.contains("ranges") || !root.get("ranges").is<picojson::array>())
-  {
-    *error = "expected {\"ranges\": [...]}";
-    return false;
-  }
-  const picojson::array& list = root.get("ranges").get<picojson::array>();
   std::vector<Range> result;
-  for (size_t i = 0; i < list.size(); ++i)
+  for (size_t i = 0; i < list->size(); ++i)
   {
-    const picojson::value& item = list[i];
-    if (!item.is<picojson::object>() || !item.contains("start") || !item.contains("end"))
-    {
-      *error = Format("range %zu: expected {\"start\":..., \"end\":...}", i);
-      return false;
-    }
     Range r;
-    const std::string label_start = Format("range %zu start", i);
-    const std::string label_end = Format("range %zu end", i);
-    if (!ParseAddress(item.get("start"), &r.start, error, label_start.c_str()) ||
-        !ParseAddress(item.get("end"), &r.end, error, label_end.c_str()))
-    {
+    if (!ParseRangeItem((*list)[i], i, &r, error))
       return false;
-    }
-    if (r.end <= r.start)
-    {
-      *error = Format("range %zu: end 0x%08X is not after start 0x%08X", i, r.end, r.start);
-      return false;
-    }
-    // end is exclusive, so the last byte is end - 1 and it must be in the same region as start.
-    const u32 region_end = RegionEnd(r.start);
-    if (region_end == 0 || r.end > region_end)
-    {
-      *error = Format("range %zu: 0x%08X-0x%08X is not inside MEM1 (0x80000000-0x81800000) or MEM2 (0x90000000-0x94000000)", i,
-                      r.start, r.end);
-      return false;
-    }
     result.push_back(r);
   }
   if (result.empty())
@@ -280,14 +330,45 @@ u64 SubtractRange(std::vector<Range>* ranges, u32 lo, u32 hi)
 }
 
 bool ApplyExclusions(const std::string& json_text, std::vector<Range>* ranges, Sink& sink, std::string* error,
-                     std::vector<Range>* parsed, bool require_nonempty)
+                     std::vector<Range>* parsed, bool require_nonempty, std::vector<PtrExclusion>* ptrs)
 {
   std::string scratch;
   if (error == nullptr)
     error = &scratch;
-  std::vector<Range> exclusions;
-  if (!ParseWhitelist(json_text, &exclusions, error))
+  picojson::value root;
+  const picojson::array* list = nullptr;
+  if (!ParseRangeArray(json_text, &root, &list, error))
     return false;
+  std::vector<Range> exclusions;
+  std::vector<PtrExclusion> pointer_entries;
+  for (size_t i = 0; i < list->size(); ++i)
+  {
+    const picojson::value& item = (*list)[i];
+    if (item.is<picojson::object>() && item.contains("ptr"))
+    {
+      PtrExclusion e;
+      if (!ParsePtrItem(item, i, &e, error))
+        return false;
+      pointer_entries.push_back(e);
+    }
+    else
+    {
+      Range r;
+      if (!ParseRangeItem(item, i, &r, error))
+        return false;
+      exclusions.push_back(r);
+    }
+  }
+  if (exclusions.empty() && pointer_entries.empty())
+  {
+    *error = "the exclusion list has no ranges";
+    return false;
+  }
+  if (!pointer_entries.empty() && ptrs == nullptr)
+  {
+    *error = "pointer entries (\"ptr\") are not supported here";
+    return false;
+  }
   std::vector<Range> result = *ranges;
   std::vector<std::string> lines;
   for (const Range& e : exclusions)
@@ -295,6 +376,11 @@ bool ApplyExclusions(const std::string& json_text, std::vector<Range>* ranges, S
     const u64 removed = SubtractRange(&result, e.start, e.end);
     lines.push_back(Format("NOTE exclude user 0x%08X-0x%08X (%llu bytes were in the whitelist)", e.start, e.end,
                            static_cast<unsigned long long>(removed)));
+  }
+  for (const PtrExclusion& e : pointer_entries)
+  {
+    lines.push_back(Format("NOTE exclude ptr entry 0x%08X size=0x%X note=%s (resolved when SyncTest arms)", e.ptr, e.size,
+                           e.note.c_str()));
   }
   if (require_nonempty && result.empty())
   {
@@ -306,6 +392,8 @@ bool ApplyExclusions(const std::string& json_text, std::vector<Range>* ranges, S
   *ranges = std::move(result);
   if (parsed != nullptr)
     *parsed = std::move(exclusions);
+  if (ptrs != nullptr)
+    *ptrs = std::move(pointer_entries);
   return true;
 }
 
@@ -537,9 +625,12 @@ SyncTest::SyncTest(const SyncTestOptions& options, std::vector<Range> ranges, Gu
     m_sink.Line("NOTE timebase restore on");
 }
 
-void SyncTest::SetUserExclusions(std::vector<Range> exclusions)
+void SyncTest::SetUserExclusions(std::vector<Range> exclusions, std::vector<PtrExclusion> pointers)
 {
   m_user_exclusions = std::move(exclusions);
+  m_ptr_exclusions.clear();
+  for (PtrExclusion& e : pointers)
+    m_ptr_exclusions.push_back({std::move(e), false, 0});
   m_ranges = ComputeRanges();
   RebuildLayout();
 }
@@ -613,12 +704,43 @@ void SyncTest::RebuildLayout()
 
 // Asks the emulated hardware which memory it uses on its own and cuts it out of the snapshot ranges. The set only grows (double
 // buffers alternate; seeing both once is enough), and a change that touches the snapshot clears the history.
+// REV3_SYNCTEST_EXCLUDE pointer entries: the u32 at `ptr` is the start of a region the game allocated at run time. A value of 0 or
+// outside MEM1 / MEM2 means "not allocated (yet)": skipped, with one NOTE per distinct value. A region that moved adds a new cut; the
+// old one stays (like the hardware regions, the set of cuts only grows).
+void SyncTest::ResolvePtrExclusions(std::vector<Exclusion>* out)
+{
+  for (PtrState& p : m_ptr_exclusions)
+  {
+    u8 word[4];
+    u32 value = 0;
+    const bool read = m_memory.Read(p.entry.ptr, word, 4);
+    if (read)
+      value = ReadBE32(word);
+    if (!read || value == 0 || !PointerOk(value))
+    {
+      if (!p.skip_logged || p.skip_value != value)
+      {
+        p.skip_logged = true;
+        p.skip_value = value;
+        m_sink.Line(Format("NOTE exclude ptr 0x%08X skipped: %s (value 0x%08X)", p.entry.ptr,
+                           !read ? "cannot read the pointer" : (value == 0 ? "pointer is 0" : "pointer is outside MEM1 / MEM2"), value));
+      }
+      continue;
+    }
+    p.skip_logged = false;
+    const u32 end = static_cast<u32>(std::min<u64>(static_cast<u64>(value) + p.entry.size, RegionEnd(value)));
+    out->push_back({Format("ptr 0x%08X ->", p.entry.ptr), value, end});
+  }
+}
+
 void SyncTest::RefreshExclusions(bool at_arm)
 {
-  if (m_hardware == nullptr)
+  if (m_hardware == nullptr && m_ptr_exclusions.empty())
     return;
   std::vector<Exclusion> found;
-  m_hardware->Query(&found);
+  if (m_hardware != nullptr)
+    m_hardware->Query(&found);
+  ResolvePtrExclusions(&found);
   bool layout_changed = false;
   for (const Exclusion& e : found)
   {
@@ -902,13 +1024,25 @@ bool SyncTest::Restore(const Slot& s, const Command& command, u32 to)
   return true;
 }
 
+// A restore under a disc read in flight would rewind memory the read is about to fill (or has half filled) from inside IOS HLE,
+// where it cannot be cut out of the snapshot: the rollback waits until the DI is idle. Counted in SUMMARY io_postponed.
+bool SyncTest::DiscReadPostpones(u32 frame)
+{
+  if (m_hardware == nullptr || !m_hardware->DiscReadInFlight())
+    return false;
+  ++m_stats.io_postponed;
+  if (m_stats.io_postponed <= MAX_IO_POSTPONE_LOGS)
+    m_sink.Line(Format("NOTE rollback postponed: disc read in flight (frame %u, %u so far)", frame, m_stats.io_postponed));
+  return true;
+}
+
 // Diagnosis mode: the state just captured for this frame is written straight back and the game is told it was restored (same
 // frame, same inputs). Memory is unchanged in effect, but the hook's RESTORED path (register reload from its stack frame) runs.
 Reply SyncTest::Noop(const Command& command)
 {
   const u32 n = command.frame;
   const Slot& slot = SlotFor(n);
-  if (n % static_cast<u32>(m_options.every) != 0 || !Restore(slot, command, n))
+  if (n % static_cast<u32>(m_options.every) != 0 || DiscReadPostpones(n) || !Restore(slot, command, n))
     return Echo(command);
   ++m_stats.noop_restores;
   if (m_stats.noop_restores % SUMMARY_EVERY_COMPARED == 0)
@@ -941,7 +1075,10 @@ Reply SyncTest::Normal(const Command& command, const std::array<u32, 2>& fighter
     return Noop(command);
 
   const u32 k = static_cast<u32>(m_options.k);
-  if (n >= m_first_n + k && n % static_cast<u32>(m_options.every) == 0 && Restore(SlotFor(n - k), command, n - k))
+  const bool due = n >= m_first_n + k && n % static_cast<u32>(m_options.every) == 0;
+  if (due && DiscReadPostpones(n))
+    return Echo(command);  // the capture above stays valid as a later rollback target
+  if (due && Restore(SlotFor(n - k), command, n - k))
   {
     const u32 target = n - k;
     ++m_stats.rollbacks;
@@ -1111,13 +1248,13 @@ void SyncTest::SummaryLine(const char* tag)
   const double n = m_stats.restores != 0 ? static_cast<double>(m_stats.restores) : 1.0;
   m_sink.Line(Format("%s frame=%u rollbacks=%u frames_compared=%u mismatching_frames=%u restore_us_mean=%.1f restore_us_max=%llu "
                      "icache_us_mean=%.1f icache_us_max=%llu sp_mismatches=%u noop_restores=%u dynamic_pages=%zu scan_us_mean=%.1f "
-                     "scan_us_max=%llu",
+                     "scan_us_max=%llu io_postponed=%u",
                      tag, m_last_frame, m_stats.rollbacks, m_stats.frames_compared, m_stats.mismatching_frames,
                      m_stats.restore_us_total / n, static_cast<unsigned long long>(m_stats.restore_us_max),
                      m_stats.icache_us_total / n, static_cast<unsigned long long>(m_stats.icache_us_max),
                      m_stats.sp_mismatches, m_stats.noop_restores, m_tracker.DynamicPages(),
                      m_stats.scans != 0 ? static_cast<double>(m_stats.scan_us_total) / static_cast<double>(m_stats.scans) : 0.0,
-                     static_cast<unsigned long long>(m_stats.scan_us_max)));
+                     static_cast<unsigned long long>(m_stats.scan_us_max), m_stats.io_postponed));
 }
 
 void SyncTest::Finish()
@@ -1454,7 +1591,7 @@ public:
   {
     sink.Line("NOTE hardware: GX FIFO via GetCommandProcessor().GetFifo(), XFB via GetVideoInterface().GetXFBAddressTop/Bottom(), "
               "audio DMA and DVD DMA via MMIO registers 0x0C005030 / 0x0C006014");
-    sink.Line("NOTE hardware: not reachable: Wii IOS /dev/di read destinations, ARAM DMA, GPU-thread texture copies");
+    sink.Line("NOTE hardware: not reachable: Wii IOS /dev/di read destinations (rollbacks wait while /dev/di is busy), ARAM DMA, GPU-thread texture copies");
   }
 
   void Query(std::vector<Exclusion>* out) override
@@ -1490,6 +1627,31 @@ public:
     QueryDvd(out, mmio, 0x0C006000, "dvd_dma");
     if (m_system.IsWii())
       QueryDvd(out, mmio, 0x0D006000, "dvd_dma_wii");
+  }
+
+  // A disc read is in flight when a GC DI transfer is running (DICR TSTART, 0x0C00601C and on a Wii 0x0D00601C) or the Wii IOS /dev/di
+  // device has a command executing or queued (DIDevice::IsBusy; Rev3's BGM streaming goes through it and its destination, a 16 KB
+  // buffer, is written from inside IOS HLE where the snapshot cannot cut it out).
+  bool DiscReadInFlight() override
+  {
+    if (MMIO::Mapping* mmio = m_system.GetMemory().GetMMIOMapping(); mmio != nullptr)
+    {
+      if ((mmio->Read<u32>(m_system, 0x0C00601C) & 1) != 0)
+        return true;
+      if (m_system.IsWii() && (mmio->Read<u32>(m_system, 0x0D00601C) & 1) != 0)
+        return true;
+    }
+    if (m_system.IsWii())
+    {
+      if (IOS::HLE::EmulationKernel* ios = m_system.GetIOS(); ios != nullptr)
+      {
+        const std::shared_ptr<IOS::HLE::Device> device = ios->GetDeviceByName("/dev/di");
+        const auto* di = dynamic_cast<const IOS::HLE::DIDevice*>(device.get());
+        if (di != nullptr && di->IsBusy())
+          return true;
+      }
+    }
+    return false;
   }
 
 private:
@@ -1721,6 +1883,7 @@ void Initialize(Module& module, Core::System& system)
   }
 
   std::vector<Range> user_exclusions;
+  std::vector<PtrExclusion> ptr_exclusions;
   const std::string exclude_path = GetEnv("REV3_SYNCTEST_EXCLUDE");
   if (!exclude_path.empty())
   {
@@ -1728,7 +1891,8 @@ void Initialize(Module& module, Core::System& system)
     if (!ReadTextFile(exclude_path, &exclude_text))
       error = "cannot read REV3_SYNCTEST_EXCLUDE " + exclude_path;
     else
-      ApplyExclusions(exclude_text, &ranges, *module.sink, &error, &user_exclusions, !options.adaptive);
+      ApplyExclusions(exclude_text, &ranges, *module.sink, &error, &user_exclusions, !options.adaptive,
+                       &ptr_exclusions);
     if (!error.empty())
     {
       const std::string message = "Rev3 SyncTest: exclude file unusable (" + error + "); SyncTest is off";
@@ -1749,7 +1913,7 @@ void Initialize(Module& module, Core::System& system)
     module.hardware = std::make_unique<DolphinHardware>(system, *module.sink);
   module.synctest = std::make_unique<SyncTest>(options, std::move(ranges), *module.memory, *module.sink, std::function<u64()>(),
                                                module.hardware.get());
-  module.synctest->SetUserExclusions(std::move(user_exclusions));
+  module.synctest->SetUserExclusions(std::move(user_exclusions), std::move(ptr_exclusions));
   if (options.restore_timebase)
   {
     module.sink->Line("NOTE timebase accessor: read SystemTimers::GetFakeTimeBase(); write CoreTiming::SetFakeTBStartValue(start + (value - now)) "

@@ -45,6 +45,10 @@ public:
 
   void DoState(PointerWrap& p) override;
 
+  // True while a disc command is executing or queued (the Rev3 SyncTest does not roll back under a disc read in flight: the read's
+  // destination lives inside IOS HLE, where the emulator cannot cut it out of the snapshot).
+  bool IsBusy() const { return m_executing_command.has_value() || !m_commands_to_execute.empty(); }
+
   std::optional<IPCReply> Open(const OpenRequest& request) override;
   std::optional<IPCReply> IOCtl(const IOCtlRequest& request) override;
   std::optional<IPCReply> IOCtlV(const IOCtlVRequest& request) override;
