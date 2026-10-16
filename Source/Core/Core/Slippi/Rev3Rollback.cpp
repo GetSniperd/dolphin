@@ -56,6 +56,8 @@ constexpr u32 HEARTBEAT_EARLY_EVERY = 60;         // ... but every this many hoo
 constexpr u32 HEARTBEAT_EARLY_CALLS = 600;        // (the first real rewinds are where the game froze)
 constexpr u32 MAX_RESTORE_LOGS = 10;              // the first restores log RESTORE begin / done lines (bytes, microseconds)
 constexpr u32 MAX_SHORT_RESTORE_LOGS = 30;        // restores 11..30 log one short line "RESTORE n -> m us=.." (places a later hang)
+constexpr u32 MAX_LEARN_LOGS = 10;                // "NOTE learned" lines written in full, then at most one per LEARN_LOG_EVERY armed calls
+constexpr u32 LEARN_LOG_EVERY = 300;
 constexpr u32 MAX_EXCLUSION_LINES = 64;           // "NOTE exclude" lines (buffers that alternate would otherwise flood the log)
 
 constexpr u32 MAX_DETAILED_MISMATCH_FRAMES = 20;  // full field / range detail for this many mismatching frames, then counts only
@@ -277,7 +279,8 @@ u64 SubtractRange(std::vector<Range>* ranges, u32 lo, u32 hi)
   return removed;
 }
 
-bool ApplyExclusions(const std::string& json_text, std::vector<Range>* ranges, Sink& sink, std::string* error)
+bool ApplyExclusions(const std::string& json_text, std::vector<Range>* ranges, Sink& sink, std::string* error,
+                     std::vector<Range>* parsed, bool require_nonempty)
 {
   std::string scratch;
   if (error == nullptr)
@@ -293,7 +296,7 @@ bool ApplyExclusions(const std::string& json_text, std::vector<Range>* ranges, S
     lines.push_back(Format("NOTE exclude user 0x%08X-0x%08X (%llu bytes were in the whitelist)", e.start, e.end,
                            static_cast<unsigned long long>(removed)));
   }
-  if (result.empty())
+  if (require_nonempty && result.empty())
   {
     *error = "the exclusions remove every range of the whitelist";
     return false;
@@ -301,7 +304,25 @@ bool ApplyExclusions(const std::string& json_text, std::vector<Range>* ranges, S
   for (const std::string& line : lines)
     sink.Line(line);
   *ranges = std::move(result);
+  if (parsed != nullptr)
+    *parsed = std::move(exclusions);
   return true;
+}
+
+std::vector<Range> MergeRanges(std::vector<Range> ranges)
+{
+  std::sort(ranges.begin(), ranges.end(), [](const Range& a, const Range& b) { return a.start < b.start; });
+  std::vector<Range> out;
+  for (const Range& r : ranges)
+  {
+    if (r.end <= r.start)
+      continue;
+    if (!out.empty() && r.start <= out.back().end)
+      out.back().end = std::max(out.back().end, r.end);
+    else
+      out.push_back(r);
+  }
+  return out;
 }
 
 // ---- (3) the fighter field table ------------------------------------------------------------------------------------------
@@ -326,12 +347,171 @@ const std::array<FieldDef, FIELD_COUNT> FIELDS = {{
     {"str_pending", 0x13EC},
 }};
 
+// ---- (3b) page tracker ----------------------------------------------------------------------------------------------------
+
+namespace
+{
+constexpr u8 PAGE_VALID = 1;    // the stored hash is a baseline for the next scan
+constexpr u8 PAGE_DYNAMIC = 2;  // changed between two scans (sticky)
+
+constexpr u64 Rotl64(u64 x, int r)
+{
+  return (x << r) | (x >> (64 - r));
+}
+
+u64 LoadWord(const u8* p)
+{
+  u64 v;
+  std::memcpy(&v, p, sizeof(v));
+  return v;
+}
+
+// 64-bit hash of one 4 KB page, for change detection only (not cryptographic): eight independent lanes, each one
+// h = (rotl(h, 31) ^ word) * odd constant, folded at the end. The rotation keeps two flips of the same high bit from cancelling,
+// the eight chains give the CPU enough independent multiplies to run at memory speed. The guest bytes are hashed as they lie.
+// Measured on a shared 2.1 GHz Xeon VM (noisy): about 20 GB/s on cached data, 5-10 GB/s streaming over the 88 MB of guest RAM,
+// i.e. 0.6-1.2 ms per call for 1/16 of it (5.5 MB); a desktop core is 2-3 times quicker. HB / SUMMARY lines report the real cost
+// (scan_us); REV3_SYNCTEST_SCAN_SLICES=32 halves it.
+u64 HashPage(const u8* p)
+{
+  constexpr u64 K = 0x9E3779B97F4A7C15ull;
+  u64 h0 = 0x243F6A8885A308D3ull, h1 = 0x13198A2E03707344ull, h2 = 0xA4093822299F31D0ull, h3 = 0x082EFA98EC4E6C89ull;
+  u64 h4 = 0x452821E638D01377ull, h5 = 0xBE5466CF34E90C6Cull, h6 = 0xC0AC29B7C97C50DDull, h7 = 0x3F84D5B5B5470917ull;
+  for (size_t i = 0; i < PAGE_SIZE; i += 64)
+  {
+    h0 = (Rotl64(h0, 31) ^ LoadWord(p + i)) * K;
+    h1 = (Rotl64(h1, 31) ^ LoadWord(p + i + 8)) * K;
+    h2 = (Rotl64(h2, 31) ^ LoadWord(p + i + 16)) * K;
+    h3 = (Rotl64(h3, 31) ^ LoadWord(p + i + 24)) * K;
+    h4 = (Rotl64(h4, 31) ^ LoadWord(p + i + 32)) * K;
+    h5 = (Rotl64(h5, 31) ^ LoadWord(p + i + 40)) * K;
+    h6 = (Rotl64(h6, 31) ^ LoadWord(p + i + 48)) * K;
+    h7 = (Rotl64(h7, 31) ^ LoadWord(p + i + 56)) * K;
+  }
+  u64 r = h0;
+  for (const u64 h : {h1, h2, h3, h4, h5, h6, h7})
+    r = (Rotl64(r, 23) ^ h) * 0xC2B2AE3D27D4EB4Full;
+  return r ^ (r >> 32);
+}
+
+// Page index <-> guest address: pages 0 .. 6143 are MEM1 from 0x80000000, pages 6144 .. 22527 are MEM2 from 0x90000000.
+constexpr size_t MEM1_PAGE_COUNT = (MEM1_END - MEM1_BASE) / PAGE_SIZE;
+static_assert(MEM1_PAGE_COUNT + (MEM2_END - MEM2_BASE) / PAGE_SIZE == TRACKED_PAGES, "page count");
+
+u32 PageAddress(size_t index)
+{
+  return index < MEM1_PAGE_COUNT ? MEM1_BASE + static_cast<u32>(index) * PAGE_SIZE :
+                                   MEM2_BASE + static_cast<u32>(index - MEM1_PAGE_COUNT) * PAGE_SIZE;
+}
+
+// Index of the page holding addr, or TRACKED_PAGES when it is in neither region.
+size_t PageIndex(u32 addr)
+{
+  if (InMem1(addr))
+    return (addr - MEM1_BASE) / PAGE_SIZE;
+  if (InMem2(addr))
+    return MEM1_PAGE_COUNT + (addr - MEM2_BASE) / PAGE_SIZE;
+  return TRACKED_PAGES;
+}
+}  // namespace
+
+PageTracker::PageTracker(GuestMemory& memory, u32 slices)
+    : m_memory(memory), m_slices(std::clamp<u32>(slices, 1, 4096)), m_hash(TRACKED_PAGES, 0), m_state(TRACKED_PAGES, 0),
+      m_buf(PAGE_SIZE)
+{
+}
+
+void PageTracker::Reset()
+{
+  if (!m_has_state)  // called on every hook call outside a fight; clearing 22528 entries each time would be a waste
+    return;
+  std::fill(m_state.begin(), m_state.end(), static_cast<u8>(0));
+  m_slice = 0;
+  m_cycles = 0;
+  m_dynamic = 0;
+  m_has_state = false;
+}
+
+u32 PageTracker::Scan()
+{
+  m_has_state = true;
+  const size_t lo = TRACKED_PAGES * m_slice / m_slices;
+  const size_t hi = TRACKED_PAGES * (static_cast<size_t>(m_slice) + 1) / m_slices;
+  u32 added = 0;
+  for (size_t i = lo; i < hi; ++i)
+  {
+    u8& state = m_state[i];
+    if ((state & PAGE_DYNAMIC) != 0)
+      continue;  // already known to change: nothing left to learn from it
+    const u32 addr = PageAddress(i);
+    const u8* page = m_memory.Peek(addr, PAGE_SIZE);
+    if (page == nullptr)
+    {
+      if (!m_memory.Read(addr, m_buf.data(), PAGE_SIZE))
+        continue;  // not backed by memory (e.g. MEM2 of a GameCube)
+      page = m_buf.data();
+    }
+    const u64 hash = HashPage(page);
+    if ((state & PAGE_VALID) != 0 && m_hash[i] != hash)
+    {
+      state |= PAGE_DYNAMIC;
+      ++m_dynamic;
+      ++added;
+    }
+    m_hash[i] = hash;
+    state |= PAGE_VALID;
+  }
+  if (++m_slice >= m_slices)
+  {
+    m_slice = 0;
+    ++m_cycles;
+  }
+  return added;
+}
+
+void PageTracker::InvalidateBaseline(const std::vector<Range>& ranges)
+{
+  if (!m_has_state)
+    return;
+  for (const Range& r : ranges)
+  {
+    if (r.end <= r.start)
+      continue;
+    const size_t first = PageIndex(r.start);
+    const size_t last = PageIndex(r.end - 1);
+    if (first >= TRACKED_PAGES || last >= TRACKED_PAGES)
+      continue;
+    for (size_t i = first; i <= last; ++i)
+      m_state[i] = static_cast<u8>(m_state[i] & ~PAGE_VALID);
+  }
+}
+
+void PageTracker::AppendDynamicRanges(std::vector<Range>* out) const
+{
+  for (size_t i = 0; i < TRACKED_PAGES; ++i)
+  {
+    if ((m_state[i] & PAGE_DYNAMIC) == 0)
+      continue;
+    const u32 start = PageAddress(i);
+    if (!out->empty() && out->back().end == start)
+      out->back().end = start + PAGE_SIZE;
+    else
+      out->push_back({start, start + PAGE_SIZE});
+  }
+}
+
+bool PageTracker::IsDynamic(u32 addr) const
+{
+  const size_t i = PageIndex(addr);
+  return i < TRACKED_PAGES && (m_state[i] & PAGE_DYNAMIC) != 0;
+}
+
 // ---- (4) SyncTest -------------------------------------------------------------------------------------------------------
 
 SyncTest::SyncTest(const SyncTestOptions& options, std::vector<Range> ranges, GuestMemory& memory, Sink& sink,
                    std::function<u64()> micros, HardwareView* hardware)
-    : m_options(options), m_ranges(std::move(ranges)), m_memory(memory), m_sink(sink), m_micros(std::move(micros)),
-      m_hardware(hardware)
+    : m_options(options), m_seed(std::move(ranges)), m_memory(memory), m_sink(sink), m_micros(std::move(micros)),
+      m_tracker(memory, options.scan_slices), m_hardware(hardware)
 {
   if (!m_micros)
     m_micros = SteadyMicros;
@@ -340,20 +520,76 @@ SyncTest::SyncTest(const SyncTestOptions& options, std::vector<Range> ranges, Gu
   m_options.hardware_check_every = std::max<u32>(m_options.hardware_check_every, 1);
   m_span.resize(FIELD_SPAN_HI - FIELD_SPAN_LO);
 
-  // Allocated once: k + 1 slots of ~2.3 MB, plus the scratch slot used while comparing a resimulated frame. Exclusions only
-  // shrink the ranges, so RebuildLayout never has to grow them.
+  // k + 1 slots plus the scratch slot used while comparing a resimulated frame. RebuildLayout sizes them for the current ranges
+  // and runs again whenever the set changes (hardware exclusions, learned pages), so the buffers follow the set.
   m_ring.resize(static_cast<size_t>(m_options.k) + 1);
+  m_ranges = ComputeRanges();
   RebuildLayout();
 
   m_sink.Line(Format("SYNCTEST start K=%d EVERY=%d window=0x%X whitelist=%s ranges=%zu bytes=%zu snapshot_bytes=%zu slots=%zu "
-                     "arm=%s noop=%d hw_exclude=%d icache=%d tb=%d",
+                     "arm=%s noop=%d hw_exclude=%d icache=%d tb=%d adaptive=%d slices=%u learn=%u",
                      m_options.k, m_options.every, m_options.stack_window, m_options.whitelist_path.c_str(), m_ranges.size(),
                      m_ranges_bytes, m_snapshot_bytes, m_ring.size(),
                      m_options.arm_by_pad ? "pad" : Format("%u", m_options.arm_commands).c_str(), m_options.noop ? 1 : 0,
-                     m_hardware != nullptr ? 1 : 0, m_options.invalidate_code ? 1 : 0, m_options.restore_timebase ? 1 : 0));
+                     m_hardware != nullptr ? 1 : 0, m_options.invalidate_code ? 1 : 0, m_options.restore_timebase ? 1 : 0,
+                     m_options.adaptive ? 1 : 0, m_tracker.Slices(), m_options.learn_cycles));
   if (m_options.restore_timebase)
     m_sink.Line("NOTE timebase restore on");
 }
+
+void SyncTest::SetUserExclusions(std::vector<Range> exclusions)
+{
+  m_user_exclusions = std::move(exclusions);
+  m_ranges = ComputeRanges();
+  RebuildLayout();
+}
+
+// The snapshot set. Legacy (non-adaptive): the whitelist in file order minus the cuts. Adaptive: whitelist seed + every dynamic
+// page the tracker found + both fighter structs (fighter .. +0x1800, so all 61 FIELDS are always covered) + the hook stack window
+// (as of arming), merged into sorted ranges. Always minus the hook region, the user's exclusions and every hardware exclusion seen
+// so far (the cuts win over everything that was added).
+std::vector<Range> SyncTest::ComputeRanges() const
+{
+  std::vector<Range> all = m_seed;
+  if (m_options.adaptive)
+  {
+    m_tracker.AppendDynamicRanges(&all);
+    for (u32 fighter : m_fighters)
+    {
+      const u32 region_end = RegionEnd(fighter);
+      if (fighter != 0 && region_end != 0)
+        all.push_back({fighter, std::min<u32>(fighter + FIGHTER_SET_BYTES, region_end)});
+    }
+    if (m_set_sp != 0)
+    {
+      const u32 region_end = RegionEnd(m_set_sp);
+      if (region_end != 0 && m_options.stack_window != 0)
+        all.push_back({m_set_sp, std::min<u32>(m_set_sp + m_options.stack_window, region_end)});
+    }
+    all = MergeRanges(std::move(all));
+  }
+  SubtractRange(&all, HOOK_REGION_START, HOOK_REGION_END);
+  for (const Range& r : m_user_exclusions)
+    SubtractRange(&all, r.start, r.end);
+  for (const Exclusion& e : m_exclusions_logged)
+    SubtractRange(&all, e.start, e.end);
+  return all;
+}
+
+namespace
+{
+bool SameRanges(const std::vector<Range>& a, const std::vector<Range>& b)
+{
+  if (a.size() != b.size())
+    return false;
+  for (size_t i = 0; i < a.size(); ++i)
+  {
+    if (a[i].start != b[i].start || a[i].end != b[i].end)
+      return false;
+  }
+  return true;
+}
+}  // namespace
 
 // Recomputes the offsets and buffer sizes for the current m_ranges. Every slot is invalidated: its data has the old layout.
 void SyncTest::RebuildLayout()
@@ -370,11 +606,9 @@ void SyncTest::RebuildLayout()
   {
     s.valid = false;
     s.data.resize(m_snapshot_bytes);
-    s.crc.assign(m_ranges.size(), 0);
   }
   m_scratch.valid = false;
   m_scratch.data.resize(m_snapshot_bytes);
-  m_scratch.crc.assign(m_ranges.size(), 0);
 }
 
 // Asks the emulated hardware which memory it uses on its own and cuts it out of the snapshot ranges. The set only grows (double
@@ -396,7 +630,8 @@ void SyncTest::RefreshExclusions(bool at_arm)
     if (known)
       continue;
     m_exclusions_logged.push_back(e);
-    const u64 removed = SubtractRange(&m_ranges, e.start, e.end);
+    std::vector<Range> probe = m_ranges;  // how much of the current set the region takes away
+    const u64 removed = SubtractRange(&probe, e.start, e.end);
     layout_changed = layout_changed || removed != 0;
     ++m_exclusion_lines;
     if (m_exclusion_lines <= MAX_EXCLUSION_LINES)
@@ -409,6 +644,7 @@ void SyncTest::RefreshExclusions(bool at_arm)
   }
   if (!layout_changed)
     return;
+  m_ranges = ComputeRanges();  // the new cuts are part of m_exclusions_logged now
   RebuildLayout();
   ClearHistory();
   m_sink.Line(Format("NOTE snapshot now ranges=%zu bytes=%zu snapshot_bytes=%zu (history cleared, frame %u)", m_ranges.size(),
@@ -437,8 +673,9 @@ std::string SyncTest::SnapshotRangeOf(const Slot& slot, u32 addr) const
 
 // Which of the 61 compared fields of each fighter lie inside the current snapshot ranges. A field outside is never rewound, so its
 // value after a restore is whatever the first run left there; the list names them.
-void SyncTest::LogFieldCoverage(const std::array<u32, 2>& fighters, const char* when)
+size_t SyncTest::LogFieldCoverage(const std::array<u32, 2>& fighters, const char* when)
 {
+  size_t worst = FIELD_COUNT;
   for (size_t p = 0; p < 2; ++p)
   {
     size_t inside = 0;
@@ -458,7 +695,9 @@ void SyncTest::LogFieldCoverage(const std::array<u32, 2>& fighters, const char* 
     if (inside != FIELD_COUNT)
       line += " NOT IN SNAPSHOT:" + missing;
     m_sink.Line(line);
+    worst = std::min(worst, inside);
   }
+  return worst;
 }
 
 Reply SyncTest::Echo(const Command& command) const
@@ -550,7 +789,6 @@ bool SyncTest::Capture(Slot& slot, const Command& command, const std::array<u32,
       Error(Format("frame %u: cannot read whitelist range 0x%08X-0x%08X", command.frame, m_ranges[i].start, m_ranges[i].end));
       return false;
     }
-    slot.crc[i] = Common::ComputeCRC32(slot.data.data() + offset, len);
     offset += len;
   }
   if (stack_len != 0 && !m_memory.Read(command.sp, slot.data.data() + offset, stack_len))
@@ -621,6 +859,10 @@ bool SyncTest::Restore(const Slot& s, const Command& command, u32 to)
     return false;
   }
   const u64 t1 = m_micros();
+  // The pages just rewritten no longer match the hashes the tracker took before: forget them (a restore must not look like a
+  // change of the game's own memory).
+  if (m_options.adaptive)
+    m_tracker.InvalidateBaseline(m_ranges);
   if (m_options.invalidate_code)
   {
     for (const Range& r : m_ranges)
@@ -778,7 +1020,10 @@ void SyncTest::Compare(const Slot& reference, const Slot& live, u32 frame)
   std::vector<size_t> range_diffs;
   for (size_t i = 0; i < m_ranges.size(); ++i)
   {
-    if (reference.crc[i] != live.crc[i])
+    // memcmp over the two captured buffers; the CRC32s that the log shows are only computed for the ranges that differ (a CRC of
+    // the whole set on every capture cost milliseconds once the set grew to several MB).
+    const size_t len = m_ranges[i].end - m_ranges[i].start;
+    if (std::memcmp(reference.data.data() + m_range_offsets[i], live.data.data() + m_range_offsets[i], len) != 0)
       range_diffs.push_back(i);
   }
   const bool addr_diff = reference.fighter_addr != live.fighter_addr;
@@ -855,8 +1100,9 @@ void SyncTest::Compare(const Slot& reference, const Slot& live, u32 frame)
         words += Format(" 0x%08X:%08X>%08X", r.start + static_cast<u32>(off), ReadBE32(a + off), ReadBE32(b + off));
       ++differing;
     }
-    m_sink.Line(Format("  range 0x%08X-0x%08X crc ref=0x%08X resim=0x%08X words=%zu%s%s", r.start, r.end, reference.crc[i],
-                       live.crc[i], differing, differing != 0 ? " first(addr:ref>resim)=" : "", words.c_str()));
+    m_sink.Line(Format("  range 0x%08X-0x%08X crc ref=0x%08X resim=0x%08X words=%zu%s%s", r.start, r.end,
+                       Common::ComputeCRC32(a, len), Common::ComputeCRC32(b, len), differing,
+                       differing != 0 ? " first(addr:ref>resim)=" : "", words.c_str()));
   }
 }
 
@@ -864,11 +1110,14 @@ void SyncTest::SummaryLine(const char* tag)
 {
   const double n = m_stats.restores != 0 ? static_cast<double>(m_stats.restores) : 1.0;
   m_sink.Line(Format("%s frame=%u rollbacks=%u frames_compared=%u mismatching_frames=%u restore_us_mean=%.1f restore_us_max=%llu "
-                     "icache_us_mean=%.1f icache_us_max=%llu sp_mismatches=%u noop_restores=%u",
+                     "icache_us_mean=%.1f icache_us_max=%llu sp_mismatches=%u noop_restores=%u dynamic_pages=%zu scan_us_mean=%.1f "
+                     "scan_us_max=%llu",
                      tag, m_last_frame, m_stats.rollbacks, m_stats.frames_compared, m_stats.mismatching_frames,
                      m_stats.restore_us_total / n, static_cast<unsigned long long>(m_stats.restore_us_max),
                      m_stats.icache_us_total / n, static_cast<unsigned long long>(m_stats.icache_us_max),
-                     m_stats.sp_mismatches, m_stats.noop_restores));
+                     m_stats.sp_mismatches, m_stats.noop_restores, m_tracker.DynamicPages(),
+                     m_stats.scans != 0 ? static_cast<double>(m_stats.scan_us_total) / static_cast<double>(m_stats.scans) : 0.0,
+                     static_cast<unsigned long long>(m_stats.scan_us_max)));
 }
 
 void SyncTest::Finish()
@@ -877,6 +1126,90 @@ void SyncTest::Finish()
     return;
   m_finished = true;
   SummaryLine("SUMMARY final");
+}
+
+// Pages that changed outside the set on a normal frame while armed: grow the set. Buffers are rebuilt for the new size and the
+// history is cleared (no rollback until K new frames are captured). Pages that are already inside the set, or are cut by an
+// exclusion, change nothing and cost nothing.
+void SyncTest::LearnWhileArmed(u32 added)
+{
+  m_stats.pages_learned_armed += added;
+  m_learned_unlogged += added;
+  std::vector<Range> ranges = ComputeRanges();
+  if (SameRanges(ranges, m_ranges))
+    return;
+  m_ranges = std::move(ranges);
+  RebuildLayout();
+  ClearHistory();
+  // Rate limit: the first 10 growths are logged, then at most one line per 300 armed calls (with the pages learned since).
+  if (m_learn_logs < MAX_LEARN_LOGS || m_armed_calls - m_learn_log_call >= LEARN_LOG_EVERY)
+  {
+    ++m_learn_logs;
+    m_learn_log_call = m_armed_calls;
+    m_sink.Line(Format("NOTE learned +%u pages (now ranges=%zu bytes=%zu) frame %u, history cleared", m_learned_unlogged,
+                       m_ranges.size(), m_ranges_bytes, m_last_frame));
+    m_sink.Line(Format("NOTE snapshot now ranges=%zu bytes=%zu snapshot_bytes=%zu slots=%zu", m_ranges.size(), m_ranges_bytes,
+                       m_snapshot_bytes, m_ring.size()));
+    m_learned_unlogged = 0;
+    if (m_learn_logs == MAX_LEARN_LOGS)
+      m_sink.Line(Format("NOTE further learning is logged at most every %u hook calls", LEARN_LOG_EVERY));
+  }
+}
+
+// Builds the snapshot set and arms, unless the fighters' fields would not all be inside it (adaptive mode: then it logs an ERROR
+// and stays unarmed until the fighters are lost and found again).
+bool SyncTest::Arm(const Command& command, const std::array<u32, 2>& fighters)
+{
+  m_set_sp = RegionEnd(command.sp) != 0 ? command.sp : 0;
+  m_armed_calls = 0;
+  m_last_frame = command.frame;
+  ClearHistory();
+  m_ranges = ComputeRanges();
+  RebuildLayout();
+  RefreshExclusions(true);  // may cut more and rebuild again
+
+  if (m_options.adaptive)
+  {
+    size_t worst = FIELD_COUNT;
+    for (size_t p = 0; p < 2; ++p)
+    {
+      size_t inside = 0;
+      for (const FieldDef& f : FIELDS)
+        inside += !RangeContaining(fighters[p] + f.offset).empty();
+      worst = std::min(worst, inside);
+    }
+    if (worst != FIELD_COUNT)
+    {
+      m_sink.Line(Format("NOTE fighters p1=0x%08X p2=0x%08X", fighters[0], fighters[1]));
+      LogFieldCoverage(fighters, nullptr);
+      Error(Format("frame %u: not all fighter fields are inside the snapshot set (an exclusion cuts a fighter struct); not arming",
+                   command.frame));
+      m_arm_blocked = true;
+      ClearHistory();
+      return false;
+    }
+  }
+
+  m_armed = true;
+  m_arm_wanted = false;
+  if (m_options.arm_by_pad)
+    m_sink.Line(Format("NOTE armed by Z at frame %u", command.frame));
+  else
+    m_sink.Line(Format("NOTE armed at frame %u (%u hook calls with both fighters)", command.frame, m_streak));
+  if (m_options.adaptive)
+  {
+    m_sink.Line(Format("NOTE adaptive set at arm: dynamic_pages=%zu (%zu bytes) scan_cycles=%u slices=%u ranges=%zu bytes=%zu "
+                       "snapshot_bytes=%zu",
+                       m_tracker.DynamicPages(), m_tracker.DynamicPages() * PAGE_SIZE, m_tracker.Cycles(), m_tracker.Slices(),
+                       m_ranges.size(), m_ranges_bytes, m_snapshot_bytes));
+  }
+  m_sink.Line(Format("NOTE snapshot now ranges=%zu bytes=%zu snapshot_bytes=%zu slots=%zu", m_ranges.size(), m_ranges_bytes,
+                     m_snapshot_bytes, m_ring.size()));
+  m_sink.Line(Format("NOTE fighters p1=0x%08X p2=0x%08X", fighters[0], fighters[1]));
+  LogFieldCoverage(fighters, nullptr);
+  if (m_dsp_state)
+    m_sink.Line("NOTE dsp at arm: " + m_dsp_state());
+  return true;
 }
 
 Reply SyncTest::OnCommand(const Command& command)
@@ -892,6 +1225,7 @@ Reply SyncTest::OnCommand(const Command& command)
   {
     m_streak = 0;
   }
+  m_last_sp = command.sp;
 
   // P1's Z, edge triggered. A press is remembered until it can be acted on (not in the middle of a resimulation).
   if (m_options.arm_by_pad)
@@ -908,6 +1242,16 @@ Reply SyncTest::OnCommand(const Command& command)
   if (!found)
   {
     m_z_pending = false;
+    m_arm_wanted = false;
+    m_arm_blocked = false;
+    m_defer_logged = false;
+    m_set_sp = 0;
+    if (m_options.adaptive)
+    {
+      // A new match starts from scratch: loading rewrites most of memory, so nothing learned before is worth keeping.
+      m_tracker.Reset();
+      m_learn_done = false;
+    }
     if (m_armed)
     {
       m_armed = false;
@@ -916,30 +1260,67 @@ Reply SyncTest::OnCommand(const Command& command)
     return Echo(command);
   }
 
+  // Page tracker: one slice per hook call, never during a resimulation (those frames replay the game after a restore; the first
+  // run's frames are the reference). Starts as soon as both fighters are found, long before arming.
+  if (m_options.adaptive && !m_resim)
+  {
+    const u64 t0 = m_micros();
+    const u32 added = m_tracker.Scan();
+    const u64 us = m_micros() - t0;
+    ++m_stats.scans;
+    m_stats.scan_us_total += us;
+    m_stats.scan_us_max = std::max(m_stats.scan_us_max, us);
+    m_scan_iv_total += us;
+    m_scan_iv_max = std::max(m_scan_iv_max, us);
+    ++m_scan_iv_n;
+    if (!m_learn_done && m_tracker.Cycles() >= m_options.learn_cycles)
+    {
+      m_learn_done = true;
+      m_sink.Line(Format("NOTE learning complete: %u scan cycles (slices=%u) dynamic_pages=%zu (%zu bytes) at frame %u", m_tracker.Cycles(),
+                         m_tracker.Slices(), m_tracker.DynamicPages(), m_tracker.DynamicPages() * PAGE_SIZE, command.frame));
+    }
+    if (added != 0 && m_armed)
+      LearnWhileArmed(added);
+  }
+
   if (!m_armed)
   {
-    const bool arm = m_options.arm_by_pad ? m_z_pending : m_streak >= std::max<u32>(m_options.arm_commands, 1);
-    if (!arm)
-      return Echo(command);
-    m_z_pending = false;
-    m_armed = true;
-    m_armed_calls = 0;
-    m_last_frame = command.frame;
-    ClearHistory();
+    bool wanted;
     if (m_options.arm_by_pad)
-      m_sink.Line(Format("NOTE armed by Z at frame %u", command.frame));
+    {
+      if (m_z_pending)
+      {
+        m_z_pending = false;
+        m_arm_wanted = !m_arm_wanted;
+        m_defer_logged = false;
+        if (!m_arm_wanted)
+          m_sink.Line(Format("NOTE arm cancelled by Z at frame %u", command.frame));
+      }
+      wanted = m_arm_wanted;
+    }
     else
-      m_sink.Line(Format("NOTE armed at frame %u (%u hook calls with both fighters)", command.frame, m_streak));
-    RefreshExclusions(true);
-    m_sink.Line(Format("NOTE fighters p1=0x%08X p2=0x%08X", fighters[0], fighters[1]));
-    LogFieldCoverage(fighters, nullptr);
-    if (m_dsp_state)
-      m_sink.Line("NOTE dsp at arm: " + m_dsp_state());
+    {
+      wanted = m_streak >= std::max<u32>(m_options.arm_commands, 1);
+    }
+    if (!wanted || m_arm_blocked)
+      return Echo(command);
+    if (!LearningDone())
+    {
+      if (!m_defer_logged)
+      {
+        m_defer_logged = true;
+        m_sink.Line(Format("NOTE arm deferred: learning (%u/%u cycles)", m_tracker.Cycles(), m_options.learn_cycles));
+      }
+      return Echo(command);
+    }
+    if (!Arm(command, fighters))
+      return Echo(command);
   }
   else if (m_options.arm_by_pad && m_z_pending && !m_resim)
   {
     m_z_pending = false;
     m_armed = false;
+    m_arm_wanted = false;
     ClearHistory();
     m_sink.Line(Format("NOTE disarmed by Z at frame %u", command.frame));
     return Echo(command);
@@ -948,9 +1329,18 @@ Reply SyncTest::OnCommand(const Command& command)
   ++m_armed_calls;
   if (m_armed_calls % (m_armed_calls <= HEARTBEAT_EARLY_CALLS ? HEARTBEAT_EARLY_EVERY : HEARTBEAT_EVERY) == 0)
   {
-    m_sink.Line(Format("HB frame=%u calls=%u rollbacks=%u noop_restores=%u", command.frame, m_armed_calls, m_stats.rollbacks,
-                       m_stats.noop_restores) +
-                (m_dsp_state ? " " + m_dsp_state() : std::string()));
+    std::string line = Format("HB frame=%u calls=%u rollbacks=%u noop_restores=%u", command.frame, m_armed_calls, m_stats.rollbacks,
+                              m_stats.noop_restores);
+    if (m_options.adaptive)
+    {
+      line += Format(" dyn=%zu scan_us=%.1f scan_us_max=%llu", m_tracker.DynamicPages(),
+                     m_scan_iv_n != 0 ? static_cast<double>(m_scan_iv_total) / m_scan_iv_n : 0.0,
+                     static_cast<unsigned long long>(m_scan_iv_max));
+      m_scan_iv_total = 0;
+      m_scan_iv_n = 0;
+      m_scan_iv_max = 0;
+    }
+    m_sink.Line(line + (m_dsp_state ? " " + m_dsp_state() : std::string()));
   }
   // Due every hardware_check_every calls; done on the next call that is not a resimulation (the layout must not change there).
   if (m_armed_calls % m_options.hardware_check_every == 0)
@@ -997,6 +1387,15 @@ public:
       return false;
     memory.CopyToEmu(addr, src, n);  // a plain memcpy: no JIT invalidation (InvalidateCode below does that)
     return true;
+  }
+
+  // A pointer straight into the emulated RAM, for hashing pages without a copy. Valid only while the range is inside MEM1 / MEM2.
+  const u8* Peek(u32 addr, size_t n) const override
+  {
+    auto& memory = m_system.GetMemory();
+    if (!Inside(memory, addr, n))
+      return nullptr;
+    return memory.GetPointerForRange(addr, n);
   }
 
   // Forced invalidation (the code bytes are restored to what they were, not modified by the game): the JIT drops every block
@@ -1260,6 +1659,23 @@ void Initialize(Module& module, Core::System& system)
       ERROR_LOG_FMT(SLIPPI, "Rev3 SyncTest: ignoring REV3_SYNCTEST_ARM={} (a number or pad)", arm);
   }
   options.noop = GetEnv("REV3_SYNCTEST_NOOP") == "1";
+  options.adaptive = GetEnv("REV3_SYNCTEST_ADAPTIVE") != "0";
+  const std::string slices = GetEnv("REV3_SYNCTEST_SCAN_SLICES");
+  if (!slices.empty())
+  {
+    if (ParseInt(slices, &value) && value >= 1 && value <= 4096)
+      options.scan_slices = static_cast<u32>(value);
+    else
+      ERROR_LOG_FMT(SLIPPI, "Rev3 SyncTest: ignoring REV3_SYNCTEST_SCAN_SLICES={} (1..4096)", slices);
+  }
+  const std::string learn = GetEnv("REV3_SYNCTEST_LEARN");
+  if (!learn.empty())
+  {
+    if (ParseInt(learn, &value) && value >= 0 && value <= 1000000)
+      options.learn_cycles = static_cast<u32>(value);
+    else
+      ERROR_LOG_FMT(SLIPPI, "Rev3 SyncTest: ignoring REV3_SYNCTEST_LEARN={} (0..1000000)", learn);
+  }
   options.invalidate_code = GetEnv("REV3_SYNCTEST_ICACHE") != "0";
   options.restore_timebase = GetEnv("REV3_SYNCTEST_TB") == "1";
   const bool hardware_exclude = GetEnv("REV3_SYNCTEST_HW_EXCLUDE") != "0";
@@ -1270,24 +1686,32 @@ void Initialize(Module& module, Core::System& system)
   module.sink = std::make_unique<FileSink>(log_path);
 
   const std::string whitelist_path = GetEnv("REV3_WHITELIST");
-  options.whitelist_path = whitelist_path;
+  options.whitelist_path = whitelist_path.empty() ? "(none)" : whitelist_path;
   std::string text;
   std::string error;
   std::vector<Range> ranges;
+  // The whitelist is required without the adaptive set. With it, it is an optional seed: an unset variable is fine, a set but
+  // unusable file is still an error.
   if (whitelist_path.empty())
     error = "REV3_WHITELIST is not set";
   else if (!ReadTextFile(whitelist_path, &text))
     error = "cannot read " + whitelist_path;
   else
     ParseWhitelist(text, &ranges, &error);
+  const bool seed_missing = whitelist_path.empty();
   u64 hook_bytes = 0;
   if (!ranges.empty())
   {
     hook_bytes = SubtractRange(&ranges, HOOK_REGION_START, HOOK_REGION_END);
-    if (ranges.empty())
+    if (ranges.empty() && !options.adaptive)
       error = "every range lies inside the hook region 0x80002400-0x80002A00";
   }
-  if (ranges.empty())
+  if (options.adaptive && seed_missing)
+  {
+    error.clear();
+    module.sink->Line("NOTE no REV3_WHITELIST: the snapshot set is learned in the match (adaptive)");
+  }
+  if (!error.empty())
   {
     const std::string message = "Rev3 SyncTest: whitelist unusable (" + error + "); SyncTest is off";
     module.sink->Line("ERROR " + message);
@@ -1296,6 +1720,7 @@ void Initialize(Module& module, Core::System& system)
     return;
   }
 
+  std::vector<Range> user_exclusions;
   const std::string exclude_path = GetEnv("REV3_SYNCTEST_EXCLUDE");
   if (!exclude_path.empty())
   {
@@ -1303,7 +1728,7 @@ void Initialize(Module& module, Core::System& system)
     if (!ReadTextFile(exclude_path, &exclude_text))
       error = "cannot read REV3_SYNCTEST_EXCLUDE " + exclude_path;
     else
-      ApplyExclusions(exclude_text, &ranges, *module.sink, &error);
+      ApplyExclusions(exclude_text, &ranges, *module.sink, &error, &user_exclusions, !options.adaptive);
     if (!error.empty())
     {
       const std::string message = "Rev3 SyncTest: exclude file unusable (" + error + "); SyncTest is off";
@@ -1324,6 +1749,7 @@ void Initialize(Module& module, Core::System& system)
     module.hardware = std::make_unique<DolphinHardware>(system, *module.sink);
   module.synctest = std::make_unique<SyncTest>(options, std::move(ranges), *module.memory, *module.sink, std::function<u64()>(),
                                                module.hardware.get());
+  module.synctest->SetUserExclusions(std::move(user_exclusions));
   if (options.restore_timebase)
   {
     module.sink->Line("NOTE timebase accessor: read SystemTimers::GetFakeTimeBase(); write CoreTiming::SetFakeTBStartValue(start + (value - now)) "

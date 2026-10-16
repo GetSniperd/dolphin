@@ -42,6 +42,15 @@ public:
     return true;
   }
 
+  // Direct pointer for the page tracker; switch off to exercise its Read() fallback.
+  const u8* Peek(u32 addr, size_t n) const override
+  {
+    if (!peek_enabled || !Inside(addr, n))
+      return nullptr;
+    return &m_mem1[addr - 0x80000000];
+  }
+  bool peek_enabled = true;
+
   void InvalidateCode(u32 addr, size_t n) override { invalidated.emplace_back(addr, n); }
   std::vector<std::pair<u32, size_t>> invalidated;  // every InvalidateCode call, in order
 
@@ -126,6 +135,9 @@ constexpr u32 FIELD_X = 0x84;
 constexpr u32 FIELD_HEALTH = 0x28;
 constexpr u32 FIELD_ANGLEA0 = 0xA0;
 constexpr u32 FIELD_Y = 0x88;
+constexpr u32 FIELD_COMBO_COUNT = 0x9AC;
+constexpr u32 LATE_PAGE = 0x80A00000;  // a page nothing seeds; only SetLatePage makes it change
+constexpr u32 LATE_WALK = 0x80C00000;  // SetWalker's first page
 
 // A deterministic game: every step adds the pads to counters in two whitelisted ranges and mirrors them into the fighters. With
 // `leak` set, a hidden counter outside the whitelist also feeds the state (what an incomplete whitelist looks like).
@@ -198,8 +210,24 @@ public:
   bool HwWordIntact() const { return m_hw_word_intact; }  // every RESTORED reply left the hardware word alone
   int RestoresSeen() const { return m_restores_seen; }
 
+  void SetQuiet() { m_quiet = true; }  // Step changes nothing: only the hook's stack frame (written by Frame) changes
+  // From this frame on a counter in the page LATE_PAGE (outside every seed) counts up and feeds p1's combo_count.
+  void SetLatePage(u32 from_frame) { m_late_page_from = from_frame; }
+  // From this frame on every frame writes one constant word into a new page: LATE_WALK + (frame - from) * stride.
+  void SetWalker(u32 from_frame, u32 stride) { m_walk_from = from_frame, m_walk_stride = stride; }
+
   void Step(const std::array<PadBytes, 2>& pads)
   {
+    if (m_quiet)
+      return;
+    if (m_late_page_from != 0 && m_counter >= m_late_page_from)
+    {
+      const u32 v = m_mem.U32(LATE_PAGE);
+      m_mem.SetU32(LATE_PAGE, v + 1);
+      m_mem.SetU32(FIGHTER[0] + FIELD_COMBO_COUNT, v);
+    }
+    if (m_walk_from != 0 && m_counter >= m_walk_from)
+      m_mem.SetU32(LATE_WALK + (m_counter - m_walk_from) * m_walk_stride, 0x1234);
     const u32 hidden = m_mem.U32(HIDDEN);
     m_mem.SetU32(HIDDEN, hidden + 1);
     const u32 leak = m_leak ? hidden : 0;
@@ -224,6 +252,10 @@ private:
   FakeMemory m_mem;
   bool m_leak;
   u32 m_late_from;
+  bool m_quiet = false;
+  u32 m_late_page_from = 0;
+  u32 m_walk_from = 0;
+  u32 m_walk_stride = 0;
   std::map<u32, u64> m_tb_seen;
   bool m_tb_consistent = true;
   u32 m_counter = 1000;
@@ -242,7 +274,33 @@ SyncTestOptions Options(int k, int every = 1)
   o.stack_window = WINDOW;
   o.whitelist_path = "test.json";
   o.arm_commands = 60;  // the product default is 600; most tests do not need to wait that long
+  o.adaptive = false;   // the classic tests use a fixed whitelist; the adaptive snapshot set has its own tests at the end
   return o;
+}
+
+// The adaptive snapshot set: no whitelist needed, the set is learned. `slices` pages are hashed per call in 1/slices parts.
+SyncTestOptions AdaptiveOptions(int k, u32 slices = 16, u32 learn = 20)
+{
+  SyncTestOptions o = Options(k);
+  o.adaptive = true;
+  o.scan_slices = slices;
+  o.learn_cycles = learn;
+  return o;
+}
+
+bool Overlaps(const Range& r, u32 lo, u32 hi)
+{
+  return r.start < hi && lo < r.end;
+}
+
+bool SetContains(const std::vector<Range>& set, u32 addr, size_t n = 4)
+{
+  for (const Range& r : set)
+  {
+    if (addr >= r.start && u64(addr) + n <= r.end)
+      return true;
+  }
+  return false;
 }
 
 std::function<u64()> FakeClock()
@@ -1087,4 +1145,444 @@ TEST(Rev3Rollback, UserExclusionsRejectBadInput)
   EXPECT_EQ(ranges[0].start, original[0].start);
   EXPECT_EQ(ranges[1].end, original[1].end);
   EXPECT_FALSE(sink.Contains("NOTE exclude user"));
+}
+
+// ---- the adaptive snapshot set ------------------------------------------------------------------------------------------------
+
+TEST(Rev3Rollback, MergeRangesSortsAndJoins)
+{
+  const std::vector<Range> merged = MergeRanges({{0x300, 0x400}, {0x100, 0x200}, {0x200, 0x250}, {0x380, 0x500}, {0x700, 0x700}});
+  ASSERT_EQ(merged.size(), 2u);
+  EXPECT_EQ(merged[0].start, 0x100u);
+  EXPECT_EQ(merged[0].end, 0x250u);
+  EXPECT_EQ(merged[1].start, 0x300u);
+  EXPECT_EQ(merged[1].end, 0x500u);
+}
+
+TEST(Rev3Rollback, PageTrackerLearnsPagesThatChange)
+{
+  for (const bool peek : {true, false})  // direct pointers and the Read() fallback must agree
+  {
+    FakeMemory mem;
+    mem.peek_enabled = peek;
+    PageTracker tracker(mem, 4);
+    const u32 busy = 0x80100000, busy2 = 0x80101000, quiet = 0x80200000, once = 0x80300000;
+    mem.SetU32(quiet, 0x1234);
+
+    // Cycle 1 only takes baselines (22528 pages in 4 slices); nothing can be dynamic yet.
+    for (int i = 0; i < 4; ++i)
+      EXPECT_EQ(tracker.Scan(), 0u);
+    EXPECT_EQ(tracker.Cycles(), 1u);
+    EXPECT_EQ(tracker.DynamicPages(), 0u);
+
+    for (u32 cycle = 0; cycle < 3; ++cycle)
+    {
+      mem.SetU32(busy, 100 + cycle);        // changes every cycle
+      mem.SetU32(busy2 + 0xFFC, 7 + cycle);  // the last word of the next page
+      if (cycle == 0)
+        mem.SetU32(once, 5);                // changes once, then never again
+      for (int i = 0; i < 4; ++i)
+        tracker.Scan();
+    }
+    EXPECT_EQ(tracker.Cycles(), 4u);
+    EXPECT_TRUE(tracker.IsDynamic(busy));
+    EXPECT_TRUE(tracker.IsDynamic(busy + 0xFFF));
+    EXPECT_TRUE(tracker.IsDynamic(busy2));
+    EXPECT_TRUE(tracker.IsDynamic(once));  // sticky
+    EXPECT_FALSE(tracker.IsDynamic(quiet));
+    EXPECT_FALSE(tracker.IsDynamic(0x80400000));
+    EXPECT_EQ(tracker.DynamicPages(), 3u);
+
+    std::vector<Range> ranges;
+    tracker.AppendDynamicRanges(&ranges);
+    ASSERT_EQ(ranges.size(), 2u);  // the two neighbouring pages are one range
+    EXPECT_EQ(ranges[0].start, busy);
+    EXPECT_EQ(ranges[0].end, busy + 0x2000);
+    EXPECT_EQ(ranges[1].start, once);
+    EXPECT_EQ(ranges[1].end, once + 0x1000);
+
+    // A restore rewrites pages: their old hashes are forgotten, so the rewrite is not taken for a change by the game.
+    tracker.Reset();
+    EXPECT_EQ(tracker.DynamicPages(), 0u);
+    EXPECT_EQ(tracker.Cycles(), 0u);
+    EXPECT_FALSE(tracker.IsDynamic(busy));
+    for (int i = 0; i < 4; ++i)
+      tracker.Scan();                       // baselines again
+    mem.SetU32(quiet, 0x9999);              // "restored" to other content ...
+    tracker.InvalidateBaseline({{quiet, quiet + 4}});
+    mem.SetU32(0x80500000, 1);              // ... while a page nobody told the tracker about really changed
+    for (int i = 0; i < 4; ++i)
+      tracker.Scan();
+    EXPECT_FALSE(tracker.IsDynamic(quiet));
+    EXPECT_TRUE(tracker.IsDynamic(0x80500000));
+    EXPECT_EQ(tracker.DynamicPages(), 1u);
+  }
+}
+
+TEST(Rev3Rollback, AdaptiveSetAlwaysHoldsBothFightersAndTheStackWindow)
+{
+  FakeGame game(false);
+  game.SetQuiet();  // nothing in memory changes except the hook's stack frame
+  FakeSink sink;
+  SyncTest test(AdaptiveOptions(2), {}, game.Mem(), sink, FakeClock());  // no whitelist at all
+  EXPECT_TRUE(sink.Contains("adaptive=1 slices=16 learn=20"));
+  for (int i = 0; i < 400; ++i)
+    game.Frame(test);
+
+  ASSERT_TRUE(test.Active());
+  EXPECT_EQ(test.DynamicPages(), 1u);  // only the page of the stack frame
+  const std::vector<Range> want = {{FIGHTER[0], FIGHTER[0] + 0x1800}, {FIGHTER[1], FIGHTER[1] + 0x1800}, {SP, SP + 0x1000}};
+  ASSERT_EQ(test.Ranges().size(), want.size());
+  for (size_t i = 0; i < want.size(); ++i)
+  {
+    EXPECT_EQ(test.Ranges()[i].start, want[i].start) << i;
+    EXPECT_EQ(test.Ranges()[i].end, want[i].end) << i;
+  }
+  EXPECT_TRUE(sink.Contains("NOTE field coverage p1 fighter=0x80420000 in_snapshot=61/61"));
+  EXPECT_TRUE(sink.Contains("NOTE field coverage p2 fighter=0x80430000 in_snapshot=61/61"));
+  EXPECT_FALSE(sink.Contains("NOT IN SNAPSHOT"));
+  EXPECT_TRUE(sink.Contains("NOTE adaptive set at arm: dynamic_pages=1 (4096 bytes)"));
+  EXPECT_TRUE(sink.Contains("NOTE snapshot now ranges=3 bytes=" + std::to_string(2 * 0x1800 + 0x1000)));
+  EXPECT_GT(test.Stats().rollbacks, 20u);
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u);
+}
+
+TEST(Rev3Rollback, AdaptiveSetLearnsStateThatNoWhitelistNamed)
+{
+  for (const bool peek : {true, false})
+  {
+    FakeGame game(true);  // the hidden counter outside any whitelist feeds the state (the classic failure of a fixed whitelist)
+    game.Mem().peek_enabled = peek;
+    FakeSink sink;
+    SyncTest test(AdaptiveOptions(2), {}, game.Mem(), sink, FakeClock());
+    for (int i = 0; i < 320 + 400; ++i)
+      game.Frame(test);
+    while (test.Resimulating())
+      game.Frame(test);
+
+    EXPECT_TRUE(test.Active());
+    EXPECT_GT(test.Stats().rollbacks, 100u);
+    EXPECT_EQ(test.Stats().mismatching_frames, 0u);
+    EXPECT_FALSE(sink.Contains("MISMATCH"));
+    EXPECT_FALSE(sink.Contains("ERROR"));
+    EXPECT_TRUE(SetContains(test.Ranges(), HIDDEN));
+    EXPECT_TRUE(SetContains(test.Ranges(), STATE_A));
+    EXPECT_TRUE(SetContains(test.Ranges(), STATE_B + 4));
+    EXPECT_FALSE(SetContains(test.Ranges(), 0x80900000));  // memory that never changes stays out
+    EXPECT_EQ(test.Stats().pages_learned_armed, 0u);       // all of it was learned before arming
+    EXPECT_TRUE(sink.Contains("NOTE learning complete: 20 scan cycles (slices=16)"));
+    EXPECT_TRUE(sink.Contains("NOTE field coverage p2 fighter=0x80430000 in_snapshot=61/61"));
+    // Scan cost is in the heartbeat and the summary (the fake clock makes every timed call 7 us).
+    EXPECT_TRUE(sink.Contains(" dyn="));
+    EXPECT_TRUE(sink.Contains(" scan_us=7.0 scan_us_max=7"));
+    test.Finish();
+    EXPECT_TRUE(sink.Contains("SUMMARY final "));
+    EXPECT_TRUE(sink.Contains(" dynamic_pages="));
+    EXPECT_TRUE(sink.Contains(" scan_us_mean=7.0 scan_us_max=7"));
+  }
+}
+
+TEST(Rev3Rollback, WhitelistStaysAnOptionalSeed)
+{
+  FakeGame game(true);
+  FakeSink sink;
+  // The seed names STATE_A / STATE_B only; the hidden counter is learned on top, the seed is kept even where nothing changes.
+  std::vector<Range> seed = game.Ranges();
+  seed.push_back({0x80900000, 0x80900100});  // never changes
+  SyncTest test(AdaptiveOptions(2), seed, game.Mem(), sink, FakeClock());
+  for (int i = 0; i < 320 + 100; ++i)
+    game.Frame(test);
+  EXPECT_TRUE(SetContains(test.Ranges(), 0x80900000));
+  EXPECT_TRUE(SetContains(test.Ranges(), HIDDEN));
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u);
+  EXPECT_GT(test.Stats().rollbacks, 20u);
+}
+
+TEST(Rev3Rollback, ArmWaitsForTheLearningWindow)
+{
+  // Count mode: the 60 calls of REV3_SYNCTEST_ARM are not enough; 20 cycles of 16 scans = 320 calls are.
+  {
+    FakeGame game(false);
+    FakeSink sink;
+    SyncTest test(AdaptiveOptions(2), {}, game.Mem(), sink, FakeClock());
+    for (int i = 0; i < 319; ++i)
+      EXPECT_EQ(game.Frame(test).flags, 0u);
+    EXPECT_FALSE(test.Active());
+    EXPECT_FALSE(test.LearningDone());
+    EXPECT_EQ(test.Stats().rollbacks, 0u);
+    EXPECT_TRUE(sink.Contains("NOTE arm deferred: learning (3/20 cycles)"));  // first asked for at call 60
+    EXPECT_FALSE(sink.Contains("NOTE armed"));
+
+    game.Frame(test);  // call 320 completes the 20th cycle: learned and armed together
+    EXPECT_TRUE(test.LearningDone());
+    EXPECT_TRUE(test.Active());
+    EXPECT_TRUE(sink.Contains("NOTE learning complete: 20 scan cycles"));
+    EXPECT_TRUE(sink.Contains("NOTE armed at frame 1319 (320 hook calls with both fighters)"));
+    int deferred = 0;
+    for (const std::string& l : sink.lines)
+      deferred += l.rfind("NOTE arm deferred", 0) == 0;
+    EXPECT_EQ(deferred, 1);  // logged once, not on every call
+  }
+  // A long N later than the learning window: N decides.
+  {
+    FakeGame game(false);
+    FakeSink sink;
+    SyncTestOptions o = AdaptiveOptions(2);
+    o.arm_commands = 600;
+    SyncTest test(o, {}, game.Mem(), sink, FakeClock());
+    for (int i = 0; i < 599; ++i)
+      game.Frame(test);
+    EXPECT_TRUE(test.LearningDone());
+    EXPECT_FALSE(test.Active());
+    EXPECT_FALSE(sink.Contains("arm deferred"));
+    game.Frame(test);
+    EXPECT_TRUE(test.Active());
+  }
+  // Pad mode: a Z press during learning is remembered and arms by itself when learning completes.
+  {
+    FakeGame game(false);
+    FakeSink sink;
+    SyncTestOptions o = AdaptiveOptions(2);
+    o.arm_by_pad = true;
+    SyncTest test(o, {}, game.Mem(), sink, FakeClock());
+    game.SetZ(false);
+    for (int i = 0; i < 49; ++i)
+      game.Frame(test);
+    game.SetZ(true);  // call 50
+    game.Frame(test);
+    game.SetZ(false);
+    EXPECT_TRUE(sink.Contains("NOTE arm deferred: learning (3/20 cycles)"));
+    EXPECT_FALSE(test.Active());
+    for (int i = 0; i < 269; ++i)  // calls 51..319
+      game.Frame(test);
+    EXPECT_FALSE(test.Active());
+    EXPECT_EQ(test.Stats().rollbacks, 0u);
+    game.Frame(test);  // call 320
+    EXPECT_TRUE(test.Active());
+    EXPECT_TRUE(sink.Contains("NOTE armed by Z at frame 1319"));
+    for (int i = 0; i < 50; ++i)
+      game.Frame(test);
+    EXPECT_GT(test.Stats().rollbacks, 5u);
+    EXPECT_EQ(test.Stats().mismatching_frames, 0u);
+
+    // Z again disarms as before; pressing before learning is done and again cancels the wish.
+    game.SetZ(true);
+    while (test.Resimulating())
+      game.Frame(test);
+    game.Frame(test);
+    game.SetZ(false);
+    EXPECT_FALSE(test.Active());
+    EXPECT_TRUE(sink.Contains("NOTE disarmed by Z"));
+  }
+  {
+    FakeGame game(false);
+    FakeSink sink;
+    SyncTestOptions o = AdaptiveOptions(2);
+    o.arm_by_pad = true;
+    SyncTest test(o, {}, game.Mem(), sink, FakeClock());
+    game.SetZ(false);
+    for (int i = 0; i < 10; ++i)
+      game.Frame(test);
+    game.SetZ(true);
+    game.Frame(test);
+    game.SetZ(false);
+    game.Frame(test);
+    game.SetZ(true);  // second press: cancel
+    game.Frame(test);
+    game.SetZ(false);
+    EXPECT_TRUE(sink.Contains("NOTE arm cancelled by Z"));
+    for (int i = 0; i < 400; ++i)
+      game.Frame(test);
+    EXPECT_FALSE(test.Active());  // learning completed, but nobody wants it armed
+    EXPECT_TRUE(test.LearningDone());
+  }
+}
+
+TEST(Rev3Rollback, ExclusionsWinOverLearnedAndSeededPages)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  FakeHardware hw;
+  hw.list = {{"audio_dma", STATE_B + 0x10, STATE_B + 0x20}, {"xfb_top", 0x80700000, 0x80701000}};  // cuts the hidden counter's page
+  std::vector<Range> seed = game.Ranges();
+  seed.push_back({0x80002000, 0x80003000});  // seeded across the hook region
+  SyncTest test(AdaptiveOptions(2), seed, game.Mem(), sink, FakeClock(), &hw);
+  test.SetUserExclusions({{STATE_A + 0x200, STATE_A + 0x300}, {FIGHTER[1] + 0x1700, FIGHTER[1] + 0x1800}});  // fighter fields end at 0x1648
+  for (int i = 0; i < 320 + 300; ++i)
+  {
+    game.Mem().SetU32(0x80002500, i);  // the hook's own counter changes every frame: its page is dynamic, its region still cut
+    game.Frame(test);
+  }
+  ASSERT_TRUE(test.Active());
+  EXPECT_TRUE(test.LearningDone());
+  const std::vector<std::pair<u32, u32>> cuts = {{HOOK_REGION_START, HOOK_REGION_END},
+                                                 {STATE_A + 0x200, STATE_A + 0x300},
+                                                 {FIGHTER[1] + 0x1700, FIGHTER[1] + 0x1800},
+                                                 {STATE_B + 0x10, STATE_B + 0x20},
+                                                 {0x80700000, 0x80701000}};
+  for (const Range& r : test.Ranges())
+  {
+    for (const auto& c : cuts)
+      EXPECT_FALSE(Overlaps(r, c.first, c.second)) << std::hex << r.start << "-" << r.end << " vs " << c.first;
+  }
+  EXPECT_TRUE(SetContains(test.Ranges(), 0x80002000));  // the rest of that page is in
+  EXPECT_TRUE(SetContains(test.Ranges(), 0x80002A00));
+  EXPECT_TRUE(SetContains(test.Ranges(), STATE_A));
+  EXPECT_TRUE(SetContains(test.Ranges(), FIGHTER[1] + 0x1000));
+  EXPECT_GT(test.DynamicPages(), 3u);  // the cut pages were learned as dynamic, then cut
+  EXPECT_TRUE(sink.Contains("NOTE exclude xfb_top 0x80700000-0x80701000"));
+  EXPECT_TRUE(sink.Contains("in_snapshot=61/61"));
+  EXPECT_FALSE(sink.Contains("ERROR"));
+}
+
+TEST(Rev3Rollback, AFighterFieldThatIsCutRefusesToArm)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTest test(AdaptiveOptions(2), {}, game.Mem(), sink, FakeClock());
+  test.SetUserExclusions({{FIGHTER[1] + 0x100, FIGHTER[1] + 0x200}});  // takes the fields at 0x140, 0x150, 0x158 ... away
+  for (int i = 0; i < 1000; ++i)
+    game.Frame(test);
+  EXPECT_FALSE(test.Active());
+  EXPECT_EQ(test.Stats().rollbacks, 0u);
+  EXPECT_TRUE(sink.Contains("NOTE field coverage p1 fighter=0x80420000 in_snapshot=61/61"));
+  EXPECT_TRUE(sink.Contains("NOTE field coverage p2 fighter=0x80430000 in_snapshot="));
+  EXPECT_TRUE(sink.Contains(" NOT IN SNAPSHOT: action@0x80430140"));
+  EXPECT_TRUE(sink.Contains("ERROR frame 1319: not all fighter fields are inside the snapshot set"));
+  int errors = 0;
+  for (const std::string& l : sink.lines)
+    errors += l.rfind("ERROR", 0) == 0;
+  EXPECT_EQ(errors, 1);  // once, not on every call
+  EXPECT_FALSE(sink.Contains("NOTE armed"));
+}
+
+TEST(Rev3Rollback, ResimulatedFramesAreNotScanned)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTest test(AdaptiveOptions(3), {}, game.Mem(), sink, FakeClock());
+  for (int i = 0; i < 320; ++i)
+    game.Frame(test);
+  ASSERT_TRUE(test.Active());
+  int resim_calls = 0;
+  for (int i = 0; i < 200; ++i)
+  {
+    const bool resim = test.Resimulating();  // this call replays a frame
+    const u64 scans = test.Stats().scans;
+    game.Frame(test);
+    EXPECT_EQ(test.Stats().scans, scans + (resim ? 0 : 1));
+    resim_calls += resim;
+  }
+  EXPECT_GT(resim_calls, 100);  // K = 3: three of every four calls replay
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u);
+}
+
+TEST(Rev3Rollback, PagesThatChangeLaterAreAddedAndTheHistoryIsCleared)
+{
+  FakeGame game(false);
+  game.SetLatePage(1500);  // armed at frame 1319; from 1500 a counter in an unseen page feeds p1's combo_count
+  FakeSink sink;
+  SyncTest test(AdaptiveOptions(2), {}, game.Mem(), sink, FakeClock());
+  while (game.Counter() < 1500)  // with a rollback every frame the game advances one frame per K + 1 hook calls
+    game.Frame(test);
+  ASSERT_TRUE(test.Active());
+  EXPECT_FALSE(SetContains(test.Ranges(), LATE_PAGE));
+  const size_t bytes_before = test.SnapshotBytes();
+  const u32 rollbacks_before = test.Stats().rollbacks;
+  EXPECT_GT(rollbacks_before, 50u);
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u);
+
+  // Until the tracker comes round to that page the replay differs; then the page is added and the set rebuilt.
+  for (int i = 0; i < 200; ++i)
+    game.Frame(test);
+  EXPECT_TRUE(SetContains(test.Ranges(), LATE_PAGE));
+  EXPECT_GE(test.Stats().pages_learned_armed, 1u);
+  EXPECT_GT(test.SnapshotBytes(), bytes_before);
+  EXPECT_TRUE(sink.Contains("NOTE learned +1 pages (now ranges="));
+  EXPECT_TRUE(sink.Contains("history cleared"));
+  EXPECT_GT(test.Stats().mismatching_frames, 0u);  // the missing page was noticed before it was learned
+
+  // From here on the replays agree again.
+  while (test.Resimulating())
+    game.Frame(test);
+  const u32 mismatches = test.Stats().mismatching_frames;
+  const u32 rollbacks = test.Stats().rollbacks;
+  for (int i = 0; i < 300; ++i)
+    game.Frame(test);
+  EXPECT_GT(test.Stats().rollbacks, rollbacks + 30);
+  EXPECT_EQ(test.Stats().mismatching_frames, mismatches);
+  EXPECT_TRUE(sink.Contains("NOTE field coverage p1 fighter=0x80420000 in_snapshot=61/61"));
+}
+
+TEST(Rev3Rollback, LearningWhileArmedIsRateLimitedInTheLog)
+{
+  FakeGame game(false);
+  // One new page per frame from frame 4400, each in the next scan slice (1024 slices of 22 pages): 60 growths in a row. The
+  // first scan cycle only records baselines and the second finds the game's own pages, so learning 3 cycles (3072 calls) is
+  // enough to arm with a complete set.
+  game.SetWalker(4400, 22 * 0x1000);
+  FakeSink sink;
+  SyncTest test(AdaptiveOptions(2, 1024, 3), {}, game.Mem(), sink, FakeClock());
+  while (game.Counter() < 4400 + 1100)
+    game.Frame(test);
+  ASSERT_TRUE(test.Active());
+  EXPECT_GE(test.Stats().pages_learned_armed, 50u);
+  int learned = 0;
+  for (const std::string& l : sink.lines)
+    learned += l.rfind("NOTE learned +", 0) == 0;
+  EXPECT_GE(learned, 10);
+  EXPECT_LE(learned, 14);
+  EXPECT_TRUE(sink.Contains("NOTE further learning is logged at most every 300 hook calls"));
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u);
+}
+
+TEST(Rev3Rollback, LosingTheFightForgetsEverythingLearned)
+{
+  FakeGame game(true);
+  FakeSink sink;
+  SyncTest test(AdaptiveOptions(2), {}, game.Mem(), sink, FakeClock());
+  for (int i = 0; i < 400; ++i)
+    game.Frame(test);
+  ASSERT_TRUE(test.Active());
+  EXPECT_GT(test.DynamicPages(), 3u);
+
+  game.Mem().SetU32(0x8038FE50 + 4, 0);  // loading screen
+  for (int i = 0; i < 20; ++i)
+    game.Frame(test);
+  EXPECT_FALSE(test.Active());
+  EXPECT_EQ(test.DynamicPages(), 0u);
+  EXPECT_EQ(test.LearnCycles(), 0u);
+  EXPECT_FALSE(test.LearningDone());
+
+  // A new match learns from scratch: no rollback for 320 calls even though 60 would do for the count.
+  game.Mem().SetU32(0x8038FE50 + 4, TEAM[1]);
+  const u32 rollbacks = test.Stats().rollbacks;
+  for (int i = 0; i < 319; ++i)
+    EXPECT_EQ(game.Frame(test).flags, 0u);
+  EXPECT_EQ(test.Stats().rollbacks, rollbacks);
+  for (int i = 0; i < 40; ++i)
+    game.Frame(test);
+  EXPECT_GT(test.Stats().rollbacks, rollbacks);
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u);
+  int complete = 0;
+  for (const std::string& l : sink.lines)
+    complete += l.rfind("NOTE learning complete", 0) == 0;
+  EXPECT_EQ(complete, 2);
+}
+
+TEST(Rev3Rollback, ExclusionsMayEmptyTheSeedWhenTheSetIsAdaptive)
+{
+  FakeSink sink;
+  std::vector<Range> ranges = {{STATE_A, STATE_A + 0x100}};
+  std::vector<Range> parsed;
+  std::string error;
+  const char* const json = R"({"ranges":[{"start":"0x80500000","end":"0x80500100"}]})";
+  EXPECT_FALSE(ApplyExclusions(json, &ranges, sink, &error, &parsed, true));  // classic: nothing would be left
+  EXPECT_FALSE(error.empty());
+  error.clear();
+  EXPECT_TRUE(ApplyExclusions(json, &ranges, sink, &error, &parsed, false));
+  EXPECT_TRUE(ranges.empty());
+  ASSERT_EQ(parsed.size(), 1u);
+  EXPECT_EQ(parsed[0].start, STATE_A);
+  EXPECT_EQ(parsed[0].end, STATE_A + 0x100);
 }
