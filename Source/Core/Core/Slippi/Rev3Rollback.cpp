@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -19,6 +20,9 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <thread>
 #include <utility>
 
 #include <picojson.h>
@@ -1045,6 +1049,10 @@ bool SyncTest::Restore(const Slot& s, const Command& command, u32 to)
   const bool log_short = !net_policy && !log_it && m_restore_logs < MAX_SHORT_RESTORE_LOGS;
   if (log_it && m_restore_logs < MAX_RESTORE_LOGS)
     m_sink.Line(Format("RESTORE %u -> %u begin", command.frame, to));
+  // Freeze dump: the hardware and the software flags that wait on it, right before the write-back (the first 10 restores).
+  const bool dump_hw = log_it && m_restore_logs < MAX_RESTORE_LOGS && m_dump != nullptr;
+  if (dump_hw)
+    m_sink.Line(m_dump->RestoreHwLine(command.frame, to, false));
 
   const u64 t0 = m_micros();
   size_t offset = 0;
@@ -1090,6 +1098,8 @@ bool SyncTest::Restore(const Slot& s, const Command& command, u32 to)
 
   // The audio hardware goes back after the memory write-back and the JIT invalidation.
   tb_text += RestoreAudio(s, command);
+  if (dump_hw)
+    m_sink.Line(m_dump->RestoreHwLine(command.frame, to, true));
 
   ++m_stats.restores;
   m_stats.restore_us_total += us;
@@ -1523,6 +1533,8 @@ bool SyncTest::Arm(const Command& command, const std::array<u32, 2>& fighters)
     m_sink.Line(Format("NOTE audio hw at arm: bytes=%zu irq=0x%02X events=%zu [%s]", state.size(), m_audio->InterruptBits(),
                        events.size(), list.c_str()));
   }
+  if (m_dump != nullptr)
+    m_dump->Dump("arm", false, true, Format("frame=%u", command.frame));
   return true;
 }
 
@@ -1548,7 +1560,18 @@ u32 SyncTest::ScanSlice(u32 frame)
   return added;
 }
 
+// The freeze dump's watchdog needs to know when the last command arrived and whether SyncTest is armed.
 Reply SyncTest::OnCommand(const Command& command)
+{
+  if (m_dump != nullptr)
+    m_dump->Tick(command.frame);
+  const Reply reply = OnCommandImpl(command);
+  if (m_dump != nullptr)
+    m_dump->SetArmed(m_armed);
+  return reply;
+}
+
+Reply SyncTest::OnCommandImpl(const Command& command)
 {
   std::array<u32, 2> fighters{};
   const bool found = FindFighters(&fighters);
@@ -2188,6 +2211,409 @@ void DeterminismKit::Finish()
   m_record_pending = 0;
 }
 
+// ---- (4c) freeze dump ---------------------------------------------------------------------------------------------------------
+// See Rev3Rollback.h "freeze dump" and REV3.md "Freeze dump". Reads guest memory and hardware only; writes nothing but log lines.
+
+namespace
+{
+// Rev3's SDK globals (from the decomp, addresses only). OSThread offsets follow the standard Dolphin SDK layout
+// (context 0x000..0x2C8, state, attr, suspend, priority, base, val, queue, link, queueJoin, mutex, queueMutex, linkActive, stackBase, stackEnd).
+constexpr u32 OS_CURRENT_CONTEXT = 0x800000D4;  // OSGetCurrentContext
+constexpr u32 OS_FPU_OWNER = 0x800000D8;        // thread whose FPRs are live
+constexpr u32 OS_ACTIVE_THREADS = 0x800000DC;   // head of the active thread list (OSThread.linkActive)
+constexpr u32 OS_CURRENT_THREAD = 0x800000E4;   // OSGetCurrentThread
+constexpr u32 OS_SCHED_DISABLE = 0x8049DAB8;    // OSDisableScheduler count (nonzero while a thread is blocked in a critical section)
+constexpr u32 OS_RESCHED = 0x8049DABC;          // reschedule requested
+constexpr u32 OS_RUN_QUEUE_BITS = 0x8049DAC0;   // bit per priority with a ready thread
+
+constexpr u32 TH_CTX_GPR1 = 0x04;
+constexpr u32 TH_CTX_LR = 0x84;
+constexpr u32 TH_CTX_SRR0 = 0x198;
+constexpr u32 TH_STATE = 0x2C8;       // u16: 1 ready, 2 running, 4 waiting, 8 moribund
+constexpr u32 TH_SUSPEND = 0x2CC;     // s32
+constexpr u32 TH_PRIORITY = 0x2D0;    // s32
+constexpr u32 TH_QUEUE = 0x2DC;       // OSThreadQueue* the thread sleeps in
+constexpr u32 TH_LINK_NEXT = 0x2E0;   // OSThreadLink.next inside that queue
+constexpr u32 TH_ACTIVE_NEXT = 0x2FC; // OSThreadLink.next of the active list
+constexpr u32 TH_STACK_BASE = 0x304;  // highest address
+constexpr u32 TH_STACK_END = 0x308;   // lowest address; the canary word lives here
+constexpr u32 STACK_CANARY = 0xDEADBABE;
+
+constexpr size_t DUMP_MAX_THREADS = 32;
+constexpr size_t DUMP_MAX_WAITERS = 8;
+constexpr size_t DUMP_PPC_FRAMES = 16;
+constexpr size_t DUMP_THREAD_FRAMES = 6;
+
+// Sleep queues ({head, tail}, 8 bytes each) the freeze can be waiting in.
+struct DumpQueueDef
+{
+  const char* name;
+  u32 address;
+};
+constexpr DumpQueueDef DUMP_QUEUES[] = {
+    {"gx_drawdone", 0x8049D950}, {"vi_retrace", 0x8049D4B8}, {"dvd", 0x8049D7B0},
+    {"nw4r_strm", 0x8049D238},   {"ax", 0x8049D6A0},         {"sc", 0x804655A0},
+};
+constexpr u32 DUMP_IPC_POINTER = 0x8049D984;  // *ptr + 0x2C is the IPC response queue
+constexpr u32 DUMP_IPC_OFFSET = 0x2C;
+constexpr u32 DUMP_GX_DRAWDONE_FLAG = 0x8049D958;  // byte
+constexpr u32 DUMP_VI_RETRACE_COUNT = 0x8049D4DC;
+constexpr u32 DUMP_GAME_LAST_VI_COUNT = 0x8049CF48;  // the game's last-frame count
+constexpr u32 DUMP_GAME_FRAME_FLAGS = 0x803C19C0;
+constexpr u32 DUMP_GAME_MAIN_STATE = 0x803C11D4;
+constexpr u32 DUMP_GAME_NO_GX = 0x803C1A70;
+
+std::optional<u32> Rd32(const GuestMemory& memory, u32 addr)
+{
+  u8 b[4];
+  if (!memory.Read(addr, b, 4))
+    return std::nullopt;
+  return ReadBE32(b);
+}
+
+std::optional<u32> Rd16(const GuestMemory& memory, u32 addr)
+{
+  u8 b[2];
+  if (!memory.Read(addr, b, 2))
+    return std::nullopt;
+  return (static_cast<u32>(b[0]) << 8) | b[1];
+}
+
+std::optional<u32> Rd8(const GuestMemory& memory, u32 addr)
+{
+  u8 b[1];
+  if (!memory.Read(addr, b, 1))
+    return std::nullopt;
+  return static_cast<u32>(b[0]);
+}
+
+std::string Hex32(const std::optional<u32>& v)
+{
+  return v ? Format("0x%08X", *v) : std::string("?");
+}
+std::string Hex16(const std::optional<u32>& v)
+{
+  return v ? Format("0x%04X", *v) : std::string("?");
+}
+std::string Hex8(const std::optional<u32>& v)
+{
+  return v ? Format("0x%02X", *v) : std::string("?");
+}
+std::string Signed(const std::optional<u32>& v)
+{
+  return v ? Format("%d", static_cast<int>(static_cast<s32>(*v))) : std::string("?");
+}
+
+// A thread / queue pointer worth following: inside MEM1 / MEM2 and word aligned.
+bool DumpPtrOk(u32 p)
+{
+  return PointerOk(p) && (p & 3) == 0;
+}
+
+void AppendFrames(std::vector<std::string>* out, const std::string& label, const std::vector<StackFrame>& frames)
+{
+  for (size_t i = 0; i < frames.size(); ++i)
+    out->push_back(Format("%sframe %zu sp=0x%08X lr=0x%08X", label.c_str(), i, frames[i].sp, frames[i].lr));
+}
+
+void AppendCpu(std::vector<std::string>* out, const GuestMemory& memory, const DumpCpu& cpu, bool ok)
+{
+  if (!ok)
+  {
+    out->push_back("ppc unavailable");
+    return;
+  }
+  out->push_back(Format("ppc pc=0x%08X npc=0x%08X lr=0x%08X ctr=0x%08X msr=0x%08X srr0=0x%08X srr1=0x%08X cr=0x%08X "
+                        "r1=0x%08X r2=0x%08X r13=0x%08X",
+                        cpu.pc, cpu.npc, cpu.lr, cpu.ctr, cpu.msr, cpu.srr0, cpu.srr1, cpu.cr, cpu.gpr[1], cpu.gpr[2], cpu.gpr[13]));
+  std::string regs = "ppc";
+  for (size_t r = 3; r <= 12; ++r)
+    regs += Format(" r%zu=0x%08X", r, cpu.gpr[r]);
+  out->push_back(regs + Format(" exceptions=0x%08X", cpu.exceptions));
+  std::vector<StackFrame> frames;
+  WalkBackChain(memory, cpu.gpr[1], DUMP_PPC_FRAMES, &frames);
+  if (frames.empty())
+    out->push_back(Format("frame none: r1=0x%08X is not a readable stack pointer", cpu.gpr[1]));
+  AppendFrames(out, "", frames);
+}
+
+// One OSThread. `live` = the running thread: pc / lr / sp come from the live registers instead of its (stale) saved context.
+void AppendThread(std::vector<std::string>* out, const GuestMemory& memory, u32 t, const DumpCpu* live)
+{
+  const std::optional<u32> state = Rd16(memory, t + TH_STATE);
+  const std::optional<u32> prio = Rd32(memory, t + TH_PRIORITY);
+  const std::optional<u32> suspend = Rd32(memory, t + TH_SUSPEND);
+  const std::optional<u32> queue = Rd32(memory, t + TH_QUEUE);
+  const std::optional<u32> stack_base = Rd32(memory, t + TH_STACK_BASE);
+  const std::optional<u32> stack_end = Rd32(memory, t + TH_STACK_END);
+  std::optional<u32> pc = Rd32(memory, t + TH_CTX_SRR0);
+  std::optional<u32> lr = Rd32(memory, t + TH_CTX_LR);
+  std::optional<u32> sp = Rd32(memory, t + TH_CTX_GPR1);
+  if (live != nullptr)
+  {
+    pc = live->pc;
+    lr = live->lr;
+    sp = live->gpr[1];
+  }
+  std::string canary = "?";
+  if (stack_end)
+  {
+    if (const std::optional<u32> word = Rd32(memory, *stack_end))
+      canary = *word == STACK_CANARY ? "ok" : "bad";
+  }
+  out->push_back(Format("thread 0x%08X state=%s prio=%s suspend=%s queue=%s pc=%s lr=%s sp=%s canary=%s stack=%s..%s%s", t,
+                        state ? Format("%u", *state).c_str() : "?", Signed(prio).c_str(), Signed(suspend).c_str(),
+                        Hex32(queue).c_str(), Hex32(pc).c_str(), Hex32(lr).c_str(), Hex32(sp).c_str(), canary.c_str(),
+                        Hex32(stack_end).c_str(), Hex32(stack_base).c_str(), live != nullptr ? " running=1 live=1" : ""));
+  if (sp)
+  {
+    std::vector<StackFrame> frames;
+    WalkBackChain(memory, *sp, DUMP_THREAD_FRAMES, &frames);
+    AppendFrames(out, Format("thread 0x%08X ", t), frames);
+  }
+}
+
+void AppendOs(std::vector<std::string>* out, const GuestMemory& memory, const DumpCpu& cpu, bool cpu_ok)
+{
+  const std::optional<u32> current = Rd32(memory, OS_CURRENT_THREAD);
+  const std::optional<u32> head = Rd32(memory, OS_ACTIVE_THREADS);
+  out->push_back(Format("os cur_thread=%s cur_context=%s fpu_owner=%s sched_disable=%s run_queue_bits=%s resched=%s active_head=%s",
+                        Hex32(current).c_str(), Hex32(Rd32(memory, OS_CURRENT_CONTEXT)).c_str(),
+                        Hex32(Rd32(memory, OS_FPU_OWNER)).c_str(), Hex32(Rd32(memory, OS_SCHED_DISABLE)).c_str(),
+                        Hex32(Rd32(memory, OS_RUN_QUEUE_BITS)).c_str(), Hex32(Rd32(memory, OS_RESCHED)).c_str(),
+                        Hex32(head).c_str()));
+
+  // The active thread list, at most DUMP_MAX_THREADS, with loop detection.
+  std::vector<u32> threads;
+  std::string end = "null";
+  u32 t = head.value_or(0);
+  if (!head)
+    end = "unreadable";
+  while (head)
+  {
+    if (t == 0)
+      break;
+    if (!DumpPtrOk(t))
+    {
+      end = Format("bad_ptr(0x%08X)", t);
+      break;
+    }
+    if (std::find(threads.begin(), threads.end(), t) != threads.end())
+    {
+      end = Format("cycle(0x%08X)", t);
+      break;
+    }
+    if (threads.size() >= DUMP_MAX_THREADS)
+    {
+      end = "max";
+      break;
+    }
+    threads.push_back(t);
+    const std::optional<u32> next = Rd32(memory, t + TH_ACTIVE_NEXT);
+    if (!next)
+    {
+      end = "unreadable_link";
+      break;
+    }
+    t = *next;
+  }
+  out->push_back(Format("threads n=%zu end=%s", threads.size(), end.c_str()));
+  for (const u32 thread : threads)
+    AppendThread(out, memory, thread, cpu_ok && current && *current == thread ? &cpu : nullptr);
+}
+
+// One sleep queue {head, tail} at `address`: the first waiters (linked through OSThread.link) and the head thread's saved pc / lr.
+void AppendQueue(std::vector<std::string>* out, const GuestMemory& memory, const char* name, u32 address, const std::string& extra)
+{
+  const std::optional<u32> head = Rd32(memory, address);
+  const std::optional<u32> tail = Rd32(memory, address + 4);
+  if (!head || !tail)
+  {
+    out->push_back(Format("queue %s at=0x%08X unreadable%s", name, address, extra.c_str()));
+    return;
+  }
+  if (*head == 0)
+  {
+    out->push_back(Format("queue %s at=0x%08X head=0x00000000 tail=%s waiters=0%s", name, address, Hex32(tail).c_str(), extra.c_str()));
+    return;
+  }
+  std::vector<u32> waiters;
+  u32 t = *head;
+  std::string end;
+  while (t != 0)
+  {
+    if (!DumpPtrOk(t))
+    {
+      end = Format(" bad_link=0x%08X", t);
+      break;
+    }
+    if (waiters.size() >= DUMP_MAX_WAITERS || std::find(waiters.begin(), waiters.end(), t) != waiters.end())
+    {
+      end = " more";
+      break;
+    }
+    waiters.push_back(t);
+    const std::optional<u32> next = Rd32(memory, t + TH_LINK_NEXT);
+    if (!next)
+    {
+      end = " unreadable_link";
+      break;
+    }
+    t = *next;
+  }
+  std::string list;
+  for (const u32 w : waiters)
+    list += Format("%s0x%08X", list.empty() ? "" : ",", w);
+  std::string line = Format("queue %s at=0x%08X head=0x%08X tail=%s waiters=%zu[%s]%s", name, address, *head, Hex32(tail).c_str(),
+                            waiters.size(), list.c_str(), end.c_str());
+  if (DumpPtrOk(*head))
+  {
+    line += Format(" head_state=%s head_pc=%s head_lr=%s", Hex16(Rd16(memory, *head + TH_STATE)).c_str(),
+                   Hex32(Rd32(memory, *head + TH_CTX_SRR0)).c_str(), Hex32(Rd32(memory, *head + TH_CTX_LR)).c_str());
+  }
+  out->push_back(line + extra);
+}
+
+void AppendQueues(std::vector<std::string>* out, const GuestMemory& memory)
+{
+  for (const DumpQueueDef& q : DUMP_QUEUES)
+  {
+    std::string extra;
+    if (q.address == 0x8049D950)
+      extra = Format(" drawdone_flag=%s", Hex8(Rd8(memory, DUMP_GX_DRAWDONE_FLAG)).c_str());
+    else if (q.address == 0x8049D4B8)
+      extra = Format(" retrace_count=%s game_last_count=%s", Hex32(Rd32(memory, DUMP_VI_RETRACE_COUNT)).c_str(),
+                     Hex32(Rd32(memory, DUMP_GAME_LAST_VI_COUNT)).c_str());
+    AppendQueue(out, memory, q.name, q.address, extra);
+  }
+  // The IPC queue sits behind a pointer (*0x8049D984 + 0x2C); skipped when the pointer is not a valid object.
+  const std::optional<u32> ipc = Rd32(memory, DUMP_IPC_POINTER);
+  if (ipc && DumpPtrOk(*ipc))
+    AppendQueue(out, memory, "ipc", *ipc + DUMP_IPC_OFFSET, Format(" ipc_object=0x%08X", *ipc));
+  else
+    out->push_back(Format("queue ipc skipped: pointer *0x%08X is %s", DUMP_IPC_POINTER, Hex32(ipc).c_str()));
+  out->push_back(Format("game frame_loop_flags=%s main_state=%s no_gx=%s", Hex32(Rd32(memory, DUMP_GAME_FRAME_FLAGS)).c_str(),
+                        Hex32(Rd32(memory, DUMP_GAME_MAIN_STATE)).c_str(), Hex32(Rd32(memory, DUMP_GAME_NO_GX)).c_str()));
+}
+
+void AppendHw(std::vector<std::string>* out, const DumpHw& hw, bool ok)
+{
+  if (!ok)
+  {
+    out->push_back("hw unavailable");
+    return;
+  }
+  out->push_back(hw.pe_ok ? Format("hw pe pe_status=0x%04X pe_token=0x%04X", hw.pe_status, hw.pe_token) : std::string("hw pe unavailable"));
+  if (hw.cp_ok)
+  {
+    const char* status = hw.cp_breakpoint ? "breakpoint" : (hw.cp_dist == 0 ? "idle" : "busy");
+    out->push_back(Format("hw cp status=%s base=0x%08X end=0x%08X rd=0x%08X wr=0x%08X rw_dist=0x%X bp=0x%08X gp_read=%d bp_enable=%d link=%d "
+                          "hi_wm=%d lo_wm=%d",
+                          status, hw.cp_base, hw.cp_end, hw.cp_rd, hw.cp_wr, hw.cp_dist, hw.cp_bp, hw.cp_gp_read ? 1 : 0,
+                          hw.cp_bp_enable ? 1 : 0, hw.cp_link ? 1 : 0, hw.cp_hi_wm ? 1 : 0, hw.cp_lo_wm ? 1 : 0));
+  }
+  else
+  {
+    out->push_back("hw cp unavailable");
+  }
+  out->push_back(hw.pi_ok ? Format("hw pi cause=0x%08X mask=0x%08X fifo_base=0x%08X fifo_end=0x%08X fifo_wptr=0x%08X", hw.pi_cause,
+                                   hw.pi_mask, hw.pi_fifo_base, hw.pi_fifo_end, hw.pi_fifo_wptr) :
+                            std::string("hw pi unavailable"));
+  out->push_back(hw.vi_ok ? Format("hw vi line=%u di0=0x%08X", hw.vi_line, hw.vi_di0) : std::string("hw vi unavailable"));
+}
+}  // namespace
+
+size_t WalkBackChain(const GuestMemory& memory, u32 sp, size_t max_frames, std::vector<StackFrame>* out)
+{
+  out->clear();
+  while (out->size() < max_frames)
+  {
+    if (sp == 0 || (sp & 3) != 0)
+      break;
+    u8 words[8];
+    if (!memory.Read(sp, words, sizeof(words)))
+      break;
+    const u32 next = ReadBE32(words);
+    out->push_back({sp, ReadBE32(words + 4)});
+    if (next <= sp)  // zero (the root), or a loop / a stack that does not grow upwards
+      break;
+    sp = next;
+  }
+  return out->size();
+}
+
+FreezeDump::FreezeDump(const GuestMemory& memory, Sink& sink, DumpSource& source, u32 stall_ms, std::function<u64()> now_ms)
+    : m_memory(memory), m_sink(sink), m_source(source), m_stall_ms(std::max<u32>(stall_ms, 1)), m_now_ms(std::move(now_ms))
+{
+  if (!m_now_ms)
+    m_now_ms = []() { return SteadyMicros() / 1000; };
+}
+
+std::vector<std::string> FreezeDump::Lines(bool full)
+{
+  std::vector<std::string> out;
+  DumpCpu cpu;
+  const bool cpu_ok = m_source.ReadCpu(&cpu) && cpu.valid;
+  DumpHw hw;
+  const bool hw_ok = m_source.ReadHw(&hw);
+  AppendCpu(&out, m_memory, cpu, cpu_ok);
+  AppendOs(&out, m_memory, cpu, cpu_ok);
+  AppendQueues(&out, m_memory);
+  AppendHw(&out, hw, hw_ok);
+  if (full)
+    m_source.AudioLines(&out);
+  return out;
+}
+
+void FreezeDump::Dump(const char* reason, bool racy, bool full, const std::string& note)
+{
+  std::lock_guard<std::mutex> lock(m_lock);
+  const std::string prefix = Format("DUMP %s ", reason);
+  m_sink.Line(prefix + Format("begin racy=%d frame=%u last_cmd_age_ms=%llu", racy ? 1 : 0, m_frame.load(),
+                              static_cast<unsigned long long>(LastAgeMs())) +
+              (note.empty() ? std::string() : " " + note));
+  for (const std::string& line : Lines(full))
+    m_sink.Line(prefix + line);
+  m_sink.Line(prefix + "end");
+}
+
+std::string FreezeDump::RestoreHwLine(u32 from, u32 to, bool after)
+{
+  DumpHw hw;
+  const bool ok = m_source.ReadHw(&hw);
+  const auto field = [ok](bool group_ok, const std::string& value) { return ok && group_ok ? value : std::string("?"); };
+  return Format("RESTOREHW %u -> %u%s pe_status=%s pe_token=%s cp_rw_dist=%s cp_rd=%s cp_wr=%s vi_count=%s drawdone=%s sched_disable=%s",
+                from, to, after ? " after" : "", field(hw.pe_ok, Format("0x%04X", hw.pe_status)).c_str(),
+                field(hw.pe_ok, Format("0x%04X", hw.pe_token)).c_str(), field(hw.cp_ok, Format("0x%X", hw.cp_dist)).c_str(),
+                field(hw.cp_ok, Format("0x%08X", hw.cp_rd)).c_str(), field(hw.cp_ok, Format("0x%08X", hw.cp_wr)).c_str(),
+                Hex32(Rd32(m_memory, DUMP_VI_RETRACE_COUNT)).c_str(), Hex8(Rd8(m_memory, DUMP_GX_DRAWDONE_FLAG)).c_str(),
+                Hex32(Rd32(m_memory, OS_SCHED_DISABLE)).c_str());
+}
+
+void FreezeDump::Tick(u32 frame)
+{
+  m_frame.store(frame);
+  m_last_ms.store(m_now_ms());
+  m_seen.store(true);
+  m_reported.store(false);
+}
+
+u64 FreezeDump::LastAgeMs() const
+{
+  if (!m_seen.load())
+    return 0;
+  const u64 now = m_now_ms();
+  const u64 last = m_last_ms.load();
+  return now > last ? now - last : 0;
+}
+
+bool FreezeDump::StallDue()
+{
+  if (!m_armed.load() || !m_seen.load() || m_reported.load() || LastAgeMs() < m_stall_ms)
+    return false;
+  return !m_reported.exchange(true);  // claimed once; the next Tick starts a new stall
+}
+
 // ---- (5) Dolphin glue ---------------------------------------------------------------------------------------------------
 
 namespace
@@ -2538,6 +2964,189 @@ std::string DescribeDsp(Core::System& system)
                 (control & 0x8000) != 0 ? "on" : "off", src, control & 0x7FFF, left);
 }
 
+// What the freeze dump reads from Dolphin (REV3_SYNCTEST_DUMP). Read-only. Safe to call from the CPU thread, from the watchdog thread
+// (racy: the CPU thread keeps running, so values may be torn but nothing is written) and from the host thread at shutdown.
+//   PPC state       system.GetPPCState(): pc, npc, gpr, LR / CTR / SRR0 / SRR1, msr, cr.Get(), Exceptions
+//   PE              MMIO 0x0C00100A (control / interrupt status) and 0x0C00100E (token), plain 16-bit reads
+//   CP              GetCommandProcessor().GetFifo() atomics (the CP status register read has side effects, so it is derived: breakpoint
+//                   flag, RW distance 0 = idle)
+//   PI              ProcessorInterfaceManager::GetCause / GetMask and the public CPU FIFO pointers
+//   VI              MMIO 0x0C00202C (vertical beam position) and the display interrupt 0 register 0x0C002030 / 32 (16-bit halves)
+//   audio (full)    DescribeDsp() and the pending audio CoreTiming events; not at shutdown (the DSP is already gone) nor when racy.
+class DolphinDumpSource final : public DumpSource
+{
+public:
+  DolphinDumpSource(Core::System& system, AudioHardware* audio) : m_system(system), m_audio(audio) {}
+
+  // Called before the final dump: HW::Shutdown has stopped the DSP before it destroys the EXI devices, so its registers are off limits.
+  void MarkShutdown() { m_shutdown = true; }
+  bool CpuRunning() const { return Core::GetState(m_system) == Core::State::Running; }
+
+  bool ReadCpu(DumpCpu* out) override
+  {
+    const PowerPC::PowerPCState& ppc = m_system.GetPPCState();
+    out->pc = ppc.pc;
+    out->npc = ppc.npc;
+    out->lr = LR(ppc);
+    out->ctr = CTR(ppc);
+    out->msr = ppc.msr.Hex;
+    out->srr0 = SRR0(ppc);
+    out->srr1 = SRR1(ppc);
+    out->cr = ppc.cr.Get();
+    out->exceptions = ppc.Exceptions;
+    for (size_t i = 0; i < out->gpr.size(); ++i)
+      out->gpr[i] = ppc.gpr[i];
+    out->valid = true;
+    return true;
+  }
+
+  bool ReadHw(DumpHw* out) override
+  {
+    if (MMIO::Mapping* mmio = m_system.GetMemory().GetMMIOMapping(); mmio != nullptr)
+    {
+      out->pe_status = mmio->Read<u16>(m_system, 0x0C00100A);
+      out->pe_token = mmio->Read<u16>(m_system, 0x0C00100E);
+      out->pe_ok = true;
+      out->vi_line = mmio->Read<u16>(m_system, 0x0C00202C);
+      out->vi_di0 = (static_cast<u32>(mmio->Read<u16>(m_system, 0x0C002030)) << 16) | mmio->Read<u16>(m_system, 0x0C002032);
+      out->vi_ok = true;
+    }
+    {
+      auto& fifo = m_system.GetCommandProcessor().GetFifo();
+      out->cp_base = fifo.CPBase.load();
+      out->cp_end = fifo.CPEnd.load();
+      out->cp_rd = fifo.CPReadPointer.load();
+      out->cp_wr = fifo.CPWritePointer.load();
+      out->cp_dist = fifo.CPReadWriteDistance.load();
+      out->cp_bp = fifo.CPBreakpoint.load();
+      out->cp_breakpoint = fifo.bFF_Breakpoint.load() != 0;
+      out->cp_gp_read = fifo.bFF_GPReadEnable.load() != 0;
+      out->cp_bp_enable = fifo.bFF_BPEnable.load() != 0;
+      out->cp_link = fifo.bFF_GPLinkEnable.load() != 0;
+      out->cp_hi_wm = fifo.bFF_HiWatermark.load() != 0;
+      out->cp_lo_wm = fifo.bFF_LoWatermark.load() != 0;
+      out->cp_ok = true;
+    }
+    {
+      auto& pi = m_system.GetProcessorInterface();
+      out->pi_cause = pi.GetCause();
+      out->pi_mask = pi.GetMask();
+      out->pi_fifo_base = pi.m_fifo_cpu_base;
+      out->pi_fifo_end = pi.m_fifo_cpu_end;
+      out->pi_fifo_wptr = pi.m_fifo_cpu_write_pointer;
+      out->pi_ok = true;
+    }
+    return true;
+  }
+
+  void AudioLines(std::vector<std::string>* out) override
+  {
+    if (m_shutdown)
+    {
+      out->push_back("dsp skipped: the DSP is shut down before the EXI devices are");
+      return;
+    }
+    out->push_back(DescribeDsp(m_system));
+    if (m_audio == nullptr)
+      return;
+    std::vector<AudioEvent> events;
+    m_audio->PendingEvents(&events);
+    std::string list;
+    for (const AudioEvent& e : events)
+      list += Format("%s%s+%lld", list.empty() ? "" : ",", e.type.c_str(), static_cast<long long>(e.cycles));
+    out->push_back(Format("audio dsp=%s irq=0x%02X events=%zu [%s]", m_audio->DspKind(), m_audio->InterruptBits(), events.size(),
+                          list.c_str()));
+  }
+
+private:
+  Core::System& m_system;
+  AudioHardware* m_audio;
+  bool m_shutdown = false;
+};
+
+// The stall watchdog: a host-side thread that wakes every 250 ms and asks the FreezeDump whether the game has gone quiet while SyncTest
+// is armed. Then it writes a racy dump at once (never blocks), and, if `pause` is set, tries to pause the CPU with Core::CPUThreadGuard
+// for a second, consistent dump. The pause waits for the CPU thread to leave its run loop; if the freeze is a host-side wait that
+// never returns, the pause never returns either, but the racy dump is already in the log. Stop() therefore waits only so long and then
+// detaches the thread; the caller must then leak what the thread uses (it checks `stop` before touching anything after the pause).
+class StallWatchdog
+{
+public:
+  StallWatchdog(Core::System& system, FreezeDump& dump, bool pause) : m_shared(std::make_shared<Shared>())
+  {
+    std::shared_ptr<Shared> shared = m_shared;
+    Core::System* const sys = &system;
+    FreezeDump* const d = &dump;
+    m_thread = std::thread([shared, sys, d, pause]() { Run(*shared, *sys, *d, pause); });
+  }
+
+  ~StallWatchdog()
+  {
+    if (m_thread.joinable())
+      m_thread.detach();
+  }
+
+  // True: the thread ended and was joined. False: it is stuck in the pause, was detached, and still holds pointers into the module.
+  bool Stop(std::chrono::milliseconds wait)
+  {
+    {
+      std::lock_guard<std::mutex> lock(m_shared->mutex);
+      m_shared->stop.store(true);
+    }
+    m_shared->cv.notify_all();
+    std::unique_lock<std::mutex> lock(m_shared->mutex);
+    const bool done = m_shared->cv.wait_for(lock, wait, [this]() { return m_shared->finished; });
+    lock.unlock();
+    if (!m_thread.joinable())
+      return done;
+    if (done)
+      m_thread.join();
+    else
+      m_thread.detach();
+    return done;
+  }
+
+private:
+  struct Shared
+  {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::atomic<bool> stop{false};
+    bool finished = false;  // under mutex
+  };
+
+  static void Run(Shared& shared, Core::System& system, FreezeDump& dump, bool pause)
+  {
+    constexpr std::chrono::milliseconds POLL(250);  // watchdog poll period
+    while (true)
+    {
+      {
+        std::unique_lock<std::mutex> lock(shared.mutex);
+        shared.cv.wait_for(lock, POLL, [&shared]() { return shared.stop.load(); });
+      }
+      if (shared.stop.load())
+        break;
+      if (!dump.StallDue())
+        continue;
+      const std::string note = Format("stall_ms=%u", dump.StallMs());
+      dump.Dump("stall", true, false, note);
+      if (!pause || shared.stop.load())
+        continue;
+      Core::CPUThreadGuard guard(system);  // returns when the CPU thread is idle (or the emulation is not running)
+      if (!shared.stop.load())
+        dump.Dump("stall", false, true, note);
+    }
+    {
+      std::lock_guard<std::mutex> lock(shared.mutex);
+      shared.finished = true;
+    }
+    shared.cv.notify_all();
+  }
+
+  std::shared_ptr<Shared> m_shared;
+  std::thread m_thread;
+};
+
 class FileSink final : public Sink
 {
 public:
@@ -2552,8 +3161,10 @@ public:
     Line(Format("=== %s log opened %s UTC ===", title, stamp));
   }
 
+  // Called from the CPU thread and (freeze dump) from the stall watchdog thread: one line at a time.
   void Line(const std::string& text) override
   {
+    std::lock_guard<std::mutex> lock(m_lock);
     if (m_file.is_open())
       m_file << text << std::endl;  // std::endl flushes: the log survives a crash of the emulator
     INFO_LOG_FMT(SLIPPI, "Rev3 {}", text);
@@ -2563,6 +3174,7 @@ public:
   void OsdInfo(const std::string& text) override { OSD::AddMessage(text, OSD::Duration::NORMAL, OSD::Color::GREEN); }
 
 private:
+  std::mutex m_lock;
   std::ofstream m_file;
 };
 
@@ -2606,6 +3218,9 @@ struct Module
   std::unique_ptr<Net::ResimHider> hider;  // a DolphinResimHider (defined further down); netplay runs only; hiding off when it goes
   std::unique_ptr<FileSink> net_sink;    // the net log (REV3_NET_LOG), netplay runs only
   std::unique_ptr<Net::NetModule> net;   // null = not a netplay run (or netplay unusable: the game then runs offline)
+  std::unique_ptr<DolphinDumpSource> dump_source;  // freeze dump (REV3_SYNCTEST_DUMP); null = off
+  std::unique_ptr<FreezeDump> dump;
+  std::unique_ptr<StallWatchdog> watchdog;
 };
 
 Module& GetModule()
@@ -2743,6 +3358,34 @@ void InitializeKit(Module& module)
   if (module.pad_record == nullptr && module.trace == nullptr && options.script_path.empty())
     return;
   module.kit = std::make_unique<DeterminismKit>(std::move(options), *module.memory, sink, module.pad_record.get(), module.trace.get());
+}
+
+// REV3_SYNCTEST_DUMP (default 1; 0 = off), REV3_SYNCTEST_DUMP_STALL_MS (100..600000, default 2000: silence on the 0xA0 hook that counts as
+// a stall), REV3_SYNCTEST_DUMP_PAUSE (default 1; 0 = the watchdog only writes the racy dump and never tries to pause the CPU).
+void InitializeDump(Module& module, Core::System& system)
+{
+  if (GetEnv("REV3_SYNCTEST_DUMP") == "0")
+  {
+    module.sink->Line("NOTE freeze dump off (REV3_SYNCTEST_DUMP=0)");
+    return;
+  }
+  u32 stall_ms = 2000;
+  const std::string stall_text = GetEnv("REV3_SYNCTEST_DUMP_STALL_MS");
+  long value = 0;
+  if (!stall_text.empty())
+  {
+    if (ParseInt(stall_text, &value) && value >= 100 && value <= 600000)
+      stall_ms = static_cast<u32>(value);
+    else
+      ERROR_LOG_FMT(SLIPPI, "Rev3 SyncTest: ignoring REV3_SYNCTEST_DUMP_STALL_MS={} (100..600000)", stall_text);
+  }
+  const bool pause = GetEnv("REV3_SYNCTEST_DUMP_PAUSE") != "0";
+  module.dump_source = std::make_unique<DolphinDumpSource>(system, module.audio.get());
+  module.dump = std::make_unique<FreezeDump>(*module.memory, *module.sink, *module.dump_source, stall_ms);
+  module.synctest->SetFreezeDump(module.dump.get());
+  module.watchdog = std::make_unique<StallWatchdog>(system, *module.dump, pause);
+  module.sink->Line(Format("NOTE freeze dump on: at arm, when no hook command arrives for %u ms while armed (pause_cpu=%d), at shutdown", stall_ms,
+                           pause ? 1 : 0));
 }
 
 // Builds module.synctest from the REV3_SYNCTEST_* variables (K frames; in netplay K = MAXR + 1 so the ring has MAXR + 2 slots) and the
@@ -2896,7 +3539,10 @@ bool BuildSyncTest(Module& module, Core::System& system, long k, bool net)
   Core::System* const sys = &system;
   module.synctest->SetDspState([sys]() { return DescribeDsp(*sys); });
   if (!net)
+  {
+    InitializeDump(module, system);  // freeze dump: offline SyncTest only (a netplay run is driven by Net::NetModule, not SyncTest::OnCommand)
     sink.Osd(Format("Rev3 SyncTest on: K=%d, every %d frame(s), log %s", options.k, options.every, log_path.c_str()));
+  }
   return true;
 }
 
@@ -3133,6 +3779,19 @@ void Shutdown()
     module.net.reset();
   }
   module.hider.reset();  // hiding off (a no-op when the session already restored it)
+  // Freeze dump: stop the watchdog first (it may be waiting to pause the CPU), then dump once more while the guest memory is still
+  // mapped (HW::Shutdown destroys the EXI devices before Memory::Shutdown; the DSP is already gone, the PPC state is still readable).
+  bool watchdog_stuck = false;
+  if (module.watchdog != nullptr)
+  {
+    watchdog_stuck = !module.watchdog->Stop(std::chrono::milliseconds(1500));
+    module.watchdog.reset();
+  }
+  if (module.dump != nullptr && module.dump_source != nullptr && module.dump->Seen())
+  {
+    module.dump_source->MarkShutdown();
+    module.dump->Dump("shutdown", module.dump_source->CpuRunning(), false);
+  }
   if (module.kit != nullptr)
     module.kit->Finish();
   module.kit.reset();  // before the memory it reads
@@ -3142,6 +3801,17 @@ void Shutdown()
   if (module.synctest != nullptr && module.net_sink == nullptr)
     module.synctest->Finish();
   module.synctest.reset();
+  if (watchdog_stuck)
+  {
+    // The detached watchdog thread still points at these (it only touches them after the CPU pause returns, and then checks its stop
+    // flag first). Leak them instead of freeing them under it.
+    static_cast<void>(module.dump.release());
+    static_cast<void>(module.dump_source.release());
+    static_cast<void>(module.memory.release());
+    static_cast<void>(module.sink.release());
+  }
+  module.dump.reset();
+  module.dump_source.reset();
   module.audio.reset();
   module.hardware.reset();
   module.net_sink.reset();  // after everything that logs into it

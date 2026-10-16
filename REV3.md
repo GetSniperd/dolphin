@@ -203,6 +203,59 @@ lines, and a restore time of a few hundred microseconds. The state machine is se
 `GuestMemory` / `Sink` interface); `Source/UnitTests/Core/Rev3RollbackTest.cpp` drives it with a fake game (target `tests`,
 filter `Rev3*`).
 
+## Freeze dump (`REV3_SYNCTEST_DUMP`, default on)
+
+Why: SyncTest replays gameplay exactly (`fields=0` on every resimulated frame) but the game freezes after about 40-60 rollbacks and the
+log just stops. The dump shows WHERE the guest is stuck: PPC registers and back-chain, every OS thread (state, pc, lr, stack, canary), the
+sleep queues the SDK blocks on (GX draw done, VI retrace, DVD, nw4r streaming, AX, IPC, SC) and the hardware those wait for (PE, CP FIFO,
+PI, VI, DSP). The suspect is a thread waiting on a hardware event whose software flag was rewound. Read-only: it never writes guest
+memory or registers.
+
+When (all into the Rev3 log, `<User>\Logs\rev3_synctest.log`):
+
+1. **arm**: once, right after the arm notes (a baseline of a healthy game). `DUMP arm begin racy=0 ...`.
+2. **stall**: a host-side watchdog thread (wakes every 250 ms) fires when SyncTest is armed and no 0xA0 hook command arrived for
+   `REV3_SYNCTEST_DUMP_STALL_MS` (default 2000 ms), once per stall (the next command re-arms it). It first writes a racy dump at once
+   (`racy=1`: the CPU thread keeps running, so values can be torn; it never blocks), then, unless `REV3_SYNCTEST_DUMP_PAUSE=0`, pauses the CPU
+   with `Core::CPUThreadGuard` and writes a consistent dump (`racy=0`, includes the DSP / audio lines). If the freeze is a host-side wait that
+   never lets the CPU thread pause, the second dump never appears (the first one does); closing Dolphin still works, the watchdog is
+   abandoned after 1.5 s. A paused emulator or a long load while armed also counts as a stall (harmless).
+3. **shutdown**: when the Slippi EXI device is destroyed (guest memory and the PPC state are still there; the DSP is already shut down, so
+   the DSP / audio lines say `dsp skipped`). `racy=1` only if the CPU is still running. Only if at least one hook command was seen.
+
+Also at every RESTORE among the first 10: `RESTOREHW n -> m pe_status=.. pe_token=.. cp_rw_dist=.. cp_rd=.. cp_wr=.. vi_count=..
+drawdone=.. sched_disable=..` right before the write-back (after `RESTORE n -> m begin`) and `RESTOREHW n -> m after ...` right after the audio
+hardware is put back (before the `RESTORE n -> m bytes=..` line). Compare the two lines to see which software flags the restore moves
+relative to the hardware: `vi_count` = `*0x8049D4DC` (VI retrace count), `drawdone` = byte `*0x8049D958` (GX draw done flag),
+`sched_disable` = `*0x8049DAB8`; `pe_status` / `pe_token` = MMIO 0x0C00100A / 0x0C00100E; `cp_*` from the command processor FIFO.
+
+Dump format. Every line is `DUMP <reason> <line>` with `<reason>` = `arm`, `stall` or `shutdown`; numbers are hex, `?` = unreadable:
+
+| line | content |
+|---|---|
+| `begin racy=<0\|1> frame=<last hook frame> last_cmd_age_ms=<ms since the last command> [note]` | start; `end` closes it |
+| `ppc pc= npc= lr= ctr= msr= srr0= srr1= cr= r1= r2= r13=` and `ppc r3=..r12= exceptions=` | registers and the pending exception bits (`PowerPCState::Exceptions`) |
+| `frame <i> sp=<sp> lr=<*(sp+4)>` | up to 16 frames of the back-chain from r1 (`*(sp)` is the next sp, `*(sp+4)` the saved LR word; stops at an unreadable, zero or unaligned sp or when the next sp does not increase). Frame 0's lr is the slot of the current function and stale unless it is in a call; from frame 1 on `lr` is a return address into the function that owns the frame |
+| `os cur_thread= cur_context= fpu_owner= sched_disable= run_queue_bits= resched= active_head=` | `*0x800000E4`, `*0x800000D4`, `*0x800000D8`, `*0x8049DAB8` (scheduler-disable count: nonzero while blocked is the freeze signature), `*0x8049DAC0`, `*0x8049DABC`, `*0x800000DC` |
+| `threads n=<count> end=null\|cycle(..)\|bad_ptr(..)\|max\|unreadable_link` | the active thread list from `*0x800000DC` via `+0x2FC` (at most 32) |
+| `thread 0x.. state= prio= suspend= queue= pc= lr= sp= canary=ok\|bad\|? stack=<end>..<base> [running=1 live=1]` | OSThread `+0x2C8` (u16: 1 ready, 2 running, 4 waiting, 8 moribund), `+0x2D0`, `+0x2CC`, `+0x2DC`; saved context pc `+0x198`, lr `+0x84`, gpr1 `+0x04`; canary = `*(+0x308) == 0xDEADBABE` at the stack end; the running thread (`*0x800000E4`) uses the live registers |
+| `thread 0x.. frame <i> sp= lr=` | 6 frames of the back-chain from the thread's sp |
+| `queue <name> at= head= tail= waiters=<n>[<threads via +0x2E0>] head_state= head_pc= head_lr= [extra]` | sleep queues `gx_drawdone 0x8049D950` (+ `drawdone_flag` = byte `0x8049D958`), `vi_retrace 0x8049D4B8` (+ `retrace_count` `*0x8049D4DC`, `game_last_count` `*0x8049CF48`), `dvd 0x8049D7B0`, `nw4r_strm 0x8049D238`, `ax 0x8049D6A0`, `ipc` (`*0x8049D984 + 0x2C`; `queue ipc skipped: pointer ..` when the pointer is not in MEM1 / MEM2), `sc 0x804655A0` |
+| `game frame_loop_flags= main_state= no_gx=` | `*0x803C19C0`, `*0x803C11D4`, `*0x803C1A70` as raw u32 (a byte flag shows in the top byte) |
+| `hw pe pe_status= pe_token=` | MMIO 0x0C00100A (PE control / interrupt status) and 0x0C00100E (token) |
+| `hw cp status=idle\|busy\|breakpoint base= end= rd= wr= rw_dist= bp= gp_read= bp_enable= link= hi_wm= lo_wm=` | `GetCommandProcessor().GetFifo()`; `idle` = rw_dist 0, `breakpoint` = the breakpoint flag |
+| `hw pi cause= mask= fifo_base= fifo_end= fifo_wptr=` | processor interface interrupt cause / mask and the CPU write-gather FIFO pointers |
+| `hw vi line= di0=` | vertical beam position (0x0C00202C) and display interrupt 0 (0x0C002030; bit 31 = flag, bit 28 = enable) |
+| `dsp csr= to_dsp_hi= ai_dma= src= blocks= left=` and `audio dsp=HLE\|LLE irq= events=<n> [type+cycles,..]` | the existing DSP / audio DMA line and the pending audio CoreTiming events; consistent dumps only (not racy, not at shutdown) |
+
+How to use it: start Dolphin with `REV3_SYNCTEST=4` (K=4) as before, play until it freezes, wait 3 seconds (the stall dump needs 2 s plus
+the pause), then close Dolphin. The log then ends with the `DUMP stall` blocks and a `DUMP shutdown` block. Read the thread with `state=4`
+and its `pc` / `lr` / `queue`, and the queue lines: a thread waiting in `gx_drawdone` while the CP is `idle` and `drawdone_flag` is 0, or in
+`vi_retrace` while `retrace_count` equals `game_last_count`, shows which event was lost. Variables: `REV3_SYNCTEST_DUMP=0` off,
+`REV3_SYNCTEST_DUMP_STALL_MS=n` (100..600000), `REV3_SYNCTEST_DUMP_PAUSE=0` (no CPU pause, racy dump only).
+
+Tests: `Rev3Rollback.FreezeDump*`, `BackChain*`, `RestoreHwLine*`, `Stall*`, `SyncTestDumpsAtArm*` (fake memory with a fake OS).
+
 ## Determinism kit (M1)
 
 Milestone M1 of the netplay plan ("boot determinism"): play a session once, record the pads, replay the pads in a second run from the same
