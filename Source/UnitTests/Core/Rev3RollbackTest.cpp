@@ -2691,3 +2691,524 @@ TEST(Rev3Rollback, ReplayingARecordGivesTheRecordRunsTrace)
   EXPECT_EQ(record_a.lines, record_b.lines);  // re-recording a replay gives back the pads
   EXPECT_TRUE(trace_a.lines != trace_c.lines);
 }
+
+// ---- freeze dump (REV3_SYNCTEST_DUMP) -----------------------------------------------------------------------------------------
+
+namespace
+{
+// A DumpSource with settable registers and hardware.
+class FakeDumpSource final : public DumpSource
+{
+public:
+  bool ReadCpu(DumpCpu* out) override
+  {
+    *out = cpu;
+    out->valid = cpu_ok;
+    return cpu_ok;
+  }
+  bool ReadHw(DumpHw* out) override
+  {
+    ++hw_reads;
+    *out = hw;
+    return hw_ok;
+  }
+  void AudioLines(std::vector<std::string>* out) override
+  {
+    ++audio_calls;
+    out->push_back("dsp csr=0x0004 fake");
+  }
+  DumpCpu cpu;
+  bool cpu_ok = true;
+  DumpHw hw;
+  bool hw_ok = true;
+  int hw_reads = 0;
+  int audio_calls = 0;
+};
+
+// A millisecond clock the test advances by hand.
+struct FakeMs
+{
+  std::shared_ptr<u64> now = std::make_shared<u64>(1000);
+  std::function<u64()> Fn() const
+  {
+    auto n = now;
+    return [n]() { return *n; };
+  }
+};
+
+constexpr u32 T1 = 0x80600000;  // running thread
+constexpr u32 T2 = 0x80601000;  // waiting in the GX draw-done queue
+constexpr u32 T3 = 0x80602000;  // waiting in the VI retrace queue, stack canary smashed
+constexpr u32 OS_ACTIVE = 0x800000DC;
+constexpr u32 OS_CURRENT = 0x800000E4;
+constexpr u32 Q_DRAWDONE = 0x8049D950;
+constexpr u32 Q_RETRACE = 0x8049D4B8;
+constexpr u32 STACK_T1 = 0x80610000;
+
+// An OSThread with the fields the dump reads.
+void MakeThread(FakeMemory& mem, u32 t, u16 state, s32 prio, u32 queue, u32 pc, u32 lr, u32 sp, u32 stack_end, u32 stack_base, bool canary,
+                u32 next_active)
+{
+  mem.Write(t + 0x2C8, std::array<u8, 2>{u8(state >> 8), u8(state)}.data(), 2);
+  mem.SetU32(t + 0x2CC, 0);
+  mem.SetU32(t + 0x2D0, static_cast<u32>(prio));
+  mem.SetU32(t + 0x2DC, queue);
+  mem.SetU32(t + 0x2E0, 0);  // link.next in the sleep queue
+  mem.SetU32(t + 0x198, pc);
+  mem.SetU32(t + 0x84, lr);
+  mem.SetU32(t + 0x04, sp);
+  mem.SetU32(t + 0x2FC, next_active);
+  mem.SetU32(t + 0x304, stack_base);
+  mem.SetU32(t + 0x308, stack_end);
+  mem.SetU32(stack_end, canary ? 0xDEADBABE : 0x12345678);
+}
+
+// A stack: frames[i] = {sp, lr}; each frame's back-chain word points to the next one, the last one to 0.
+void MakeStack(FakeMemory& mem, const std::vector<std::pair<u32, u32>>& frames)
+{
+  for (size_t i = 0; i < frames.size(); ++i)
+  {
+    mem.SetU32(frames[i].first, i + 1 < frames.size() ? frames[i + 1].first : 0);
+    mem.SetU32(frames[i].first + 4, frames[i].second);
+  }
+}
+
+// Three active threads (T1 running), a waiter in two sleep queues, the SDK flags and the IPC queue.
+void MakeFakeOs(FakeMemory& mem)
+{
+  mem.SetU32(OS_ACTIVE, T1);
+  mem.SetU32(OS_CURRENT, T1);
+  mem.SetU32(0x800000D4, T1);  // current context
+  mem.SetU32(0x800000D8, T1);  // FPU owner
+  MakeThread(mem, T1, 2, 16, 0, 0xAAAA0000, 0xAAAA0004, 0x80611FF0, STACK_T1, STACK_T1 + 0x2000, true, T2);
+  MakeThread(mem, T2, 4, 20, Q_DRAWDONE, 0x80123450, 0x80123460, 0x80611800, STACK_T1 + 0x4000, STACK_T1 + 0x6000, true, T3);
+  MakeThread(mem, T3, 4, 24, Q_RETRACE, 0x80345670, 0x80345680, 0x80612800, STACK_T1 + 0x8000, STACK_T1 + 0xA000, false, 0);
+  MakeStack(mem, {{0x80611800, 0x80111110}, {0x80611840, 0x80222220}, {0x80611900, 0x80333330}});
+  mem.SetU32(Q_DRAWDONE, T2);
+  mem.SetU32(Q_DRAWDONE + 4, T2);
+  mem.SetU32(Q_RETRACE, T3);
+  mem.SetU32(Q_RETRACE + 4, T3);
+  const u8 flag = 1;
+  mem.Write(0x8049D958, &flag, 1);
+  mem.SetU32(0x8049D4DC, 0x1234);
+  mem.SetU32(0x8049CF48, 0x1230);
+  mem.SetU32(0x8049DAB8, 1);  // scheduler disabled
+  mem.SetU32(0x8049DAC0, 0x00010000);
+  mem.SetU32(0x8049D984, 0x80620000);  // IPC object; its queue at +0x2C is empty
+  mem.SetU32(0x803C19C0, 0x00000003);
+  mem.SetU32(0x803C11D4, 7);
+  mem.SetU32(0x803C1A70, 0x01000000);
+}
+
+DumpCpu MakeFakeCpu()
+{
+  DumpCpu cpu;
+  cpu.valid = true;
+  cpu.pc = 0x80001000;
+  cpu.npc = 0x80001004;
+  cpu.lr = 0x80002000;
+  cpu.ctr = 0x80003000;
+  cpu.msr = 0x0000A032;
+  cpu.srr0 = 0x80004000;
+  cpu.srr1 = 0x0000B032;
+  cpu.cr = 0x28000042;
+  cpu.exceptions = 4;
+  for (u32 i = 0; i < 32; ++i)
+    cpu.gpr[i] = 0x1000 + i;
+  cpu.gpr[1] = 0x80611F00;
+  cpu.gpr[2] = 0x80500002;
+  cpu.gpr[13] = 0x80500013;
+  return cpu;
+}
+
+bool HasLine(const std::vector<std::string>& lines, const std::string& needle)
+{
+  return std::any_of(lines.begin(), lines.end(), [&](const std::string& l) { return l.find(needle) != std::string::npos; });
+}
+
+}  // namespace
+
+TEST(Rev3Rollback, BackChainFollowsTheSavedSpAndLr)
+{
+  FakeMemory mem;
+  MakeStack(mem, {{0x80500000, 0x80001000}, {0x80500040, 0x80002000}, {0x80500100, 0x80003000}});
+  std::vector<StackFrame> frames;
+  ASSERT_EQ(WalkBackChain(mem, 0x80500000, 16, &frames), 3u);
+  EXPECT_EQ(frames[0].sp, 0x80500000u);
+  EXPECT_EQ(frames[0].lr, 0x80001000u);
+  EXPECT_EQ(frames[1].sp, 0x80500040u);
+  EXPECT_EQ(frames[1].lr, 0x80002000u);
+  EXPECT_EQ(frames[2].sp, 0x80500100u);  // the last frame (back-chain 0) is still listed
+  EXPECT_EQ(frames[2].lr, 0x80003000u);
+  EXPECT_EQ(WalkBackChain(mem, 0x80500000, 2, &frames), 2u);  // limited
+  EXPECT_EQ(WalkBackChain(mem, 0x80500000, 0, &frames), 0u);
+  // A back-chain that does not increase stops the walk after the frame that points back.
+  mem.SetU32(0x80500100, 0x80500040);
+  EXPECT_EQ(WalkBackChain(mem, 0x80500000, 16, &frames), 3u);
+  mem.SetU32(0x80500100, 0x80500100);  // points at itself
+  EXPECT_EQ(WalkBackChain(mem, 0x80500000, 16, &frames), 3u);
+  // Zero, unaligned and unreadable stack pointers give nothing.
+  EXPECT_EQ(WalkBackChain(mem, 0, 16, &frames), 0u);
+  EXPECT_EQ(WalkBackChain(mem, 0x80500002, 16, &frames), 0u);
+  EXPECT_EQ(WalkBackChain(mem, 0x90000000, 16, &frames), 0u);  // MEM2 does not exist in the fake
+  EXPECT_EQ(WalkBackChain(mem, 0x817FFFFC, 16, &frames), 0u);  // only 4 of the 8 bytes are readable
+  EXPECT_EQ(WalkBackChain(mem, 0x80000000, 16, &frames), 1u);  // a readable frame of zeros: listed, then the chain ends
+  // A next sp that is unreadable ends the walk after the frame that holds it.
+  mem.SetU32(0x80500100, 0x90001000);
+  EXPECT_EQ(WalkBackChain(mem, 0x80500000, 16, &frames), 3u);
+}
+
+TEST(Rev3Rollback, FreezeDumpListsRegistersAndTheBackChain)
+{
+  FakeMemory mem;
+  MakeFakeOs(mem);
+  MakeStack(mem, {{0x80611F00, 0x80AAAAA0}, {0x80611F80, 0x80BBBBB0}});
+  FakeSink sink;
+  FakeDumpSource src;
+  src.cpu = MakeFakeCpu();
+  FreezeDump dump(mem, sink, src);
+  const std::vector<std::string> lines = dump.Lines(false);
+  EXPECT_TRUE(HasLine(lines, "ppc pc=0x80001000 npc=0x80001004 lr=0x80002000 ctr=0x80003000 msr=0x0000A032 srr0=0x80004000 srr1=0x0000B032 "
+                             "cr=0x28000042 r1=0x80611F00 r2=0x80500002 r13=0x80500013"));
+  EXPECT_TRUE(HasLine(lines, "ppc r3=0x00001003 r4=0x00001004 r5=0x00001005 r6=0x00001006 r7=0x00001007 r8=0x00001008 r9=0x00001009 "
+                             "r10=0x0000100A r11=0x0000100B r12=0x0000100C exceptions=0x00000004"));
+  EXPECT_TRUE(HasLine(lines, "frame 0 sp=0x80611F00 lr=0x80AAAAA0"));
+  EXPECT_TRUE(HasLine(lines, "frame 1 sp=0x80611F80 lr=0x80BBBBB0"));
+  EXPECT_EQ(src.audio_calls, 0);  // not a full dump
+  // The registers are unavailable: one line says so, the rest of the dump carries on.
+  src.cpu_ok = false;
+  const std::vector<std::string> no_cpu = dump.Lines(false);
+  EXPECT_TRUE(HasLine(no_cpu, "ppc unavailable"));
+  EXPECT_TRUE(HasLine(no_cpu, "os cur_thread=0x80600000"));
+}
+
+TEST(Rev3Rollback, FreezeDumpWalksTheThreadsAndUsesLiveRegistersForTheRunningOne)
+{
+  FakeMemory mem;
+  MakeFakeOs(mem);
+  FakeSink sink;
+  FakeDumpSource src;
+  src.cpu = MakeFakeCpu();
+  FreezeDump dump(mem, sink, src);
+  const std::vector<std::string> lines = dump.Lines(false);
+  EXPECT_TRUE(HasLine(lines, "os cur_thread=0x80600000 cur_context=0x80600000 fpu_owner=0x80600000 sched_disable=0x00000001 "
+                             "run_queue_bits=0x00010000 resched=0x00000000 active_head=0x80600000"));
+  EXPECT_TRUE(HasLine(lines, "threads n=3 end=null"));
+  // Running thread: pc / lr / sp from the live registers, not from its stale context (0xAAAA0000).
+  EXPECT_TRUE(HasLine(lines, "thread 0x80600000 state=2 prio=16 suspend=0 queue=0x00000000 pc=0x80001000 lr=0x80002000 sp=0x80611F00 "
+                             "canary=ok stack=0x80610000..0x80612000 running=1 live=1"));
+  EXPECT_FALSE(HasLine(lines, "0xAAAA0000"));
+  // A waiting thread: the saved context, queue and canary.
+  EXPECT_TRUE(HasLine(lines, "thread 0x80601000 state=4 prio=20 suspend=0 queue=0x8049D950 pc=0x80123450 lr=0x80123460 sp=0x80611800 "
+                             "canary=ok stack=0x80614000..0x80616000"));
+  EXPECT_TRUE(HasLine(lines, "thread 0x80602000 state=4 prio=24 suspend=0 queue=0x8049D4B8 pc=0x80345670"));
+  EXPECT_TRUE(HasLine(lines, "canary=bad stack=0x80618000..0x8061A000"));
+  // Its 6-frame back-chain from the saved sp (3 frames exist).
+  EXPECT_TRUE(HasLine(lines, "thread 0x80601000 frame 0 sp=0x80611800 lr=0x80111110"));
+  EXPECT_TRUE(HasLine(lines, "thread 0x80601000 frame 2 sp=0x80611900 lr=0x80333330"));
+  EXPECT_FALSE(HasLine(lines, "thread 0x80601000 frame 3 "));
+}
+
+TEST(Rev3Rollback, FreezeDumpThreadListSurvivesLoopsBadPointersAndLength)
+{
+  FakeSink sink;
+  FakeDumpSource src;
+  src.cpu = MakeFakeCpu();
+  {
+    FakeMemory mem;
+    MakeFakeOs(mem);
+    mem.SetU32(T3 + 0x2FC, T1);  // the list loops back
+    FreezeDump dump(mem, sink, src);
+    EXPECT_TRUE(HasLine(dump.Lines(false), "threads n=3 end=cycle(0x80600000)"));
+  }
+  {
+    FakeMemory mem;
+    MakeFakeOs(mem);
+    mem.SetU32(T3 + 0x2FC, 0x12345678);  // not a pointer
+    FreezeDump dump(mem, sink, src);
+    EXPECT_TRUE(HasLine(dump.Lines(false), "threads n=3 end=bad_ptr(0x12345678)"));
+  }
+  {
+    FakeMemory mem;
+    MakeFakeOs(mem);
+    mem.SetU32(T3 + 0x2FC, 0x80600002);  // not aligned
+    FreezeDump dump(mem, sink, src);
+    EXPECT_TRUE(HasLine(dump.Lines(false), "threads n=3 end=bad_ptr(0x80600002)"));
+  }
+  {
+    FakeMemory mem;
+    MakeFakeOs(mem);
+    // 40 distinct threads in a chain: at most 32 are listed.
+    mem.SetU32(OS_ACTIVE, 0x80700000);
+    for (u32 i = 0; i < 40; ++i)
+    {
+      const u32 t = 0x80700000 + i * 0x400;
+      MakeThread(mem, t, 1, 10, 0, 0x80001000 + i, 0, 0x80611000, 0x80720000 + i * 0x20, 0x80730000, true, i + 1 < 40 ? t + 0x400 : 0);
+    }
+    FreezeDump dump(mem, sink, src);
+    const std::vector<std::string> lines = dump.Lines(false);
+    EXPECT_TRUE(HasLine(lines, "threads n=32 end=max"));
+    int threads = 0;
+    for (const std::string& l : lines)
+      threads += l.rfind("thread 0x", 0) == 0 && l.find(" state=") != std::string::npos;
+    EXPECT_EQ(threads, 32);
+  }
+  {
+    // A thread in MEM2 (not readable in the fake memory): fields are '?', nothing crashes.
+    FakeMemory mem;
+    MakeFakeOs(mem);
+    mem.SetU32(OS_ACTIVE, 0x90000000);
+    FreezeDump dump(mem, sink, src);
+    const std::vector<std::string> lines = dump.Lines(false);
+    EXPECT_TRUE(HasLine(lines, "threads n=1 end=unreadable_link"));
+    EXPECT_TRUE(HasLine(lines, "thread 0x90000000 state=? prio=? suspend=? queue=? pc=? lr=? sp=? canary=? stack=?..?"));
+  }
+  {
+    // No OS at all (zeroed memory): an empty list, no thread lines.
+    FakeMemory mem;
+    FreezeDump dump(mem, sink, src);
+    const std::vector<std::string> lines = dump.Lines(false);
+    EXPECT_TRUE(HasLine(lines, "threads n=0 end=null"));
+    EXPECT_TRUE(HasLine(lines, "queue ipc skipped: pointer *0x8049D984 is 0x00000000"));
+  }
+}
+
+TEST(Rev3Rollback, FreezeDumpShowsTheSleepQueuesAndTheGameFlags)
+{
+  FakeMemory mem;
+  MakeFakeOs(mem);
+  FakeSink sink;
+  FakeDumpSource src;
+  src.cpu = MakeFakeCpu();
+  FreezeDump dump(mem, sink, src);
+  std::vector<std::string> lines = dump.Lines(false);
+  EXPECT_TRUE(HasLine(lines, "queue gx_drawdone at=0x8049D950 head=0x80601000 tail=0x80601000 waiters=1[0x80601000] head_state=0x0004 "
+                             "head_pc=0x80123450 head_lr=0x80123460 drawdone_flag=0x01"));
+  EXPECT_TRUE(HasLine(lines, "queue vi_retrace at=0x8049D4B8 head=0x80602000 tail=0x80602000 waiters=1[0x80602000] head_state=0x0004 "
+                             "head_pc=0x80345670 head_lr=0x80345680 retrace_count=0x00001234 game_last_count=0x00001230"));
+  EXPECT_TRUE(HasLine(lines, "queue dvd at=0x8049D7B0 head=0x00000000 tail=0x00000000 waiters=0"));
+  EXPECT_TRUE(HasLine(lines, "queue nw4r_strm at=0x8049D238 head=0x00000000"));
+  EXPECT_TRUE(HasLine(lines, "queue ax at=0x8049D6A0 head=0x00000000"));
+  EXPECT_TRUE(HasLine(lines, "queue sc at=0x804655A0 head=0x00000000"));
+  EXPECT_TRUE(HasLine(lines, "queue ipc at=0x8062002C head=0x00000000 tail=0x00000000 waiters=0 ipc_object=0x80620000"));
+  EXPECT_TRUE(HasLine(lines, "game frame_loop_flags=0x00000003 main_state=0x00000007 no_gx=0x01000000"));
+
+  // Two waiters in one queue, linked through OSThread.link (+0x2E0), and a loop in the link.
+  mem.SetU32(Q_DRAWDONE, T2);
+  mem.SetU32(T2 + 0x2E0, T3);
+  mem.SetU32(Q_DRAWDONE + 4, T3);
+  EXPECT_TRUE(HasLine(dump.Lines(false), "queue gx_drawdone at=0x8049D950 head=0x80601000 tail=0x80602000 waiters=2[0x80601000,0x80602000]"));
+  mem.SetU32(T3 + 0x2E0, T2);
+  EXPECT_TRUE(HasLine(dump.Lines(false), "waiters=2[0x80601000,0x80602000] more"));
+  // A queue head that is not a thread pointer is shown but not followed.
+  mem.SetU32(Q_RETRACE, 0x12345678);
+  lines = dump.Lines(false);
+  EXPECT_TRUE(HasLine(lines, "queue vi_retrace at=0x8049D4B8 head=0x12345678 tail=0x80602000 waiters=0[] bad_link=0x12345678 retrace_count="));
+  // The IPC pointer is skipped when it points outside MEM1 / MEM2.
+  mem.SetU32(0x8049D984, 0x12345678);
+  EXPECT_TRUE(HasLine(dump.Lines(false), "queue ipc skipped: pointer *0x8049D984 is 0x12345678"));
+}
+
+TEST(Rev3Rollback, FreezeDumpShowsTheHardware)
+{
+  FakeMemory mem;
+  FakeSink sink;
+  FakeDumpSource src;
+  src.cpu = MakeFakeCpu();
+  src.hw.pe_ok = true;
+  src.hw.pe_status = 0x000C;
+  src.hw.pe_token = 0x0042;
+  src.hw.cp_ok = true;
+  src.hw.cp_base = 0x80500000;
+  src.hw.cp_end = 0x8050FFE0;
+  src.hw.cp_rd = 0x80501000;
+  src.hw.cp_wr = 0x80501400;
+  src.hw.cp_dist = 0x400;
+  src.hw.cp_bp = 0x80500800;
+  src.hw.cp_gp_read = true;
+  src.hw.cp_link = true;
+  src.hw.pi_ok = true;
+  src.hw.pi_cause = 0x0000010C;
+  src.hw.pi_mask = 0x0000FFFF;
+  src.hw.pi_fifo_base = 0x00400000;
+  src.hw.pi_fifo_end = 0x0040FFE0;
+  src.hw.pi_fifo_wptr = 0x00401000;
+  src.hw.vi_ok = true;
+  src.hw.vi_line = 263;
+  src.hw.vi_di0 = 0x90AE010F;
+  FreezeDump dump(mem, sink, src);
+  std::vector<std::string> lines = dump.Lines(false);
+  EXPECT_TRUE(HasLine(lines, "hw pe pe_status=0x000C pe_token=0x0042"));
+  EXPECT_TRUE(HasLine(lines, "hw cp status=busy base=0x80500000 end=0x8050FFE0 rd=0x80501000 wr=0x80501400 rw_dist=0x400 bp=0x80500800 "
+                             "gp_read=1 bp_enable=0 link=1 hi_wm=0 lo_wm=0"));
+  EXPECT_TRUE(HasLine(lines, "hw pi cause=0x0000010C mask=0x0000FFFF fifo_base=0x00400000 fifo_end=0x0040FFE0 fifo_wptr=0x00401000"));
+  EXPECT_TRUE(HasLine(lines, "hw vi line=263 di0=0x90AE010F"));
+  src.hw.cp_dist = 0;
+  EXPECT_TRUE(HasLine(dump.Lines(false), "hw cp status=idle "));
+  src.hw.cp_breakpoint = true;
+  src.hw.cp_dist = 0x40;
+  EXPECT_TRUE(HasLine(dump.Lines(false), "hw cp status=breakpoint "));
+  // Groups that could not be read say so; a hardware view that fails altogether gives one line.
+  src.hw.pe_ok = false;
+  src.hw.cp_ok = false;
+  lines = dump.Lines(false);
+  EXPECT_TRUE(HasLine(lines, "hw pe unavailable"));
+  EXPECT_TRUE(HasLine(lines, "hw cp unavailable"));
+  src.hw_ok = false;
+  EXPECT_TRUE(HasLine(dump.Lines(false), "hw unavailable"));
+}
+
+TEST(Rev3Rollback, FreezeDumpWritesPrefixedLinesBetweenBeginAndEnd)
+{
+  FakeMemory mem;
+  MakeFakeOs(mem);
+  FakeSink sink;
+  FakeDumpSource src;
+  src.cpu = MakeFakeCpu();
+  FakeMs ms;
+  FreezeDump dump(mem, sink, src, 2000, ms.Fn());
+  dump.Tick(321);
+  *ms.now += 2500;
+  dump.Dump("stall", true, false, "stall_ms=2000");
+  ASSERT_GT(sink.lines.size(), 10u);
+  EXPECT_EQ(sink.lines.front(), "DUMP stall begin racy=1 frame=321 last_cmd_age_ms=2500 stall_ms=2000");
+  EXPECT_EQ(sink.lines.back(), "DUMP stall end");
+  for (const std::string& l : sink.lines)
+    EXPECT_EQ(l.rfind("DUMP stall ", 0), 0u) << l;
+  EXPECT_EQ(src.audio_calls, 0);  // racy / not full: no audio lines
+  // A full, consistent dump asks the source for the audio lines and says racy=0.
+  sink.lines.clear();
+  dump.Dump("arm", false, true);
+  EXPECT_EQ(sink.lines.front(), "DUMP arm begin racy=0 frame=321 last_cmd_age_ms=2500");
+  EXPECT_TRUE(sink.Contains("DUMP arm dsp csr=0x0004 fake"));
+  EXPECT_EQ(src.audio_calls, 1);
+}
+
+TEST(Rev3Rollback, RestoreHwLineHasTheHardwareAndTheSoftwareFlags)
+{
+  FakeMemory mem;
+  MakeFakeOs(mem);
+  FakeSink sink;
+  FakeDumpSource src;
+  src.hw.pe_ok = true;
+  src.hw.pe_status = 0x0008;
+  src.hw.pe_token = 0x0099;
+  src.hw.cp_ok = true;
+  src.hw.cp_dist = 0x120;
+  src.hw.cp_rd = 0x80501000;
+  src.hw.cp_wr = 0x80501120;
+  FreezeDump dump(mem, sink, src);
+  EXPECT_EQ(dump.RestoreHwLine(12, 8, false),
+            "RESTOREHW 12 -> 8 pe_status=0x0008 pe_token=0x0099 cp_rw_dist=0x120 cp_rd=0x80501000 cp_wr=0x80501120 vi_count=0x00001234 "
+            "drawdone=0x01 sched_disable=0x00000001");
+  EXPECT_EQ(dump.RestoreHwLine(12, 8, true),
+            "RESTOREHW 12 -> 8 after pe_status=0x0008 pe_token=0x0099 cp_rw_dist=0x120 cp_rd=0x80501000 cp_wr=0x80501120 vi_count=0x00001234 "
+            "drawdone=0x01 sched_disable=0x00000001");
+  src.hw_ok = false;
+  EXPECT_EQ(dump.RestoreHwLine(1, 0, false),
+            "RESTOREHW 1 -> 0 pe_status=? pe_token=? cp_rw_dist=? cp_rd=? cp_wr=? vi_count=0x00001234 drawdone=0x01 sched_disable=0x00000001");
+}
+
+TEST(Rev3Rollback, StallIsReportedOncePerStallAndOnlyWhileArmed)
+{
+  FakeMemory mem;
+  FakeSink sink;
+  FakeDumpSource src;
+  FakeMs ms;
+  FreezeDump dump(mem, sink, src, 2000, ms.Fn());
+  EXPECT_FALSE(dump.StallDue());  // no command yet
+  dump.Tick(1);
+  *ms.now += 5000;
+  EXPECT_FALSE(dump.StallDue());  // not armed (a menu or a load is not a stall)
+  dump.SetArmed(true);
+  EXPECT_TRUE(dump.StallDue());
+  EXPECT_FALSE(dump.StallDue());  // once per stall
+  *ms.now += 5000;
+  EXPECT_FALSE(dump.StallDue());
+  dump.Tick(2);  // the game is alive again: the next silence is a new stall
+  EXPECT_EQ(dump.LastFrame(), 2u);
+  *ms.now += 1999;
+  EXPECT_FALSE(dump.StallDue());  // shorter than the limit
+  *ms.now += 1;
+  EXPECT_TRUE(dump.StallDue());
+  EXPECT_EQ(dump.LastAgeMs(), 2000u);
+  dump.Tick(3);
+  dump.SetArmed(false);
+  *ms.now += 9000;
+  EXPECT_FALSE(dump.StallDue());
+}
+
+TEST(Rev3Rollback, SyncTestDumpsAtArmAndLogsTheHardwareAroundTheFirstRestores)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTest test(Options(2), game.Ranges(), game.Mem(), sink, FakeClock());
+  FakeDumpSource src;
+  src.cpu = MakeFakeCpu();
+  src.hw.pe_ok = true;
+  src.hw.cp_ok = true;
+  FakeMs ms;
+  FreezeDump dump(game.Mem(), sink, src, 2000, ms.Fn());
+  test.SetFreezeDump(&dump);
+  for (int i = 0; i < 200; ++i)
+    game.Frame(test);
+  ASSERT_GT(test.Stats().rollbacks, 20u);
+  EXPECT_FALSE(sink.Contains("ERROR"));
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u);
+
+  // One baseline dump at arm, after the arm notes, as a consistent (racy=0) full dump.
+  int arm_begin = 0;
+  int arm_end = 0;
+  for (const std::string& l : sink.lines)
+  {
+    arm_begin += l.rfind("DUMP arm begin racy=0 frame=", 0) == 0;
+    arm_end += l == "DUMP arm end";
+  }
+  EXPECT_EQ(arm_begin, 1);
+  EXPECT_EQ(arm_end, 1);
+  EXPECT_TRUE(sink.Contains("DUMP arm dsp csr=0x0004 fake"));
+  EXPECT_TRUE(sink.Contains("DUMP arm ppc pc=0x80001000"));
+
+  // Around each of the first 10 restores: RESTORE begin, RESTOREHW (before), RESTOREHW after, RESTORE done.
+  int before = 0;
+  int after = 0;
+  for (size_t i = 0; i < sink.lines.size(); ++i)
+  {
+    const std::string& l = sink.lines[i];
+    if (l.rfind("RESTOREHW ", 0) != 0)
+      continue;
+    const bool is_after = l.find(" after pe_status=") != std::string::npos;
+    (is_after ? after : before)++;
+    ASSERT_GT(i, 0u);
+    ASSERT_LT(i + 1, sink.lines.size());
+    if (is_after)
+    {
+      EXPECT_EQ(sink.lines[i + 1].rfind("RESTORE ", 0), 0u) << sink.lines[i + 1];
+      EXPECT_NE(sink.lines[i + 1].find(" bytes="), std::string::npos);
+    }
+    else
+    {
+      EXPECT_EQ(sink.lines[i - 1].rfind("RESTORE ", 0), 0u) << sink.lines[i - 1];
+      EXPECT_NE(sink.lines[i - 1].find(" begin"), std::string::npos);
+    }
+  }
+  EXPECT_EQ(before, 10);
+  EXPECT_EQ(after, 10);
+
+  // The dump follows the commands: the last frame, and armed, so silence is a stall.
+  EXPECT_GT(dump.LastFrame(), 0u);
+  *ms.now += 3000;
+  EXPECT_TRUE(dump.StallDue());
+}
+
+TEST(Rev3Rollback, SyncTestWithoutADumpLogsNoDumpLines)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTest test(Options(2), game.Ranges(), game.Mem(), sink, FakeClock());
+  for (int i = 0; i < 200; ++i)
+    game.Frame(test);
+  ASSERT_GT(test.Stats().rollbacks, 20u);
+  EXPECT_FALSE(sink.Contains("DUMP "));
+  EXPECT_FALSE(sink.Contains("RESTOREHW"));
+}

@@ -34,6 +34,8 @@
 //   REV3_SYNCTEST_EXCLUDE=path   JSON {"ranges":[{"start","end"}]} subtracted from the snapshot (logged as NOTE exclude user ...),
 //                                to test excluding audio / scratch ranges without editing the whitelist
 //   REV3_SYNCTEST_AUDIO_HW=0 do not rewind the emulated audio hardware (DSP, AI, their CoreTiming events and PI interrupt bits)
+//   REV3_SYNCTEST_DUMP=0     no freeze dump (default 1: a state dump into the Rev3 log at arm, on a stall of the hook, at shutdown;
+//                            REV3_SYNCTEST_DUMP_STALL_MS=n silence that counts as a stall, default 2000; REV3_SYNCTEST_DUMP_PAUSE=0 racy dump only)
 //                            together with memory (default 1, see "THE AUDIO HARDWARE" below)
 //   REV3_SYNCTEST_ADAPTIVE=0 do not learn the snapshot set in the running match (default 1: adaptive, see below)
 //   REV3_SYNCTEST_SCAN_SLICES=N  adaptive: every hook call hashes 1/N of all 4 KB pages of MEM1 + MEM2 (default 16)
@@ -86,10 +88,12 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -272,6 +276,116 @@ public:
   virtual void Osd(const std::string& text) = 0;   // an on-screen message
 };
 
+// ---- freeze dump (REV3_SYNCTEST_DUMP) ---------------------------------------------------------------------------------------
+// A read-only state dump into the Rev3 log, to see WHERE the game is stuck when SyncTest freezes it (a thread waiting on a hardware event
+// whose software flag was rewound: GX draw done, VI retrace, DVD, AX, IPC). Every line starts with `DUMP <reason> `. Taken (a) when
+// SyncTest arms (baseline), (b) by a watchdog thread when no 0xA0 command arrived for REV3_SYNCTEST_DUMP_STALL_MS (default 2000) while
+// armed, once per stall (first a racy dump, then, if the CPU can be paused, a consistent one), and (c) at shutdown. It never writes guest
+// memory or registers. The addresses are Rev3's SDK globals from the decomp (see REV3.md "Freeze dump"). Everything but the Dolphin glue
+// is pure (GuestMemory / Sink / DumpSource), so the unit tests drive it with a fake memory.
+struct DumpCpu
+{
+  bool valid = false;
+  u32 pc = 0;
+  u32 npc = 0;
+  u32 lr = 0;
+  u32 ctr = 0;
+  u32 msr = 0;
+  u32 srr0 = 0;
+  u32 srr1 = 0;
+  u32 cr = 0;
+  u32 exceptions = 0;  // PowerPCState::Exceptions (pending exception bits)
+  std::array<u32, 32> gpr{};
+};
+
+// The hardware the freeze hunt cares about. Each group has its own ok flag (a group that cannot be read is logged as unavailable).
+struct DumpHw
+{
+  bool pe_ok = false;
+  u16 pe_status = 0;  // PE control / interrupt status register (MMIO 0x0C00100A: token / finish enables and flags)
+  u16 pe_token = 0;   // PE token register (MMIO 0x0C00100E)
+  bool cp_ok = false;
+  u32 cp_base = 0;
+  u32 cp_end = 0;
+  u32 cp_rd = 0;
+  u32 cp_wr = 0;
+  u32 cp_dist = 0;  // CPReadWriteDistance: bytes the GPU still has to read (0 = the CP is idle)
+  u32 cp_bp = 0;    // breakpoint address
+  bool cp_breakpoint = false;
+  bool cp_gp_read = false;
+  bool cp_bp_enable = false;
+  bool cp_link = false;
+  bool cp_hi_wm = false;
+  bool cp_lo_wm = false;
+  bool pi_ok = false;
+  u32 pi_cause = 0;
+  u32 pi_mask = 0;
+  u32 pi_fifo_base = 0;
+  u32 pi_fifo_end = 0;
+  u32 pi_fifo_wptr = 0;
+  bool vi_ok = false;
+  u32 vi_line = 0;  // vertical beam position (MMIO 0x0C00202C)
+  u32 vi_di0 = 0;   // display interrupt 0 register (MMIO 0x0C002030): bit 31 = interrupt flag, bit 28 = enable
+};
+
+class DumpSource
+{
+public:
+  virtual ~DumpSource() = default;
+  virtual bool ReadCpu(DumpCpu* out) = 0;
+  virtual bool ReadHw(DumpHw* out) = 0;
+  // Extra lines (without the `DUMP <reason> ` prefix): the DSP / AI state and the audio CoreTiming events. Only asked for in a
+  // consistent dump (arm, a paused CPU), never in a racy one. Default: none.
+  virtual void AudioLines(std::vector<std::string>* /*out*/) {}
+};
+
+struct StackFrame
+{
+  u32 sp = 0;
+  u32 lr = 0;  // *(sp + 4), the saved LR word of that frame
+};
+
+// The PPC back-chain from `sp`: each entry is {sp, *(sp + 4)}; the next sp is *(sp). Stops after `max_frames`, at an unreadable, zero or
+// unaligned sp, or when the next sp does not increase (a loop or a stack end). The last frame found is still listed. Returns the count.
+size_t WalkBackChain(const GuestMemory& memory, u32 sp, size_t max_frames, std::vector<StackFrame>* out);
+
+class FreezeDump
+{
+public:
+  // `now_ms` returns a monotonic clock in milliseconds (default: steady_clock); `stall_ms` = silence that counts as a stall.
+  FreezeDump(const GuestMemory& memory, Sink& sink, DumpSource& source, u32 stall_ms = 2000, std::function<u64()> now_ms = {});
+
+  // The dump as lines without the prefix. `full` adds the audio lines (consistent dumps only).
+  std::vector<std::string> Lines(bool full);
+  // Writes Lines() to the sink, each as `DUMP <reason> <line>`, between `begin racy=<0|1> <note>` and `end` lines. One dump at a time.
+  void Dump(const char* reason, bool racy, bool full, const std::string& note = {});
+  // `RESTOREHW <from> -> <to>[ after] pe_status=.. pe_token=.. cp_rw_dist=.. cp_rd=.. cp_wr=.. vi_count=.. drawdone=.. sched_disable=..`
+  std::string RestoreHwLine(u32 from, u32 to, bool after);
+
+  // CPU thread, every 0xA0 command: the latest frame and the time; ends a stall. SetArmed: SyncTest is armed (or not) after the command.
+  void Tick(u32 frame);
+  void SetArmed(bool armed) { m_armed.store(armed); }
+  // Watchdog thread: true once per stall (armed, and no command for stall_ms since the last Tick); Tick starts the next stall.
+  bool StallDue();
+  u32 LastFrame() const { return m_frame.load(); }
+  u64 LastAgeMs() const;
+  u32 StallMs() const { return m_stall_ms; }
+  bool Seen() const { return m_seen.load(); }  // at least one command arrived
+
+private:
+  const GuestMemory& m_memory;
+  Sink& m_sink;
+  DumpSource& m_source;
+  u32 m_stall_ms;
+  std::function<u64()> m_now_ms;
+  std::mutex m_lock;  // serialises Dump (CPU thread at arm / shutdown, watchdog thread)
+  std::atomic<u64> m_last_ms{0};
+  std::atomic<u32> m_frame{0};
+  std::atomic<bool> m_armed{false};
+  std::atomic<bool> m_reported{false};
+  std::atomic<bool> m_seen{false};  // a command arrived at least once
+};
+
 // ---- SyncTest -------------------------------------------------------------------------------------------------------------
 struct SyncTestOptions
 {
@@ -365,6 +479,10 @@ public:
   // One command in, one reply out. All work (reads, snapshots, restores, logging) happens inside this call.
   Reply OnCommand(const Command& command);
 
+  // Optional: the freeze dump (REV3_SYNCTEST_DUMP). SyncTest dumps once when it arms, logs the RESTOREHW lines around the first
+  // restores, and tells it about every command (frame, time, armed) for the stall watchdog. Not owned; null = off.
+  void SetFreezeDump(FreezeDump* dump) { m_dump = dump; }
+
   // Writes the final summary line (once). The destructor does not.
   void Finish();
 
@@ -409,6 +527,7 @@ private:
     } audio;
   };
 
+  Reply OnCommandImpl(const Command& command);
   bool FindFighters(std::array<u32, 2>* addrs) const;
   bool Capture(Slot& slot, const Command& command, const std::array<u32, 2>& fighters);
   void Reset(const char* why);
@@ -485,6 +604,7 @@ private:
   bool m_z_pending = false;  // a Z press not yet acted on (acted on outside a resimulation)
   u32 m_restore_logs = 0;    // RESTORE lines written (the first 10 in full, restores 11..30 as one short line)
   std::function<std::string()> m_dsp_state;
+  FreezeDump* m_dump = nullptr;      // null = no freeze dump
   AudioHardware* m_audio = nullptr;  // null = memory only
   size_t m_audio_bytes = 0;          // size of the latest audio state (it varies a little: the HLE mail queue)
   u32 m_audio_size_notes = 0;        // "audio state size changed" lines written
