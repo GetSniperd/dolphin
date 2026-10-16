@@ -169,6 +169,18 @@ u64 EnetTransport::RttUs() const
   return m_link.RttUs();
 }
 
+bool EnetTransport::TimeOffsetUs(s32* out, u32* samples) const
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  return m_link.TimeOffsetUs(out, samples);
+}
+
+void EnetTransport::ResetTimeOffsets()
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  m_link.ResetTimeOffsets();
+}
+
 u32 EnetTransport::BadPackets() const
 {
   std::lock_guard<std::mutex> lock(m_mutex);
@@ -667,6 +679,7 @@ void NetModule::Start(const Command& command)
     hello_inputs.hook_crc_valid = true;
   }
   hello_inputs.rollback = m_options.rollback;
+  hello_inputs.max_rollback = m_options.max_rollback;
   hello_inputs.arm_calls = m_options.arm_calls;
   hello_inputs.quiet_calls = m_options.quiet_calls;
 
@@ -710,6 +723,9 @@ void NetModule::Start(const Command& command)
   config.barrier_timeout_ms = m_options.connect_timeout_ms;
   config.wait_timeout_ms = m_options.wait_timeout_ms;
   config.range_crc = m_options.range_crc;
+  config.pace = m_options.pace;
+  config.maxr_adapt = m_options.maxr_adapt;
+  config.maxr_budget_us = m_options.maxr_budget_us;
   config.hello = BuildHello(hello_inputs, m_options.role, m_options.delay);
   m_log.Line(Fmt("NET start role=%s listen=%u peer=%s delay=%d rollback=%d maxr=%d gate=arm:%u,quiet:%u game=%s build=%s",
                  RoleText(m_options.role), static_cast<unsigned>(m_options.listen_port), m_transport->PeerText().c_str(), m_options.delay,
@@ -719,6 +735,11 @@ void NetModule::Start(const Command& command)
     m_log.Line("NOTE REV3_NET_RANGE_CRC=1: the CRCs of the snapshot ranges are exchanged at every checksum frame (testing only; differences are logged, never a desync)");
   m_session = std::make_unique<RollbackSession>(
       config, *m_transport, *m_store, m_log, [this](const std::function<bool()>& pred, u32 timeout_ms) { return Wait(pred, timeout_ms); });
+  m_session->SetPaceActuator(m_env.pacer);
+  m_log.Line(Fmt("NET pacing %s%s (hard %d frames, t1 %d us, hard max %d us, gentle max %d permille, slice %d us)%s", config.pace.enabled ? "on" : "off (measure only)",
+                 config.pace.enabled && m_env.pacer == nullptr ? ", no actuator" : "", config.pace.hard_frames, config.pace.t1_us, config.pace.hard_max_us,
+                 config.pace.gentle_max_permille, config.pace.slice_us,
+                 config.maxr_adapt ? Fmt("; adaptive MAXR on (budget %u us)", config.maxr_budget_us).c_str() : ""));
   m_log.Line("NET waiting for the peer: the game is held at frame 0 until both machines are connected and their HELLOs match");
 }
 

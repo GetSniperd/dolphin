@@ -102,6 +102,12 @@ public:
   u64 GetIdleTicks() const;
   TimePoint GetTargetHostTime(s64 target_cycle);
 
+  // Rev3 netplay pacing (Slippi/Rev3Session.h PaceActuator; CPU thread only): sleep `delay`, then restart the throttle clock at the current cycle.
+  // A plain sleep inside a hook command would not slow the game: the throttle sees the emulated clock behind real time afterwards and runs the
+  // next frames without sleeping until it has caught up (up to MAIN_MAX_FALLBACK), so the machine ends up where it was. Restarting the clock
+  // forgets that lag, so the delay stays. The emulated clock is untouched: the game state cannot differ because of this.
+  void SleepAndResetThrottle(DT delay);
+
   void RefreshConfig();
 
   void DoState(PointerWrap& p);

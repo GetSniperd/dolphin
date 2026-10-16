@@ -17,6 +17,8 @@
 //                    must be frame 0), evaluates the arm gate and the per-call fighter flags, blocks while the session waits (WaitFn:
 //                    condition variable + stop check, so closing the window never hangs), hides resimulated frames (ResimHiding: throttle
 //                    off + mute, v1), writes the net log.
+//   Pacing (M5)      EnetTransport answers TimeOffsetUs() from PadLink's TimeSync (arrival of every newer remote pad against our newest send, RTT/2
+//                    corrected); NetModule hands the session a PaceActuator (Rev3Rollback.cpp's DolphinPacer) and the pacing / adaptive MAXR options.
 //   REV3_NETSIM      (M4) EnetTransport holds every received message through a NetSim (Rev3NetSim.h) before it is processed: delay, jitter,
 //                    loss of PAD / ACK packets; the ENet connect handshake is not touched.
 //
@@ -75,8 +77,10 @@ public:
   // CPU thread: block up to `ms` for the network thread to receive something (or a connection event); returns at once when something
   // arrived since the last call.
   void WaitActivity(u32 ms);
-  u64 RttUs() const;
+  u64 RttUs() const override;
   u32 BadPackets() const;
+  bool TimeOffsetUs(s32* out, u32* samples) const override;
+  void ResetTimeOffsets() override;
   NetSimStats NetSimCounts() const override;
 
   // Transport
@@ -171,6 +175,7 @@ struct NetEnvironment
   HelloInputs hello;               // everything the Dolphin side knows; the module adds the hook CRC at the first command
   ResimHider* hider = nullptr;     // v1 hiding of resimulated frames (throttle off + mute); null = none. Not owned.
   FreezeDump* dump = nullptr;      // freeze dump: marked blocked while a wait loop waits for the peer (not a freeze); null = none. Not owned.
+  PaceActuator* pacer = nullptr;   // M5: carries out the pacing delays (sleep + restart of Dolphin's throttle clock); null = pacing only measures. Not owned.
 };
 
 class NetModule

@@ -486,6 +486,13 @@ void CoreTimingManager::Throttle(const s64 target_cycle)
   SleepUntil(target_time);
 }
 
+void CoreTimingManager::SleepAndResetThrottle(DT delay)
+{
+  if (delay > DT::zero())
+    SleepUntil(Clock::now() + delay);
+  ResetThrottle(static_cast<s64>(GetTicks()));
+}
+
 void CoreTimingManager::UpdateSpeedLimit(s64 cycle, double new_speed)
 {
   m_emulation_speed = new_speed;

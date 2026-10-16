@@ -34,7 +34,7 @@ namespace
 {
 std::string Fmt(const char* format, ...)
 {
-  char buf[1024];
+  char buf[2048];  // the SUMMARY line is the longest
   va_list args;
   va_start(args, format);
   const int n = vsnprintf(buf, sizeof(buf), format, args);
@@ -492,6 +492,109 @@ bool ParseRangeCrc(const std::vector<u8>& bytes, RangeCrcMsg* out)
   return true;
 }
 
+// ---- pacing: the time offset estimate and the policy (M5) -----------------------------------------------------------------------
+
+void TimeSync::OnLocalSend(s32 frame, u64 now_us)
+{
+  if (frame <= m_local_frame)
+    return;  // only a newer frame counts (a re-send is not a new frame)
+  m_local_frame = frame;
+  Sent& slot = m_sent[static_cast<size_t>(frame) % RING];
+  slot.frame = frame;
+  slot.us = now_us;
+}
+
+void TimeSync::OnRemote(s32 frame, u64 now_us, u64 rtt_us)
+{
+  if (frame <= m_newest_remote)
+    return;  // a re-sent or reordered packet: not the first arrival of this frame
+  m_newest_remote = frame;
+  if (m_local_frame < 0 || rtt_us == 0)
+    return;  // nothing to compare with yet (Slippi's has_game_started), or no RTT estimate: the arrival time would be wrong by RTT/2
+  // Slippi (SlippiNetplay.cpp:295-316): opponent_send_time = now - ping/2; offset = opponent_send_time - our_send_time + frame_time * (our_frame - their_frame).
+  const s64 opponent_send_us = static_cast<s64>(now_us) - static_cast<s64>(rtt_us / 2);
+  const Sent& same = m_sent[static_cast<size_t>(std::max(frame, 0)) % RING];
+  s64 offset;
+  if (frame >= 0 && same.frame == frame)
+    offset = opponent_send_us - static_cast<s64>(same.us);
+  else
+  {
+    const Sent& newest = m_sent[static_cast<size_t>(m_local_frame) % RING];
+    offset = opponent_send_us - static_cast<s64>(newest.us) + static_cast<s64>(PACE_FRAME_US) * (static_cast<s64>(m_local_frame) - static_cast<s64>(frame));
+  }
+  constexpr s64 LIMIT = 60000000;  // one minute: a sample beyond this is a broken clock, not a skew; keeps the sums far from overflow
+  offset = std::max(-LIMIT, std::min(LIMIT, offset));
+  m_buf[m_next] = static_cast<s32>(offset);
+  m_next = (m_next + 1) % m_buf.size();
+  m_count = std::min(m_count + 1, m_buf.size());
+}
+
+bool TimeSync::OffsetUs(s32* out, u32* samples) const
+{
+  if (m_count == 0)
+    return false;
+  // CalcTimeOffsetUs (SlippiNetplay.cpp:1698-1717): sort, drop the lowest and highest third, average the rest.
+  std::array<s32, PACE_INTERVAL_FRAMES> sorted = m_buf;
+  std::sort(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(m_count));
+  const size_t third = m_count / 3;
+  const size_t end = m_count - third;
+  s64 sum = 0;
+  for (size_t i = third; i < end; ++i)
+    sum += sorted[i];
+  *out = static_cast<s32>(sum / static_cast<s64>(end - third));
+  if (samples != nullptr)
+    *samples = static_cast<u32>(m_count);
+  return true;
+}
+
+void TimeSync::Reset()
+{
+  m_count = 0;
+  m_next = 0;
+}
+
+PaceDecision DecidePace(const PaceConfig& c, s32 frames_since_gate, s32 offset_us)
+{
+  PaceDecision d;
+  if (frames_since_gate <= c.hard_frames)
+  {
+    // Hard sync (Slippi EXI_DeviceSlippi.cpp:1437-1470): ahead by more than t1 -> lose the excess at once, up to hard_max_us.
+    if (offset_us > c.t1_us)
+    {
+      const s32 lose = std::min(offset_us - c.hard_target_us, c.hard_max_us);
+      if (lose > 0)
+      {
+        d.action = "hard";
+        d.delay_us = lose;
+      }
+    }
+    else if (offset_us < -c.t1_us)
+    {
+      d.action = "behind";
+    }
+    return d;
+  }
+  // Gentle (Slippi shouldAdvanceOnlineFrame, EXI_DeviceSlippi.cpp:1503-1530): a slowdown of up to gentle_max_permille of the interval,
+  // proportional to the lead up to gentle_window_frames frames, nothing inside the dead band.
+  if (offset_us > c.gentle_deadband_us)
+  {
+    const s64 window_us = static_cast<s64>(c.gentle_window_frames) * PACE_FRAME_US;
+    const s64 lead_us = std::min<s64>(offset_us, window_us);
+    const s64 interval_us = static_cast<s64>(c.interval_frames) * PACE_FRAME_US;
+    const s64 lose = window_us > 0 ? interval_us * c.gentle_max_permille * lead_us / (1000 * window_us) : 0;
+    if (lose > 0)
+    {
+      d.action = "gentle";
+      d.delay_us = static_cast<s32>(lose);
+    }
+  }
+  else if (offset_us < -c.gentle_deadband_us)
+  {
+    d.action = "behind";
+  }
+  return d;
+}
+
 void ResimHiding::Update(bool resimulating)
 {
   if (m_hider == nullptr || resimulating == m_hidden)
@@ -519,7 +622,11 @@ RollbackSession::RollbackSession(const Config& config, Transport& transport, Sna
   m_delay = m_cfg.delay;
   m_cfg.hello.role = m_cfg.role;
   m_cfg.hello.delay = static_cast<u32>(m_delay);
-  Line(Fmt("SESSION start role=%s delay=%d maxr=%d", RoleName(m_cfg.role), m_delay, m_cfg.max_rollback));
+  m_maxr_eff = m_cfg.max_rollback;
+  m_stats.maxr_eff = m_maxr_eff;
+  m_stats.maxr_eff_min = m_maxr_eff;
+  Line(Fmt("SESSION start role=%s delay=%d maxr=%d pace=%s maxr_adapt=%s", RoleName(m_cfg.role), m_delay, m_cfg.max_rollback,
+           m_cfg.pace.enabled ? "on" : "off", m_cfg.maxr_adapt ? "on" : "off"));
 }
 
 void RollbackSession::Line(const std::string& text)
@@ -687,7 +794,7 @@ bool RollbackSession::BlockSatisfied()
   case Block::Lockstep:
     return Confirmed() >= n;
   case Block::Stall:
-    return n - Confirmed() <= m_cfg.max_rollback;
+    return n - Confirmed() <= m_maxr_eff;
   case Block::DrainA:
     return Confirmed() >= n - 1;
   case Block::DrainB:
@@ -812,6 +919,10 @@ bool RollbackSession::StepInner(const Command& command, const Gate& gate, Reply*
       WindowTick(n);
   }
 
+  // Pacing (M5) only delays a call that began as a normal ARMED call: not a resimulation (the throttle is off then), not a DRAIN or the
+  // call that finishes one (it may end a resimulation), not LOCKSTEP.
+  m_pace_allowed = !m_resim && m_mode == Mode::ARMED;
+
   if (m_resim)
     return StepResim(command, gate, reply);
 
@@ -922,6 +1033,11 @@ int RollbackSession::TryArm(const Gate& gate)
   m_relayout = false;
   m_relayout_frame = -1;
   m_hold = false;
+  m_pace_next = n + m_cfg.pace.interval_frames;  // the first check after a full interval of ARMED samples
+  m_pace_pending_us = 0;
+  m_stall_run = 0;
+  m_stall_run_us = 0;
+  m_net.ResetTimeOffsets();  // the samples so far are lockstep timing (every frame waited for the peer)
   m_store.Clear();
   for (Used& u : m_used)
     u = Used{};
@@ -936,7 +1052,7 @@ int RollbackSession::TryArm(const Gate& gate)
 bool RollbackSession::StepArmed(const Command& command, const Gate& gate, Reply* reply)
 {
   const s32 n = m_cur_frame;
-  const int maxr = m_cfg.max_rollback;
+  const int maxr = m_maxr_eff;  // the stall rule's limit (<= the configured MAXR; only the stall rule and the depth of a postponed rollback use it)
 
   // The agreed close: scheduled from a FINAL frame F for frame F + MAXR + 1, the same on both machines (THE GATE RULE). A live state, which
   // may be a misprediction's, never closes anything: gate.fighters_found / gate.health_zero are only recorded, below.
@@ -991,12 +1107,18 @@ bool RollbackSession::StepArmed(const Command& command, const Gate& gate, Reply*
       m_stall_start_us = m_net.Now();
       ++m_stats.stalls;
       ++m_win.stalls;
+      ++m_stall_run;
+      m_stats.stall_run_max = std::max(m_stats.stall_run_max, m_stall_run);
       m_stall_logged = DetailLine(Detail::Stall, Fmt("STALL start frame=%d R=%d predicted=%d maxr=%d", n, Confirmed(), n - Confirmed(), maxr));
     }
     return Blocked(Block::Stall);
   }
   if (m_in_stall)
+  {
     EndStall(false);
+    if (StallRunTooLong())
+      return EndCall(n, EchoReply(command), reply);
+  }
 
   const s32 g = FindMisprediction(n);
   if (g >= 0)
@@ -1027,6 +1149,9 @@ bool RollbackSession::StepArmed(const Command& command, const Gate& gate, Reply*
     const Pad8 remote = RemoteAt(n);
     CaptureUsed(n, local, remote, false, nullptr, lost);
     FinalizeChecks(n);
+    if (!m_stalled_this_call)
+      NoteCallWithoutStall();
+    Pace(n);
     return EndCall(n, MakeReply(local, remote, 0, n), reply);
   }
 
@@ -1043,6 +1168,9 @@ bool RollbackSession::StepArmed(const Command& command, const Gate& gate, Reply*
     ++m_stats.predicted_frames;
   CaptureUsed(n, local, remote, !known, &info, lost);
   FinalizeChecks(n);
+  if (!m_stalled_this_call)
+    NoteCallWithoutStall();
+  Pace(n);
   return EndCall(n, MakeReply(local, remote, 0, n), reply);
 }
 
@@ -1069,6 +1197,9 @@ bool RollbackSession::DoRollback(const Command& command, s32 target, bool forced
 {
   const s32 n = m_cur_frame;
   const s32 depth = n - target;
+  m_resim_start_us = m_net.Now();  // the cost of a rollback = restore + K re-run frames, measured from here to the end of the resimulation
+  m_resim_depth = depth;
+  m_resim_blocked = false;
   if (!m_store.Has(target))
   {
     Line(Fmt("ERROR ROLLBACK frame=%d live=%d: no snapshot for the target", target, n));
@@ -1143,7 +1274,10 @@ bool RollbackSession::StepResim(const Command& command, const Gate& gate, Reply*
   const bool drain = m_mode == Mode::DRAIN;
   const bool last = m == m_resim_target;
   if (drain && last && Confirmed() < m)
+  {
+    m_resim_blocked = true;
     return Blocked(Block::DrainB);
+  }
 
   const Pad8 local = LocalAt(m);
   const u8 lost = LostKind(gate);
@@ -1155,7 +1289,10 @@ bool RollbackSession::StepResim(const Command& command, const Gate& gate, Reply*
   {
     // The corrected timeline has no fighters at this frame: nothing to snapshot, so it is played with the real pad only.
     if (!known)
+    {
+      m_resim_blocked = true;
       return Blocked(Block::Lockstep);
+    }
   }
   remote = known ? RemoteAt(m) : Predict();
   if (captured && !m_store.Capture(m, command.sp, &info))
@@ -1176,6 +1313,10 @@ bool RollbackSession::StepResim(const Command& command, const Gate& gate, Reply*
 
   // The second run of the call that was live when the rollback began: the resimulation is over.
   m_resim = false;
+  if (m_resim_blocked)
+    ++m_stats.resim_cost_skipped;
+  else
+    NoteResimCost(m_resim_depth, m_net.Now() - m_resim_start_us);
   // The RESIM line goes with its ROLLBACK line (written or left out together: the budget counts rollbacks, not lines).
   if (m_resim_logged)
     Line(Fmt("RESIM done frame=%d", m));
@@ -1196,6 +1337,7 @@ void RollbackSession::EnterDrain(s32 frame, const std::string& why, bool relayou
   m_mode = Mode::DRAIN;
   m_relayout = relayout;
   m_hold = false;
+  m_pace_pending_us = 0;  // pacing is for ARMED calls only
   if (relayout)
   {
     ++m_stats.relayouts;
@@ -1278,6 +1420,7 @@ void RollbackSession::EndStall(bool hit_timeout)
   m_stats.stall_us_total += us;
   m_stats.stall_us_max = std::max(m_stats.stall_us_max, us);
   m_win.stall_us += us;
+  m_stall_run_us += us;
   const std::string text =
       Fmt("STALL %s frame=%d ms=%.1f R=%d", hit_timeout ? "timeout" : "end", m_cur_frame, static_cast<double>(us) / 1000.0, Confirmed());
   if (hit_timeout || m_stall_logged)
@@ -1287,6 +1430,177 @@ void RollbackSession::EndStall(bool hit_timeout)
     ++m_win.suppressed;
     ++m_stats.log_suppressed;
   }
+}
+
+// ---- M5: stall run, pacing, resimulation cost, adaptive MAXR ---------------------------------------------------------------------
+
+void RollbackSession::NoteCallWithoutStall()
+{
+  m_stall_run = 0;
+  m_stall_run_us = 0;
+}
+
+// Slippi (EXI_DeviceSlippi.cpp:1380-1400) force-disconnects after 420 frames (7 s) in which a player kept needing inputs it did not have. Its
+// halted frames each take one frame time, so "420 halted frames" is "7 s without progress". Here a stalled call is one blocking wait: a single
+// wait of 420 frame times is the BlockTimeoutMs timeout (BlockTimedOut); this is the other form, many short stalls in a row. A run of
+// stalled calls counts only when its waits add up to as many frame times as calls (the game then runs at 30 fps or less the whole time): a
+// link that stalls every call by a millisecond or two is slow but playable and must not end the session.
+bool RollbackSession::StallRunTooLong()
+{
+  const u32 limit = m_cfg.stall_disconnect_frames;
+  if (limit == 0 || m_stall_run < limit || m_stall_run_us < static_cast<u64>(limit) * static_cast<u64>(PACE_FRAME_US))
+    return false;
+  LeaveSession(Fmt("stall: %u consecutive stalled frames, %.1f s of waiting for the peer (the link cannot keep up)", m_stall_run,
+                   static_cast<double>(m_stall_run_us) / 1e6),
+               true);
+  return true;
+}
+
+// ARMED, normal calls only (m_pace_allowed; the callers are the two successful ends of StepArmed): a check when one is due, then the next slice of an accepted
+// delay. Everything here only moves host wall time; the reply of the call is already decided.
+void RollbackSession::Pace(s32 frame)
+{
+  if (!m_pace_allowed)
+    return;  // a pending delay waits for the next normal ARMED call
+  const PaceConfig& pc = m_cfg.pace;
+  if (m_pace_pending_us == 0 && frame >= m_pace_next && !m_hold)
+  {
+    s32 offset_us = 0;
+    u32 samples = 0;
+    const u64 rtt_us = m_net.RttUs();
+    // Not ready (too few samples since the last correction, or no RTT yet): try again on the next call, nothing is logged.
+    if (m_net.TimeOffsetUs(&offset_us, &samples) && samples >= pc.min_samples && rtt_us >= pc.min_rtt_us)
+    {
+      const s32 since = frame - m_armed_frame;
+      PaceDecision d = DecidePace(pc, since, offset_us);
+      m_pace_next = frame + pc.interval_frames;
+      ++m_stats.pace_checks;
+      m_stats.pace_offset_sum_us += offset_us;
+      if (m_stats.pace_checks == 1)
+        m_stats.pace_offset_max_us = m_stats.pace_offset_min_us = offset_us;
+      m_stats.pace_offset_max_us = std::max(m_stats.pace_offset_max_us, offset_us);
+      m_stats.pace_offset_min_us = std::min(m_stats.pace_offset_min_us, offset_us);
+
+      std::string action = d.action;
+      s32 sleep_us = 0;
+      std::string would;
+      if (d.delay_us > 0)
+      {
+        if (pc.enabled && m_pacer != nullptr)
+        {
+          m_pace_pending_us = d.delay_us;
+          sleep_us = d.delay_us;
+          ++m_stats.pace_slowdowns;
+        }
+        else
+        {
+          would = Fmt(" would=%s:%d", d.action, d.delay_us);
+          action = "off";
+          if (pc.enabled && !m_pace_noted)
+          {
+            m_pace_noted = true;
+            Line("NOTE pacing has no actuator in this run: the offset is measured and logged, nothing is delayed");
+          }
+        }
+      }
+      const bool hard = d.delay_us > 0 && std::string(d.action) == "hard";
+      const std::string text =
+          Fmt("PACE frame=%d since_gate=%d offset_us=%d adv=%.2f rtt_ms=%.1f samples=%u action=%s sleep_us=%d%s", frame, since, offset_us,
+              static_cast<double>(offset_us) / PACE_FRAME_US, static_cast<double>(rtt_us) / 1000.0, samples, action.c_str(), sleep_us, would.c_str());
+      // The first PACE_LOG_FULL_LINES checks are written in full, later ones only when they are a hard correction or one in PACE_LOG_EVERY.
+      if (m_pace_check_lines < PACE_LOG_FULL_LINES || hard || m_stats.pace_checks % PACE_LOG_EVERY == 0)
+      {
+        ++m_pace_check_lines;
+        Line(text);
+      }
+      else
+        ++m_stats.pace_lines_left_out;
+    }
+  }
+  if (m_pace_pending_us > 0)
+  {
+    const s32 slice = std::min(m_pace_pending_us, std::max(1, pc.slice_us));
+    m_pace_pending_us -= slice;
+    if (m_pacer != nullptr)
+      m_pacer->Delay(static_cast<u32>(slice));
+    m_stats.pace_sleep_us_total += static_cast<u64>(slice);
+    if (m_pace_pending_us == 0)
+      m_net.ResetTimeOffsets();  // the samples taken so far describe the timing before this correction
+  }
+}
+
+void RollbackSession::NoteResimCost(s32 depth, u64 cost_us)
+{
+  const u32 cost = static_cast<u32>(std::min<u64>(cost_us, 0xFFFFFFFFull));
+  ++m_stats.resim_costs;
+  if (m_resim_cost_us.size() < RESIM_COST_KEEP)
+    m_resim_cost_us.push_back(cost);
+  else
+  {
+    m_resim_cost_us[m_resim_cost_next] = cost;
+    m_resim_cost_next = (m_resim_cost_next + 1) % RESIM_COST_KEEP;
+  }
+  m_resim_unit_us[m_resim_unit_count % m_resim_unit_us.size()] = cost / static_cast<u32>(std::max<s32>(depth, 1));
+  ++m_resim_unit_count;
+  AdaptMaxr();
+}
+
+bool RollbackSession::ResimCostPercentileUs(int percent, u32* out) const
+{
+  if (m_resim_cost_us.empty())
+    return false;
+  std::vector<u32> sorted = m_resim_cost_us;
+  std::sort(sorted.begin(), sorted.end());
+  const size_t n = sorted.size();
+  // Nearest rank: the smallest value with at least `percent` % of the samples at or below it.
+  const size_t rank = (static_cast<size_t>(std::max(0, std::min(100, percent))) * n + 99) / 100;
+  *out = sorted[std::max<size_t>(rank, 1) - 1];
+  return true;
+}
+
+// Adaptive MAXR (docs/rollback_netplay_plan.md 3.5): MAXR_eff is the largest K for which the resimulation of K frames costs less than the
+// budget at its p95. The cost of a rollback is not linear in its depth (the restore and the live frame are fixed parts) but the per-frame
+// cost cost/depth over-estimates for shallow rollbacks, which are the common ones, so the estimate errs on the side of a smaller K. Local: the stall
+// rule is the only thing that uses MAXR_eff; the gate close and the slot count keep using the configured MAXR, which both machines share.
+// Down at once, up by one per ADAPT_RAISE_WAIT measured rollbacks, never above the configured MAXR, never below 1.
+void RollbackSession::AdaptMaxr()
+{
+  constexpr size_t MIN_SAMPLES = 8;       // measured rollbacks before the first change
+  constexpr u32 ADAPT_RAISE_WAIT = 16;    // measured rollbacks between two increases
+  if (!m_cfg.maxr_adapt)
+    return;
+  const size_t n = std::min(m_resim_unit_count, m_resim_unit_us.size());
+  if (n < MIN_SAMPLES)
+    return;
+  std::vector<u32> units(m_resim_unit_us.begin(), m_resim_unit_us.begin() + static_cast<std::ptrdiff_t>(n));
+  std::sort(units.begin(), units.end());
+  const u32 p95 = units[std::max<size_t>((95 * n + 99) / 100, 1) - 1];
+  const u32 k_raw = p95 == 0 ? static_cast<u32>(MAX_ROLLBACK_CEILING) : m_cfg.maxr_budget_us / p95;
+  const int k = static_cast<int>(std::max<u32>(1, std::min<u32>(k_raw, static_cast<u32>(m_cfg.max_rollback))));
+  int next = m_maxr_eff;
+  if (k < m_maxr_eff)
+  {
+    next = k;
+    m_maxr_raise_wait = ADAPT_RAISE_WAIT;
+  }
+  else if (k > m_maxr_eff)
+  {
+    if (m_maxr_raise_wait > 0)
+      --m_maxr_raise_wait;
+    else
+    {
+      next = m_maxr_eff + 1;
+      m_maxr_raise_wait = ADAPT_RAISE_WAIT;
+    }
+  }
+  if (next == m_maxr_eff)
+    return;
+  Line(Fmt("MAXR eff %d -> %d (p95 resimulation cost %.2f ms per frame, budget %.1f ms, configured %d, %zu rollbacks measured)", m_maxr_eff, next,
+           static_cast<double>(p95) / 1000.0, static_cast<double>(m_cfg.maxr_budget_us) / 1000.0, m_cfg.max_rollback, n));
+  m_maxr_eff = next;
+  m_stats.maxr_eff = next;
+  m_stats.maxr_eff_min = std::min(m_stats.maxr_eff_min, next);
+  ++m_stats.maxr_changes;
 }
 
 // ---- checksums -------------------------------------------------------------------------------------------------------------------
@@ -1641,14 +1955,28 @@ void RollbackSession::SummaryLine(const char* tag)
   std::string ranges;
   if (m_cfg.range_crc)
     ranges = Fmt(" range_checks=%u range_diff_frames=%u", m_stats.range_checks, m_stats.range_diff_frames);
+  // M5: pacing (adv_* in frames of 16.683 ms, positive = ahead of the peer), the stall run, the cost of a rollback, the stall rule's limit.
+  const double checks = static_cast<double>(std::max<u32>(m_stats.pace_checks, 1));
+  const auto adv = [](double us) { return us / PACE_FRAME_US; };
+  u32 p50 = 0, p95 = 0, pmax = 0;
+  ResimCostPercentileUs(50, &p50);
+  ResimCostPercentileUs(95, &p95);
+  ResimCostPercentileUs(100, &pmax);
+  const std::string m5 = Fmt(
+      " pace=%s pace_checks=%u pace_slowdowns=%u pace_sleep_ms_total=%.1f adv_mean=%.2f adv_max=%.2f adv_min=%.2f pace_lines_left_out=%u "
+      "stall_run_max=%u resim_n=%u resim_skipped=%u resim_ms_p50=%.2f resim_ms_p95=%.2f resim_ms_max=%.2f maxr_eff=%d maxr_eff_min=%d maxr_changes=%u",
+      m_cfg.pace.enabled ? "on" : "off", m_stats.pace_checks, m_stats.pace_slowdowns, static_cast<double>(m_stats.pace_sleep_us_total) / 1000.0,
+      adv(static_cast<double>(m_stats.pace_offset_sum_us) / checks), adv(m_stats.pace_offset_max_us), adv(m_stats.pace_offset_min_us),
+      m_stats.pace_lines_left_out, m_stats.stall_run_max, m_stats.resim_costs, m_stats.resim_cost_skipped, p50 / 1000.0, p95 / 1000.0,
+      pmax / 1000.0, m_stats.maxr_eff, m_stats.maxr_eff_min, m_stats.maxr_changes);
   Line(Fmt("%s mode=%s frame=%d calls=%u resim_calls=%u rollbacks=%u max_depth=%u depth_hist=[%s] predicted=%u stalls=%u stall_ms_max=%.1f "
            "postponed=%u forced_hw=%u hw_holds=%u hold_calls=%u relayouts=%u chk_ok=%u chk_bad=%u gate_opens=%u gate_closes=%u gate_late=%u "
-           "arm_refused=%u log_suppressed=%u%s%s",
+           "arm_refused=%u log_suppressed=%u%s%s%s",
            tag, ModeName(m_mode), m_expected_next, m_stats.calls, m_stats.resim_calls, m_stats.rollbacks, m_stats.max_depth, hist.c_str(),
            m_stats.predicted_frames, m_stats.stalls, static_cast<double>(m_stats.stall_us_max) / 1000.0, m_stats.postponed,
            m_stats.forced_hw, m_stats.hw_holds, m_stats.hold_calls, m_stats.relayouts, m_stats.checks_ok, m_stats.checks_bad,
            m_stats.gate_opens, m_stats.gate_closes, m_stats.gate_late, m_stats.arm_refused, m_stats.log_suppressed, sim.c_str(),
-           ranges.c_str()));
+           ranges.c_str(), m5.c_str()));
 }
 
 void RollbackSession::Finish()

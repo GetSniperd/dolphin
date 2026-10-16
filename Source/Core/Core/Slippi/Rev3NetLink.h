@@ -71,6 +71,10 @@ public:
   size_t Unacked() const { return m_unacked.size(); }
   bool Overflowed() const { return m_unacked.size() > MAX_UNACKED; }
   u64 RttUs() const { return m_rtt_us; }      // smoothed ack round trip; 0 = no sample yet
+  // M5 pacing: Slippi's per-received-pad time offset (TimeSync in Rev3Session.h). Taken at the first arrival of every newer remote frame, with the
+  // local send time of our newest queued frame; positive = this machine is ahead.
+  bool TimeOffsetUs(s32* out, u32* samples) const { return m_time.OffsetUs(out, samples); }
+  void ResetTimeOffsets() { m_time.Reset(); }
   s32 AckedFrame() const { return m_acked; }  // hook frame; -1 = none
 
   // ---- receiving side (network thread)
@@ -89,6 +93,7 @@ private:
     Pad8 pad{};
     u64 first_sent_us = 0;
     u32 sent = 0;
+    bool timer_resent = false;  // sent again by PollResend (no RTT sample from its ack, Karn)
   };
   struct Remote
   {
@@ -96,7 +101,7 @@ private:
     Pad8 pad{};
   };
 
-  std::vector<u8> BuildPad(u64 now_us);
+  std::vector<u8> BuildPad(u64 now_us, bool timer_resend = false);
 
   u8 m_port;
   std::deque<Local> m_unacked;
@@ -108,6 +113,7 @@ private:
   u64 m_rtt_us = 0;
   std::array<Remote, REMOTE_RING> m_remote{};
   s32 m_remote_r = -1;
+  TimeSync m_time;
   std::vector<PeerChecksum> m_peer_checks;
   s32 m_last_peer_chk_frame = -1;
   u32 m_last_peer_chk_value = 0;
@@ -162,6 +168,10 @@ struct NetOptions
   std::string netsim;      // REV3_NETSIM (Rev3NetSim.h): delay_ms=..,jitter_ms=..,loss_pct=..,seed=.. ; "" = off
   u32 busy_calls = 3;      // REV3_NET_BUSY: consecutive armed calls with a disc read in flight that start a HOLD (predict nothing); 0 = never
   bool range_crc = false;  // REV3_NET_RANGE_CRC=1 (testing only): exchange the CRCs of the snapshot ranges at every checksum frame
+  // M5 (REV3.md "Netplay (M5)"). Local to a machine (not part of HELLO) except the MAXR itself.
+  PaceConfig pace;                 // REV3_NET_PACE=0|1 (default 1), REV3_NET_PACE_T1_US, REV3_NET_PACE_HARD_MAX_US, REV3_NET_PACE_SLICE_US, REV3_NET_PACE_GENTLE_PERMILLE
+  bool maxr_adapt = false;         // REV3_NET_MAXR_ADAPT=1: the stall rule's limit follows the measured cost of resimulation (off by default)
+  u32 maxr_budget_us = 14000;      // REV3_NET_MAXR_BUDGET_US: resimulation of K frames should cost less than this at its p95 (microseconds)
 };
 using GetEnvFn = std::function<std::string(const char*)>;  // "" for unset
 NetOptions ParseNetOptions(const GetEnvFn& get_env);
@@ -190,6 +200,7 @@ struct HelloInputs
   bool hook_crc_valid = false;
   u32 hook_crc = 0;         // CRC-32 of the hook code region 0x800024A0-0x8000291F once the game has booted
   bool rollback = false;    // REV3_NET_ROLLBACK
+  int max_rollback = 5;     // REV3_NET_ROLLBACK_MAX: MAXR. The gate close is scheduled MAXR + 1 frames after a final frame, so both sides must use the same
   u32 arm_calls = 600;
   u32 quiet_calls = 60;
   u32 stable_crc = 0;       // CRC of the REV3_NET_STABLE ranges' file contents (0 = none), so both sides use the same ranges

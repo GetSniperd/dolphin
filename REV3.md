@@ -591,9 +591,128 @@ memory); it is what tells you which memory to look at when the field checksum fi
   both sides logged the same `GATE close` lines.
 - Not yet run: two real Dolphin processes with Rev3 and `REV3_NETSIM` (D does that), the real throttle / mute under a real audio backend.
 
-## Known gaps (after M4)
+## Netplay (M5): pacing, MAXR measurement, stall run, log lines
 
-- Pacing (CalcTimeOffsetUs port: keeping the two clocks in step so the faster machine does not run into the stall rule) and MAXR measurement are M5.
+Milestone M5 keeps the two machines in step so that one of them is not pinned at the stall limit all match, measures what a rollback costs,
+and makes sure neither side can hang. Motivation: D's loopback with `delay_ms=80,jitter_ms=30,loss_pct=5` (D=2, MAXR=5, RTT about 137 ms, 7788 frames):
+host stalls 1902, predicted 3147, rollbacks 0; guest stalls 5, predicted 403, rollbacks 42. Files: `Rev3Session.{h,cpp}` (`TimeSync`, `DecidePace`,
+`RollbackSession::Pace()`, resimulation cost, adaptive MAXR, stall run), `Rev3NetLink.{h,cpp}` (RTT fix, `PadLink` offsets, options, HELLO `maxr`),
+`Rev3Net.{h,cpp}` (`EnetTransport` answers the session's pacing questions), `Rev3Rollback.cpp` (`DolphinPacer`), `CoreTiming.{h,cpp}`
+(`SleepAndResetThrottle`). Design reasoning and the numbers of the test network: rev3-mod `docs/findings.md` "Pacing (M5)".
+
+### Why a machine ends up ahead, and why a plain sleep does not fix it
+
+Dolphin's throttle makes up lost time: a machine that waited for the peer (a stall) runs the next frames without sleeping until it is back on its
+schedule (a lag beyond `MAIN_MAX_FALLBACK`, 100 ms, is forgiven). Two such machines settle with the leader at the stall limit (`N - R > MAXR`: it
+waits, catches up, waits again) and the follower never predicting. A hidden resimulation runs with the throttle off and the throttle clock restarts at its end, so
+the machine that rolls back often loses the re-run time for good and drifts later; the one that never rolls back stays ahead. The rollback itself
+works; the pair is just not balanced. So a delay must (1) go to the machine that is ahead and (2) survive the throttle's catch-up:
+`CoreTimingManager::SleepAndResetThrottle(delay)` sleeps and then restarts the throttle clock at the current cycle (the emulated clock is untouched;
+CPU thread only; `DolphinPacer` calls it, and does nothing while the limiter is off). The actuator is a `PaceActuator` interface, so the session stays pure.
+
+### What is measured (`TimeSync`)
+
+Slippi's idea (`SlippiNetplay.cpp` per received pad :295-316, `CalcTimeOffsetUs` :1664-1733): each time a newer remote pad arrives, `sample = (arrival - RTT/2) - our
+send time of the SAME frame` = how much later than us the peer sent that frame; positive = this machine is **ahead**. (Slippi uses our newest send time plus
+`frame_time * (our newest - their frame)`, which assumes our frames go out 16.7 ms apart; a throttle catch-up burst breaks that, so the exact frame's send time is used
+while it is still known (last 64 frames) and Slippi's formula only for a frame we have not sent yet.) Only the first arrival of a newer frame is a sample (a re-sent packet says nothing),
+none without an RTT estimate, a window of the last 30 samples is sorted and the **middle third averaged** (jitter spikes and late re-sends fall out at both ends).
+The RTT is the ACK time minus the FIRST send of the acked frame (EWMA 7/8); only pads re-sent by the resend timer give no sample (Karn). (Until M5 the sample needed
+a pad sent exactly once, which in ARMED, with a packet per frame repeating every unacked pad and an RTT longer than a frame, almost never happens: the RTT stayed 0.)
+
+### What it does (`RollbackSession::Pace()`, `DecidePace`)
+
+ARMED, **normal calls only** (not LOCKSTEP, where the wait for the pad is the pacing; not DRAIN or the call that ends one; not a resimulation: `m_pace_allowed`). A check
+is due every `interval_frames` = 30 frames (Slippi `SLIPPI_ONLINE_LOCKSTEP_INTERVAL`), the first one 30 frames after the gate opened, and runs when the window has at least
+`min_samples` (15) samples and an RTT exists. It slows only when **ahead**; behind it does nothing (the peer slows). Changes host wall time only: the reply, the pads
+and the game state are decided before and untouched. A correction is spread over hook calls in slices of at most `slice_us`, so no frame is stretched by more
+than 4 ms; when the last slice is out, the offset window is cleared (the next check needs fresh samples measured with the new timing).
+
+| number | default | unit | meaning (Slippi source) |
+|---|---|---|---|
+| `interval_frames` | 30 | frames | between two checks (SlippiNetplay.h:35) |
+| `hard_frames` | 120 | frames since the gate opened | hard window; later gentle (EXI_DeviceSlippi.cpp:1437) |
+| `t1_us` | 10000 | microseconds | hard: ahead by this much or less = nothing (EXI:1426) |
+| `hard_target_us` | 5000 | microseconds | hard: leave this much lead after the correction |
+| `hard_max_us` | 83415 (5 frames) | microseconds | hard: most delay one check may ask for (EXI:1451) |
+| `gentle_deadband_us` | 8000 | microseconds | gentle: ahead by this much or less = nothing (EXI:1521) |
+| `gentle_window_frames` | 3 | frames of lead | lead at which the gentle correction reaches its maximum (EXI:1514) |
+| `gentle_max_permille` | 10 | thousandths of the 30-frame interval | largest gentle slowdown, 1.0 % = 5 ms per check (Slippi 0.5 %) |
+| `slice_us` | 4000 | microseconds | most one hook call is delayed |
+| `min_samples` | 15 | offsets | needed in the window before a check may decide |
+
+Hard: ahead by more than `t1_us` loses `min(offset - hard_target_us, hard_max_us)`. Gentle: ahead by more than the dead band loses
+`interval * permille/1000 * min(offset, 3 frames) / 3 frames`. Worst case in the hard window: about 4 checks x 83 ms; afterwards at most 5 ms per 500 ms (1 %).
+
+**Skew at the gate.** In lockstep every call waits for the peer's pad and then runs unthrottled until it is back on its schedule, so neither machine's throttle
+clock says anything about the other. When the gate opens (both at the same frame) the two are some frames apart (about the one-way latency plus jitter plus the START_CHECK
+exchange; the test network starts them 0-8 frames apart). Nothing in the protocol removes it, which is what the hard window is for: the machine that is ahead gives it back
+at once (at most 5 frames per check), the one that is behind does nothing.
+
+### Variables
+
+| variable | default | meaning |
+|---|---|---|
+| `REV3_NET_PACE=0\|1` | 1 | 0: measure and log, never delay (`action=off ... would=hard:35000`), the A/B baseline. Local to a machine, not part of HELLO (pacing changes no game state) |
+| `REV3_NET_PACE_T1_US`, `_HARD_MAX_US`, `_SLICE_US`, `_GENTLE_PERMILLE` | 10000, 83415, 4000, 10 | the numbers of the table above (0..100000, 0..300000, 100..16000, 0..100) |
+| `REV3_NET_ROLLBACK_MAX` | 5 | MAXR, 1..7 (Slippi's `ROLLBACK_MAX_FRAMES`). **Both machines must use the same value**: the gate close is scheduled MAXR + 1 frames after a final frame, so HELLO now carries `maxr` and a difference refuses the session and names it |
+| `REV3_NET_MAXR_ADAPT=1` | 0 | adaptive `MAXR_eff` (below), local |
+| `REV3_NET_MAXR_BUDGET_US` | 14000 | microseconds: the resimulation of K frames should cost less than this at its p95 (1000..100000) |
+
+### MAXR measurement and the adaptive rule
+
+Every rollback is timed from the RESTORED reply to the end of its last re-run frame (`resim_n`, `resim_skipped` for a rollback that waited on the network in the middle).
+`SUMMARY` carries `resim_ms_p50`, `resim_ms_p95`, `resim_ms_max` (milliseconds per rollback, nearest-rank percentiles over the last 4096). With
+`REV3_NET_MAXR_ADAPT=1`: the cost per frame of a rollback is cost / depth (this over-estimates shallow rollbacks, so it errs towards a smaller K); `MAXR_eff` is the
+largest K <= MAXR with p95(cost per frame) x K < `REV3_NET_MAXR_BUDGET_US`, at least 1; it needs 8 measured rollbacks, goes **down at once** and **up by one after 16 further measured rollbacks** (and never above the configured MAXR), logs
+`MAXR eff 5 -> 3 (p95 resimulation cost ... ms per frame, budget ... ms, configured 5, n rollbacks measured)`, and `SUMMARY` has `maxr_eff`, `maxr_eff_min`, `maxr_changes`. It is
+local: only the stall rule (`N - R > MAXR_eff`) and the depth of a postponed rollback use it; the gate close, the slot count and HELLO use the configured MAXR.
+Off by default: lowering the stall limit turns rollbacks into stalls, which is only worth it on a machine that cannot re-run MAXR frames in time.
+
+### Disconnect and timeouts
+
+- **Stall run.** Slippi disconnects after 420 frames (7 s) of a player needing inputs it does not have. Here a stall is one blocking wait, so: a single wait of 420 frame times (7000 ms,
+  `BlockTimeoutMs`) leaves (`STALL timeout`, `stall: no remote pad for 420 frames`), and **420 consecutive stalled calls** whose waits add up to at least 420 frame times leave too
+  (`stall: 420 consecutive stalled frames, 8.4 s of waiting for the peer (the link cannot keep up)`). A link that stalls every call by a millisecond or two is slow but playable and does not
+  end the session; any call without a stall resets the run. `SUMMARY` has `stall_run_max`.
+- 10 s without any pad from a peer that is still connected (`wait_timeout_ms`) and a lost connection leave as before. The frame-0 barrier times out after 120 s.
+- **Closing the window** (while a wait or a frame is running) calls `Abort("the emulator was closed")`: `LEAVE frame=.. reason=..`, `SUMMARY`, and a **BYE** carrying the reason. The peer logs
+  `BYE from the peer: the emulator was closed` and `LEAVE ... reason=the peer left (the emulator was closed)`, ends its wait at once and plays on offline. A crash sends no BYE: the
+  peer's 10 s no-pad timeout (or ENet's disconnect) ends the wait.
+
+### Log lines
+
+`PACE frame=130 since_gate=100 offset_us=45000 adv=2.70 rtt_ms=137.0 samples=30 action=hard sleep_us=40000` once per check (every 30 armed frames while pacing can decide). `action`: `none` (not
+ahead), `hard`, `gentle`, `behind`, `off` (pacing disabled or no actuator: `would=hard:40000` follows). `adv` is the offset in frames of 16.683 ms. Volume: the first 120 checks in full, then
+hard corrections and one check in 20 (the count of the rest is `pace_lines_left_out`); a 10-minute match has about 1200 checks, so about 180 lines. `NET pacing on (hard 120 frames, t1 10000 us, ...)` at start.
+`SUMMARY` (and the one written at a leave) gained: `pace=on|off pace_checks pace_slowdowns pace_sleep_ms_total adv_mean adv_max adv_min` (frames; positive = ahead; over all checks) `pace_lines_left_out
+stall_run_max resim_n resim_skipped resim_ms_p50 resim_ms_p95 resim_ms_max maxr_eff maxr_eff_min maxr_changes`. rev3-mod `phase4.py` reads all of these (`phase4.bat loopback --pace off|on`).
+
+### What D should run, and what success looks like
+
+    .\tools\rollback\phase4.bat loopback --rollback --netsim delay_ms=80,jitter_ms=30,loss_pct=5,seed=1
+    .\tools\rollback\phase4.bat loopback --rollback --netsim delay_ms=80,jitter_ms=30,loss_pct=5,seed=1 --pace off     (the baseline, tag ..._nopace)
+    optional: --rollback-max 7, --maxr-adapt, a longer match
+
+Success, in `net_<tag>.md`: the **host's stalls a small fraction of 1902** and no LOPSIDED flag, stalls and rollbacks on both sides of the same order, `pace_slowdowns` > 0 on the machine that
+was ahead (and few on the other) with `pace_sleep_ms_total` a small part of the match, `adv_mean` near 0 (a few tenths of a frame), the same `CHK` lines on both sides (verdict CLEAN), no `DESYNC`/`ERROR`, and
+`resim_ms_p95` under about 14 ms. The `--pace off` run should look like the old one (host pinned), which shows the effect is the pacing.
+
+### Verification
+
+- Unit tests (`Rev3SessionTest.cpp` 103 tests, `Rev3NetLinkTest.cpp` 45, `Rev3NetSimTest.cpp` 14, `Rev3RollbackTest.cpp` 116, all passing): `DecidePace` table, `TimeSync` (same-frame send time, middle third,
+  Slippi's fallback), checks every 30 armed frames in slices and a cleared window, hard then gentle, never for a machine that is behind, pacing off, no RTT / too few samples, nothing in LOCKSTEP, 420 stalled calls leave while
+  slow short stalls and interrupted runs do not, window close sends BYE and the peer logs the reason, resimulation cost percentiles, adaptive MAXR down / up / bounds, PACE log volume and the SUMMARY keys; PadLink RTT while streaming, timer
+  re-sends, offsets through two links; option parsing; HELLO `maxr`.
+- Closed-loop test network (`SimMachine` with Dolphin's catch-up throttle, a restart of the throttle clock after a resimulation, the actual `TimeSync` and RTT estimator): with the host's pad moving, the guest's still and one side starting 5 frames
+  ahead (50 ms + 30 ms jitter, 5 % loss, D=2, MAXR=5) the host stalls 838 / 1837 / 1869 / 789 (resimulation 2 ms per frame) and 1629 / 1837 / 1869 / 1334 (8 ms) times with pacing off, 16 / 196 / 42 / 20 and 183 / 391 / 290 / 188 with it on;
+  the host sleeps 214-362 ms in a 41 s run; both sides end in the reference state. 1000 seeds of lossy, jittery runs (gate re-opens, busy hardware, relayouts, random throttle and resimulation costs, start skews) still agree with the reference and no
+  delay is ever requested outside a normal ARMED call, nor larger than one slice. The 1000 seeds without the throttle model pass as before.
+- Not yet run: two real Dolphin processes with pacing (D does that), `SleepAndResetThrottle` under a real audio/video backend. The thresholds are the model's and Slippi's; D's numbers will retune them.
+
+## Known gaps (after M5)
+
+- Pacing and MAXR measurement are built (M5) but only run in the test network; the real numbers are D's loopback (above). Not done: a pacing OSD line (the log has it), and the adaptive MAXR is off by default.
 - The in-game side of hiding (skip render and SFX of re-run frames, the rbhook patch) is M6; v1 only turns the throttle off and mutes the output.
 - Internet play (NAT traversal beyond simultaneous open, relay, matchmaking) is M7; direct connect only.
 - A HOLD makes a machine wait for the peer's pads more often during a disc read; there is no measurement of how often yet.

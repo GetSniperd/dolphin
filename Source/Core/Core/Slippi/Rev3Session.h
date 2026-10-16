@@ -58,9 +58,36 @@
 //   A frame without fighters cannot be snapshotted, so such a frame is never predicted (the call waits for the real pad), and a live state
 //   without fighters is recorded as "lost" like a health-0 fighter.
 //
+// PACING (M5): keeping the two machines in step so that neither one stalls
+//   Rollback bounds how far a machine may run ahead of what it knows (the stall rule, N - R > MAXR), but it does not say who is ahead. Two
+//   machines that start a few frames apart settle with one of them always at the stall limit (it waits for the other, then catches up at
+//   full speed, because Dolphin's throttle makes up lost time) and the other never predicting at all. TimeSync measures the skew the way
+//   Slippi does (SlippiNetplay.cpp CalcTimeOffsetUs): every time a newer remote pad arrives, "when did the opponent send frame f, by our
+//   clock" (arrival - RTT/2) minus "when did we send our newest frame h" plus the frame difference; a window of the last 30 samples is
+//   sorted and the middle third averaged. Positive = this machine is AHEAD. RollbackSession::Pace() (ARMED, normal calls only) looks at it
+//   every PACE_INTERVAL_FRAMES; an ahead machine delays itself through the PaceActuator, a machine that is behind does nothing (the other
+//   side slows). The first PaceConfig::hard_frames after the gate opens correct hard (this is where the lockstep leaves a skew behind), later only
+//   gently (Slippi's emulation-speed step, as a delay). The delay only moves host wall time: it never touches the game, the replies or the
+//   pads. Never in LOCKSTEP (the wait for the pad IS the pacing there) and never in a resimulation. The numbers are in PaceConfig.
+//   Skew at the gate: in lockstep every call waits for the peer's pad and then runs unthrottled until it is back on its schedule, so neither
+//   machine's throttle clock says anything about the other's. When the gate opens (both at the same frame, THE GATE RULE) the two are
+//   some frames apart, in the order of the one-way latency plus jitter plus the START_CHECK exchange (the test network starts them 0 to 8
+//   frames apart; D's loopback with 137 ms RTT settled with the host pinned at the stall limit). Nothing in the protocol removes it, so the
+//   first PaceConfig::hard_frames (120) frames are the hard window: the machine that is ahead gives the difference back at once (at most 5
+//   frames per check, in slices of 4 ms), the one that is behind does nothing. Every correction clears the offset window, so the next check
+//   waits for min_samples (15) fresh samples measured with the new timing. Pacing needs an RTT estimate (no decision without one: a
+//   missing RTT would make both machines believe they are ahead and both slow down). A hidden resimulation restarts the guest's throttle
+//   clock when it ends, which moves THAT machine later by the time the re-run took; that is why a machine that rolls back often is the one that
+//   ends up behind and the one that predicts and never rolls back is the one that has to slow down.
+//
+// MAXR (M5)
+//   Config::max_rollback (REV3_NET_ROLLBACK_MAX, 1..7 = Slippi's ROLLBACK_MAX_FRAMES) is shared by both machines (HELLO checks it): the
+//   scheduled gate close and the snapshot slot count depend on it. The stall rule uses MAXR_eff <= MAXR, which one machine may lower on its
+//   own (stalls are local): with Config::maxr_adapt the cost of every rollback (RESTORED reply to the end of the resimulation) is measured and
+//   MAXR_eff is the largest K for which K frames of resimulation fit the budget at the p95 per-frame cost. See AdaptMaxr().
+//
 // NOT DONE YET (later milestones)
-//   M5: pacing (CalcTimeOffsetUs port), MAXR measurement. M6: the game-side render / SFX skip. See also the header notes at the
-//   declarations marked "M3".
+//   M6: the game-side render / SFX skip. See also the header notes at the declarations marked "M3".
 
 #pragma once
 
@@ -112,6 +139,84 @@ enum class Mode : u8
   DRAIN,
 };
 const char* ModeName(Mode mode);
+
+// ---- pacing (M5) -----------------------------------------------------------------------------------------------------------
+// Every number below is a tunable; the unit is in the comment. REV3_NET_PACE* in Rev3NetLink.h override some of them.
+// "ahead" = this machine runs earlier than the peer (it sends the same frame earlier); the offset is positive then.
+constexpr s32 PACE_FRAME_US = 16683;  // microseconds per game frame at 60 Hz (Slippi's frame_time, EXI_DeviceSlippi.cpp:1424)
+constexpr s32 PACE_INTERVAL_FRAMES = 30;  // frames between two pacing checks and samples in the offset window (Slippi SLIPPI_ONLINE_LOCKSTEP_INTERVAL, SlippiNetplay.h:35)
+
+struct PaceConfig
+{
+  bool enabled = true;               // false (REV3_NET_PACE=0): measure and log, never delay (the A/B baseline)
+  s32 interval_frames = PACE_INTERVAL_FRAMES;  // frames between two checks (after a correction the next one waits for fresh samples, see min_samples)
+  s32 hard_frames = 120;             // frames after the gate opened in which corrections are hard (Slippi: "frame <= 120", EXI_DeviceSlippi.cpp:1437)
+  s32 t1_us = 10000;                 // hard sync: ahead by this much or less = nothing to do (microseconds; Slippi t1 = 10 ms, EXI:1426)
+  s32 hard_target_us = 5000;         // hard sync: a correction aims to leave this much lead (microseconds); Slippi leaves up to t1
+  s32 hard_max_us = 5 * PACE_FRAME_US;  // hard sync: most delay one check may ask for (microseconds; Slippi: 5 frames at most early on, EXI:1451)
+  s32 gentle_deadband_us = 8000;     // later: ahead by this much or less = nothing (microseconds; Slippi: 8000, EXI:1521)
+  s32 gentle_window_frames = 3;      // later: the lead (in frames) at which the correction reaches its maximum (Slippi slow_down_frame_window, EXI:1514)
+  s32 gentle_max_permille = 10;      // later: largest slowdown, thousandths of the interval (10 = 1.0 %; Slippi uses 0.5 % = 5, EXI:1513). 1.0 % of a
+                                     // 30 frame interval is 5 ms: the gentle regime can never cost more than that per check
+  s32 slice_us = 4000;               // the most one hook call is delayed (microseconds). A correction is spread over calls of this size, so a hard
+                                     // one (83 ms) takes 21 calls, inside one interval, and a frame is never stretched by more than 4 ms
+  u32 min_samples = 15;              // offsets needed in the window before a check may decide (a correction clears the window)
+  u64 min_rtt_us = 1;                // no decision without an RTT estimate (the offset subtracts RTT/2): microseconds
+};
+
+// What one check decided.
+struct PaceDecision
+{
+  const char* action = "none";  // "none" (not ahead), "hard", "gentle", "behind" (the peer is ahead: nothing to do here), "off" (pacing disabled, ahead)
+  s32 delay_us = 0;             // microseconds this machine delays itself in total (spread over calls of at most slice_us)
+};
+// The pure policy: `frames_since_gate` = frames since the arm gate opened, `offset_us` = the robust average (positive = ahead).
+PaceDecision DecidePace(const PaceConfig& config, s32 frames_since_gate, s32 offset_us);
+
+// Slippi's time offset estimate (SlippiNetplay.cpp:295-316 per received pad, CalcTimeOffsetUs:1664-1733), for one peer.
+//   OnLocalSend  a local pad for `frame` went out at now_us.
+//   OnRemote     a PAD packet whose newest pad is for `frame` arrived at now_us; only the FIRST arrival of a newer frame is a sample (a re-sent
+//                packet says nothing about when the peer sent it). The peer sent that frame about rtt/2 ago, so
+//                   sample = (now - rtt/2) - our_send_time(frame)
+//                is how much LATER than us the peer sent the same frame: positive = we are ahead. Slippi compares with our NEWEST send h instead
+//                and adds PACE_FRAME_US * (h - frame), which assumes our frames go out 16.7 ms apart; Dolphin's throttle makes a machine that waited
+//                for the peer run its next frames in a burst, so here the send time of the very same frame is used whenever it is still known
+//                (the last PACE_RING frames) and Slippi's formula only when the peer is so far ahead that we have not sent that frame yet.
+//                Not sampled until an RTT is known.
+//   OffsetUs     sorts the last PACE_INTERVAL_FRAMES samples and averages the middle third (outliers: jitter spikes, late re-sends).
+// Pure and clock-free (the caller passes microseconds); used by PadLink (the real transport) and the test network.
+class TimeSync
+{
+public:
+  static constexpr size_t RING = 64;  // local send times kept (frames)
+  void OnLocalSend(s32 frame, u64 now_us);
+  void OnRemote(s32 frame, u64 now_us, u64 rtt_us);
+  bool OffsetUs(s32* out, u32* samples = nullptr) const;  // false: no sample yet
+  void Reset();                                           // forget the samples (after a correction: they describe the old timing)
+  u32 Samples() const { return static_cast<u32>(m_count); }
+
+private:
+  struct Sent
+  {
+    s32 frame = -1;
+    u64 us = 0;
+  };
+  std::array<s32, PACE_INTERVAL_FRAMES> m_buf{};
+  size_t m_count = 0;
+  size_t m_next = 0;
+  std::array<Sent, RING> m_sent{};
+  s32 m_local_frame = -1;  // newest local frame sent
+  s32 m_newest_remote = -1;
+};
+
+// What carries out a delay. Real: sleeps and restarts Dolphin's throttle clock (CoreTimingManager::SleepAndResetThrottle), so the lost time is
+// not made up by running the next frames faster. CPU thread only. Never touches game state.
+class PaceActuator
+{
+public:
+  virtual ~PaceActuator() = default;
+  virtual void Delay(u32 microseconds) = 0;
+};
 
 // ---- the transport ---------------------------------------------------------------------------------------------------------
 enum class ConnState : u8
@@ -168,6 +273,10 @@ public:
   virtual void Pump() {}
   // REV3_NETSIM counters (M4) for the SUMMARY line; `active` false = no simulation.
   virtual NetSimStats NetSimCounts() const { return {}; }
+  // M5, pacing. TimeSync's robust offset (positive = this machine is ahead) and the number of samples behind it; false = none yet.
+  virtual bool TimeOffsetUs(s32* /*out*/, u32* /*samples*/) const { return false; }
+  virtual void ResetTimeOffsets() {}  // forget the samples (the session just changed its own timing)
+  virtual u64 RttUs() const { return 0; }  // smoothed round trip of the PAD / ACK exchange, microseconds; 0 = no sample yet
 };
 
 // ---- snapshots -------------------------------------------------------------------------------------------------------------
@@ -283,9 +392,14 @@ struct Config
   int max_rollback = 5;               // MAXR: most frames ever predicted = deepest rollback (1..MAX_ROLLBACK_CEILING)
   u32 barrier_timeout_ms = 120000;    // frame-0 barrier: connect + HELLO (D starts both emulators by hand)
   u32 wait_timeout_ms = 10000;        // lockstep / drain / ARMED waits for a peer that sends nothing
-  u32 stall_disconnect_frames = 420;  // a stall (N - R > MAXR) that lasts this many frames (x 1/60 s) ends the session (Slippi's number)
+  u32 stall_disconnect_frames = 420;  // Slippi's number (EXI_DeviceSlippi.cpp:1396, 7 s): a stall (N - R > MAXR) that lasts this many frames (x 1/60 s)
+                                      // ends the session, and so does this many CONSECUTIVE stalled calls whose waits add up to as many frame times
   u32 start_check_timeout_ms = 10000; // waiting for the peer's START_CHECK at arm time (a timeout only refuses to arm)
   bool range_crc = false;             // REV3_NET_RANGE_CRC=1: exchange the CRCs of the snapshot ranges at every checksum frame (testing only)
+  PaceConfig pace;                    // M5: pacing (REV3_NET_PACE and friends)
+  bool maxr_adapt = false;            // M5, REV3_NET_MAXR_ADAPT=1: the stall rule uses MAXR_eff <= max_rollback, lowered when resimulation gets slow
+  u32 maxr_budget_us = 14000;         // M5, adaptive MAXR: the resimulation of K frames should cost less than this at its p95 (microseconds; ~ one 60 Hz
+                                      // frame of 16.7 ms minus the live frame's own work)
   Hello hello;                        // this side's HELLO (role and delay are filled in from this config when the session starts)
 };
 
@@ -331,6 +445,21 @@ struct SessionStats
   u32 gate_opens = 0;
   u32 gate_closes = 0;
   u32 arm_refused = 0;
+  // M5 pacing (checks = decisions taken; the offset sums are microseconds, positive = ahead)
+  u32 pace_checks = 0;
+  u32 pace_slowdowns = 0;             // checks that asked for a delay
+  u64 pace_sleep_us_total = 0;        // delay actually handed to the PaceActuator
+  s64 pace_offset_sum_us = 0;
+  s32 pace_offset_max_us = 0;
+  s32 pace_offset_min_us = 0;
+  u32 pace_lines_left_out = 0;        // PACE lines not written (rate limit)
+  // M5 stall run and resimulation cost
+  u32 stall_run_max = 0;              // longest run of consecutive stalled calls
+  u32 resim_costs = 0;                // rollbacks whose cost was measured (RESTORED reply to the end of the resimulation)
+  u32 resim_cost_skipped = 0;         // rollbacks not measured (the resimulation had to wait for the peer)
+  int maxr_eff = 0;                   // the stall rule's current limit (= max_rollback unless adaptive)
+  int maxr_eff_min = 0;
+  u32 maxr_changes = 0;
 };
 
 // ---- hiding the resimulated frames, v1 (M4) ---------------------------------------------------------------------------------
@@ -366,6 +495,9 @@ private:
 // LOG_FULL_LINES events of each kind; after that a window of LOG_WINDOW_FRAMES frames writes one `ROLLBACK depth_hist=..` summary line (with
 // the counts of ALL events of the window) instead, and only when it had left lines out. CHK, DESYNC, ERROR, GATE, LEAVE, SUMMARY are never
 // limited. The same numbers rate-limit SyncTest's RESTORE lines in a netplay run (Rev3Rollback.h).
+constexpr size_t RESIM_COST_KEEP = 4096;  // rollback costs kept for the SUMMARY percentiles (a ring; a match has far fewer rollbacks)
+constexpr u32 PACE_LOG_FULL_LINES = 120;  // PACE lines written in full; afterwards only hard corrections and one in PACE_LOG_EVERY checks
+constexpr u32 PACE_LOG_EVERY = 20;
 constexpr u32 LOG_FULL_LINES = 200;
 constexpr s32 LOG_WINDOW_FRAMES = 600;
 
@@ -405,6 +537,12 @@ public:
   // Called for every frame that becomes final while ARMED (all inputs below it verified): (frame, Rev3Checksum of its start state).
   // Used by tests to compare every frame with a no-latency reference run; M4 may use it for logging.
   void SetFinalObserver(std::function<void(s32 frame, u32 checksum)> observer) { m_final_observer = std::move(observer); }
+
+  // M5. Where pacing delays go (null = pacing only measures and logs). Not owned; must outlive the session.
+  void SetPaceActuator(PaceActuator* actuator) { m_pacer = actuator; }
+  int maxr_eff() const { return m_maxr_eff; }  // the stall rule's limit now (<= Config::max_rollback)
+  // Percentile (0..100) of the measured rollback costs in microseconds (RESTORED reply to the end of the resimulation); false = no sample.
+  bool ResimCostPercentileUs(int percent, u32* out) const;
 
 private:
   enum class Block : u8
@@ -473,6 +611,13 @@ private:
   void CaptureUsed(s32 frame, const Pad8& local, const Pad8& remote, bool predicted, const CaptureInfo* info, u8 lost);
   s32 FindMisprediction(s32 frame);
   void EndStall(bool hit_timeout);
+
+  // ---- M5: pacing, stall run, resimulation cost
+  void Pace(s32 frame);                // ARMED normal calls only: take a check when due, hand out the next slice of an accepted delay
+  void NoteCallWithoutStall();         // a normal call completed without waiting: the stall run is over
+  bool StallRunTooLong();              // true (after leaving the session): too many consecutive stalled calls
+  void NoteResimCost(s32 depth, u64 cost_us);
+  void AdaptMaxr();
 
   // ---- checksums
   void FinalizeChecks(s32 limit);
@@ -549,9 +694,12 @@ private:
 
   // stall
   bool m_stalled_this_call = false;  // this call was counted as a stall
+  bool m_pace_allowed = false;       // M5: this call began as a normal ARMED call (not LOCKSTEP, DRAIN or a resimulation): the only kind pacing may delay
   bool m_in_stall = false;           // a stall wait is running (EndStall not yet called)
   bool m_stall_logged = false;       // the STALL start line of the stall in progress was written in full
   u64 m_stall_start_us = 0;
+  u32 m_stall_run = 0;               // consecutive normal calls that stalled (reset by a call that did not)
+  u64 m_stall_run_us = 0;            // their waits added up
 
   // checksums
   std::map<s32, OwnCheck> m_own;
@@ -585,6 +733,24 @@ private:
     u64 stall_us = 0;
     std::array<u32, MAX_ROLLBACK_CEILING + 2> depth{};
   } m_win;
+
+  // M5 pacing
+  PaceActuator* m_pacer = nullptr;
+  s32 m_pace_next = 0;               // the frame from which the next check may run
+  s32 m_pace_pending_us = 0;         // accepted delay not yet handed out
+  u32 m_pace_check_lines = 0;        // PACE lines written in full so far
+  bool m_pace_noted = false;         // the "no actuator" note was written
+
+  // M5 resimulation cost and the adaptive MAXR
+  int m_maxr_eff = 5;
+  u64 m_resim_start_us = 0;
+  bool m_resim_blocked = false;      // the resimulation in progress had to wait for the peer: its cost says nothing about the machine
+  s32 m_resim_depth = 0;
+  std::vector<u32> m_resim_cost_us;  // ring of the last RESIM_COST_KEEP costs
+  size_t m_resim_cost_next = 0;
+  std::array<u32, 64> m_resim_unit_us{};  // ring of the last 64 per-frame costs (cost / depth), for AdaptMaxr
+  size_t m_resim_unit_count = 0;
+  u32 m_maxr_raise_wait = 0;         // measured rollbacks left before the limit may go up again
 
   std::function<void(s32, u32)> m_final_observer;
   SessionStats m_stats;

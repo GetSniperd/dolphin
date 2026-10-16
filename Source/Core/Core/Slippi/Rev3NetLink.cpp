@@ -60,6 +60,7 @@ std::vector<u8> PadLink::QueueLocal(s32 frame, const Pad8& pad, s32 checksum_fra
   if (frame <= m_last_queued)
     return {};
   m_last_queued = frame;
+  m_time.OnLocalSend(frame, now_us);
   Local entry;
   entry.frame = frame;
   entry.pad = pad;
@@ -74,12 +75,12 @@ std::vector<u8> PadLink::PollResend(u64 now_us)
   const u64 interval = std::max(RESEND_MIN_US, m_rtt_us);
   if (now_us >= m_last_send_us && now_us - m_last_send_us < interval)
     return {};
-  return BuildPad(now_us);
+  return BuildPad(now_us, true);
 }
 
 // Oldest unacked pads first (the receiver needs them contiguous), at most MAX_PADS_PER_PACKET; the header names the newest of them and the
 // pads follow newest first, exactly Slippi's SendSlippiPad layout.
-std::vector<u8> PadLink::BuildPad(u64 now_us)
+std::vector<u8> PadLink::BuildPad(u64 now_us, bool timer_resend)
 {
   const size_t count = std::min(m_unacked.size(), MAX_PADS_PER_PACKET);
   std::vector<u8> out;
@@ -96,6 +97,8 @@ std::vector<u8> PadLink::BuildPad(u64 now_us)
     if (m_unacked[i].sent == 0)
       m_unacked[i].first_sent_us = now_us;
     ++m_unacked[i].sent;
+    if (timer_resend)
+      m_unacked[i].timer_resent = true;
   }
   m_last_send_us = now_us;
   return out;
@@ -122,6 +125,7 @@ bool PadLink::OnPacket(const u8* data, size_t size, u64 now_us, std::vector<u8>*
       ++m_bad;
       return false;
     }
+    m_time.OnRemote(newest_wire - WIRE_FRAME_OFFSET, now_us, m_rtt_us);
     const size_t count = (size - PAD_HEADER_BYTES) / PAD_BYTES;
     for (size_t i = 0; i < count; ++i)
     {
@@ -164,7 +168,12 @@ bool PadLink::OnPacket(const u8* data, size_t size, u64 now_us, std::vector<u8>*
     while (!m_unacked.empty() && m_unacked.front().frame <= acked)
     {
       const Local& front = m_unacked.front();
-      if (front.frame == acked && front.sent == 1 && now_us >= front.first_sent_us)
+      // The receiver acks R when a packet makes it contiguous, normally the first packet that carried the pad, so the sample is the time since
+      // the pad's FIRST send. A pad also travels in every later packet while it is unacked (that is the protocol, not a retransmission) and
+      // must not rule the sample out: with a packet per frame and an RTT of several frames that was every pad, and the estimate stayed at its
+      // last lockstep value for the whole armed stretch (found in M5; pacing subtracts RTT/2). Karn's rule applies to the TIMER resend only
+      // (PollResend): after one, an ack cannot be matched to one send.
+      if (front.frame == acked && !front.timer_resent && now_us >= front.first_sent_us)
       {
         const u64 sample = now_us - front.first_sent_us;
         m_rtt_us = m_rtt_us == 0 ? sample : (7 * m_rtt_us + sample) / 8;
@@ -371,6 +380,34 @@ NetOptions ParseNetOptions(const GetEnvFn& get_env)
     o.range_crc = true;
   else if (!range_crc.empty() && range_crc != "0")
     o.warnings.push_back("REV3_NET_RANGE_CRC=" + range_crc + " is neither 0 nor 1; using 0");
+  // M5: pacing and the adaptive MAXR
+  const std::string pace = get_env("REV3_NET_PACE");
+  if (pace == "0")
+    o.pace.enabled = false;
+  else if (pace == "1")
+    o.pace.enabled = true;
+  else if (!pace.empty())
+    o.warnings.push_back("REV3_NET_PACE=" + pace + " is neither 0 nor 1; using 1 (pacing on)");
+  v = o.pace.t1_us;
+  ReadNumber(get_env, "REV3_NET_PACE_T1_US", 0, 100000, &v, &o.warnings);
+  o.pace.t1_us = static_cast<s32>(v);
+  v = o.pace.hard_max_us;
+  ReadNumber(get_env, "REV3_NET_PACE_HARD_MAX_US", 0, 300000, &v, &o.warnings);
+  o.pace.hard_max_us = static_cast<s32>(v);
+  v = o.pace.slice_us;
+  ReadNumber(get_env, "REV3_NET_PACE_SLICE_US", 100, 16000, &v, &o.warnings);
+  o.pace.slice_us = static_cast<s32>(v);
+  v = o.pace.gentle_max_permille;
+  ReadNumber(get_env, "REV3_NET_PACE_GENTLE_PERMILLE", 0, 100, &v, &o.warnings);
+  o.pace.gentle_max_permille = static_cast<s32>(v);
+  const std::string adapt = get_env("REV3_NET_MAXR_ADAPT");
+  if (adapt == "1")
+    o.maxr_adapt = true;
+  else if (!adapt.empty() && adapt != "0")
+    o.warnings.push_back("REV3_NET_MAXR_ADAPT=" + adapt + " is neither 0 nor 1; using 0");
+  v = o.maxr_budget_us;
+  ReadNumber(get_env, "REV3_NET_MAXR_BUDGET_US", 1000, 100000, &v, &o.warnings);
+  o.maxr_budget_us = static_cast<u32>(v);
   o.log_path = get_env("REV3_NET_LOG");
   o.stable_path = get_env("REV3_NET_STABLE");
   o.netsim = get_env("REV3_NETSIM");
@@ -406,6 +443,7 @@ Hello BuildHello(const HelloInputs& in, Role role, int delay)
                       in.wiimote_sources[4]));
   add("hook_code_crc", in.hook_crc_valid ? Fmt("0x%08X", in.hook_crc) : std::string("(not read)"));
   add("rollback", in.rollback ? "1" : "0");
+  add("maxr", Fmt("%d", in.max_rollback));
   add("gate", Fmt("arm=%u,quiet=%u", in.arm_calls, in.quiet_calls));
   add("stable_ranges", in.stable_crc != 0 ? Fmt("0x%08X", in.stable_crc) : std::string("none"));
   return h;

@@ -3838,6 +3838,7 @@ struct Module
   std::unique_ptr<FileLineWriter> pad_record;
   std::unique_ptr<FileLineWriter> trace;
   std::unique_ptr<DeterminismKit> kit;  // null = none of REV3_PAD_RECORD / REV3_PAD_SCRIPT / REV3_TRACE is usable
+  std::unique_ptr<Net::PaceActuator> pacer;  // a DolphinPacer; netplay runs only
   std::unique_ptr<Net::ResimHider> hider;  // a DolphinResimHider (defined further down); netplay runs only; hiding off when it goes
   std::unique_ptr<FileSink> net_sink;    // the net log (REV3_NET_LOG), netplay runs only
   std::unique_ptr<Net::NetModule> net;   // null = not a netplay run (or netplay unusable: the game then runs offline)
@@ -4287,6 +4288,26 @@ private:
   Core::System& m_system;
 };
 
+// Pacing delays (M5, REV3.md "Netplay (M5)"): the session asks this machine to lose a few milliseconds because it runs ahead of its peer.
+// CoreTimingManager::SleepAndResetThrottle sleeps and restarts the throttle clock, which is what makes the loss permanent (a bare sleep would
+// be made up by the next frames running unthrottled). Nothing to do while the limiter is off (unlimited speed, fast-forward, a hidden
+// resimulation): there is no schedule to be ahead of, and the throttle resets itself on every call then.
+class DolphinPacer final : public Net::PaceActuator
+{
+public:
+  explicit DolphinPacer(Core::System& system) : m_system(system) {}
+
+  void Delay(u32 microseconds) override
+  {
+    if (Core::GetIsThrottlerTempDisabled() || Config::Get(Config::MAIN_EMULATION_SPEED) <= 0.0f)
+      return;
+    m_system.GetCoreTiming().SleepAndResetThrottle(std::chrono::duration_cast<DT>(std::chrono::microseconds(microseconds)));
+  }
+
+private:
+  Core::System& m_system;
+};
+
 // REV3_NET_ROLE is set: a netplay run (REV3.md "Netplay (M3)"). SyncTest is off in this mode; the snapshot machinery (SyncTest's network
 // mode) is only built when REV3_NET_ROLLBACK=1. Everything that goes wrong is logged to the Rev3 log and the net log and the game then
 // runs offline (the reply echoes the pads).
@@ -4349,6 +4370,8 @@ void InitializeNet(Module& module, Core::System& system)
   env.hello = CollectHelloInputs(stable_crc);
   module.hider = std::make_unique<DolphinResimHider>(system);
   env.hider = module.hider.get();
+  module.pacer = std::make_unique<DolphinPacer>(system);
+  env.pacer = module.pacer.get();
   env.dump = module.dump.get();  // the session's wait loops mark the dump blocked: waiting for the peer is not a freeze
   module.net = std::make_unique<Net::NetModule>(options, env, *module.memory, module.hardware.get(), module.synctest.get(),
                                                 std::move(stable_ranges), log);
@@ -4455,6 +4478,7 @@ void Shutdown()
     module.net->Shutdown();  // BYE to the peer, SUMMARY, stats, network thread joined
     module.net.reset();
   }
+  module.pacer.reset();
   module.hider.reset();  // hiding off (a no-op when the session already restored it)
   // Freeze dump: stop the watchdog first (it may be waiting to pause the CPU), then dump once more while the guest memory is still
   // mapped (HW::Shutdown destroys the EXI devices before Memory::Shutdown; the DSP is already gone, the PPC state is still readable).

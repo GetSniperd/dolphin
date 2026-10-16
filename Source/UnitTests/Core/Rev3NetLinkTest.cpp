@@ -128,6 +128,105 @@ TEST(Rev3NetLink, ARepeatedPadIsNotASecondSample)
   EXPECT_EQ(host.Unacked(), 0u);
 }
 
+// ---- PadLink: M5 round trip while streaming, and the time offsets -------------------------------------------------------------------
+
+TEST(Rev3NetLink, TheRoundTripIsSampledWhileFramesStreamEvenThoughEveryPacketRepeatsTheUnackedPads)
+{
+  // ARMED: a packet per frame carries every pad that is not acked yet, so with a 20 ms round trip (more than a frame time) every pad goes out
+  // twice before its ack is back. The ack of a pad is still a clean sample of the FIRST send (only timer re-sends are ambiguous, Karn).
+  PadLink host(0), guest(1);
+  std::vector<std::pair<u64, std::vector<u8>>> acks;  // (arrival at the host, datagram)
+  for (s32 f = 0; f < 12; ++f)
+  {
+    const u64 t = static_cast<u64>(f) * 16683;
+    for (auto it = acks.begin(); it != acks.end();)
+    {
+      if (it->first <= t)
+      {
+        Deliver(host, it->second, it->first);
+        it = acks.erase(it);
+      }
+      else
+        ++it;
+    }
+    const std::vector<u8> packet = host.QueueLocal(f, P(static_cast<u8>(f)), -1, 0, t);
+    acks.emplace_back(t + 20000, Deliver(guest, packet, t + 10000));
+  }
+  EXPECT_EQ(host.RttUs(), 20000u);  // 20 ms every time
+  EXPECT_GE(host.AckedFrame(), 9);
+}
+
+TEST(Rev3NetLink, ATimerResendOfAPadIsNoSampleButTheNextFrameIsOne)
+{
+  PadLink host(0), guest(1);
+  const std::vector<u8> p0 = host.QueueLocal(0, P(1), -1, 0, 0);
+  const std::vector<u8> again = host.PollResend(30000);  // the packet (or its ack) was lost: the timer sends frame 0 again
+  ASSERT_FALSE(again.empty());
+  Deliver(host, Deliver(guest, again, 40000), 70000);
+  EXPECT_EQ(host.RttUs(), 0u);
+  const std::vector<u8> p1 = host.QueueLocal(1, P(2), -1, 0, 80000);
+  Deliver(host, Deliver(guest, p1, 90000), 100000);
+  EXPECT_EQ(host.RttUs(), 20000u);
+}
+
+namespace
+{
+// Two PadLinks and a wire with a fixed one-way delay, driven in time order.
+struct TwoLinks
+{
+  explicit TwoLinks(u64 one_way) : one_way_us(one_way) {}
+  void Send(int from, const std::vector<u8>& bytes, u64 now) { q.emplace(now + one_way_us, std::make_pair(1 - from, bytes)); }
+  void Run(u64 until)
+  {
+    while (!q.empty() && q.begin()->first <= until)
+    {
+      const u64 at = q.begin()->first;
+      const int to = q.begin()->second.first;
+      const std::vector<u8> bytes = q.begin()->second.second;
+      q.erase(q.begin());
+      std::vector<u8> reply;
+      EXPECT_TRUE(link[to].OnPacket(bytes.data(), bytes.size(), at, &reply));
+      if (!reply.empty())
+        Send(to, reply, at);
+    }
+  }
+  PadLink link[2] = {PadLink(0), PadLink(1)};
+  u64 one_way_us;
+  std::multimap<u64, std::pair<int, std::vector<u8>>> q;
+};
+}  // namespace
+
+TEST(Rev3NetLink, TimeOffsetsSayWhichSideSendsEarlier)
+{
+  // The host sends every frame 20 ms before the guest does (so it is 20 ms ahead); one way takes 30 ms, the round trip 60 ms.
+  TwoLinks net(30000);
+  s32 off = 0;
+  u32 n = 0;
+  for (s32 f = 0; f < 80; ++f)
+  {
+    const u64 host_t = static_cast<u64>(f) * 16683;
+    const u64 guest_t = host_t + 20000;
+    net.Run(host_t);
+    net.Send(0, net.link[0].QueueLocal(f, P(static_cast<u8>(f)), -1, 0, host_t), host_t);
+    if (f == 0)
+    {
+      EXPECT_FALSE(net.link[1].TimeOffsetUs(&off, &n));  // nothing received yet
+    }
+    net.Run(guest_t);
+    net.Send(1, net.link[1].QueueLocal(f, P(static_cast<u8>(f + 100)), -1, 0, guest_t), guest_t);
+  }
+  net.Run(80 * 16683 + 200000);
+  EXPECT_EQ(net.link[0].RttUs(), 60000u);
+  EXPECT_EQ(net.link[1].RttUs(), 60000u);
+  ASSERT_TRUE(net.link[0].TimeOffsetUs(&off, &n));
+  EXPECT_EQ(off, 20000);  // the host is ahead
+  EXPECT_EQ(n, 30u);      // the window holds the last 30 samples
+  ASSERT_TRUE(net.link[1].TimeOffsetUs(&off, &n));
+  EXPECT_EQ(off, -20000);  // the guest is behind
+  net.link[0].ResetTimeOffsets();
+  EXPECT_FALSE(net.link[0].TimeOffsetUs(&off, &n));
+}
+
 // ---- PadLink: loss, reordering, resend --------------------------------------------------------------------------------------------
 
 TEST(Rev3NetLink, ALostPacketIsFilledByTheNextOne)
@@ -513,6 +612,57 @@ TEST(Rev3NetLink, M4OptionsHaveDefaultsAndCanBeSet)
   EXPECT_EQ(o.warnings.size(), 2u);
 }
 
+TEST(Rev3NetLink, M5PacingOptionsHaveDefaultsAndCanBeSet)
+{
+  NetOptions o = ParseNetOptions(EnvOf({{"REV3_NET_ROLE", "host"}, {"REV3_NET_PEER", "1.2.3.4:5"}}));
+  ASSERT_TRUE(o.ok);
+  EXPECT_TRUE(o.pace.enabled);  // pacing is on unless switched off
+  EXPECT_EQ(o.pace.t1_us, 10000);
+  EXPECT_EQ(o.pace.hard_max_us, 5 * PACE_FRAME_US);
+  EXPECT_EQ(o.pace.slice_us, 4000);
+  EXPECT_EQ(o.pace.gentle_max_permille, 10);
+  EXPECT_FALSE(o.maxr_adapt);  // the adaptive MAXR is off unless switched on
+  EXPECT_EQ(o.maxr_budget_us, 14000u);
+  EXPECT_TRUE(o.warnings.empty());
+
+  o = ParseNetOptions(EnvOf({{"REV3_NET_ROLE", "guest"},
+                             {"REV3_NET_PEER", "1.2.3.4:5"},
+                             {"REV3_NET_PACE", "0"},
+                             {"REV3_NET_PACE_T1_US", "12000"},
+                             {"REV3_NET_PACE_HARD_MAX_US", "50000"},
+                             {"REV3_NET_PACE_SLICE_US", "2000"},
+                             {"REV3_NET_PACE_GENTLE_PERMILLE", "5"},
+                             {"REV3_NET_MAXR_ADAPT", "1"},
+                             {"REV3_NET_MAXR_BUDGET_US", "9000"},
+                             {"REV3_NET_ROLLBACK_MAX", "7"}}));
+  ASSERT_TRUE(o.ok);
+  EXPECT_FALSE(o.pace.enabled);
+  EXPECT_EQ(o.pace.t1_us, 12000);
+  EXPECT_EQ(o.pace.hard_max_us, 50000);
+  EXPECT_EQ(o.pace.slice_us, 2000);
+  EXPECT_EQ(o.pace.gentle_max_permille, 5);
+  EXPECT_TRUE(o.maxr_adapt);
+  EXPECT_EQ(o.maxr_budget_us, 9000u);
+  EXPECT_EQ(o.max_rollback, 7);  // MAXR up to 7 (Slippi's ROLLBACK_MAX_FRAMES)
+  EXPECT_TRUE(o.warnings.empty());
+
+  // Unusable values keep the default and say so; MAXR 8 is above the ceiling.
+  o = ParseNetOptions(EnvOf({{"REV3_NET_ROLE", "host"},
+                             {"REV3_NET_PEER", "1.2.3.4:5"},
+                             {"REV3_NET_PACE", "yes"},
+                             {"REV3_NET_PACE_SLICE_US", "0"},
+                             {"REV3_NET_MAXR_ADAPT", "2"},
+                             {"REV3_NET_MAXR_BUDGET_US", "5"},
+                             {"REV3_NET_ROLLBACK_MAX", "8"}}));
+  ASSERT_TRUE(o.ok);
+  EXPECT_TRUE(o.pace.enabled);
+  EXPECT_EQ(o.pace.slice_us, 4000);
+  EXPECT_FALSE(o.maxr_adapt);
+  EXPECT_EQ(o.maxr_budget_us, 14000u);
+  EXPECT_EQ(o.max_rollback, 5);
+  EXPECT_EQ(o.warnings.size(), 5u);
+}
+
 TEST(Rev3NetLink, BadRoleOrPeerIsRefusedWithAReason)
 {
   NetOptions o = ParseNetOptions(EnvOf({{"REV3_NET_ROLE", "spectator"}, {"REV3_NET_PEER", "1.2.3.4:5"}}));
@@ -554,7 +704,7 @@ TEST(Rev3NetLink, HelloCarriesTheListedItems)
   EXPECT_EQ(h.delay, 2u);
   std::map<std::string, std::string> items(h.items.begin(), h.items.end());
   for (const char* key : {"build", "cpu_core", "cpu_thread", "sync_gpu", "dsp", "rtc", "overclock", "mmu", "fast_disc_speed", "wiimotes",
-                          "hook_code_crc", "rollback", "gate", "stable_ranges"})
+                          "hook_code_crc", "rollback", "gate", "maxr", "stable_ranges"})
     EXPECT_EQ(items.count(key), 1u) << key;
   EXPECT_EQ(items["cpu_core"], "JIT64");
   EXPECT_EQ(items["cpu_thread"], "single");
@@ -565,6 +715,7 @@ TEST(Rev3NetLink, HelloCarriesTheListedItems)
   EXPECT_EQ(items["hook_code_crc"], "0xA1B2C3D4");
   EXPECT_EQ(items["rollback"], "0");
   EXPECT_EQ(items["gate"], "arm=600,quiet=60");
+  EXPECT_EQ(items["maxr"], "5");
   EXPECT_EQ(items["stable_ranges"], "none");
 }
 
@@ -598,6 +749,7 @@ TEST(Rev3NetLink, EachSettingThatCouldDivergeMakesTheHellosDisagree)
       {"hook_code_crc", [](HelloInputs* i) { i->hook_crc ^= 1; }},
       {"rollback", [](HelloInputs* i) { i->rollback = true; }},
       {"gate", [](HelloInputs* i) { i->arm_calls = 601; }},
+      {"maxr", [](HelloInputs* i) { i->max_rollback = 6; }},  // M5: the gate close is scheduled MAXR + 1 frames on, so both sides must use the same MAXR
       {"stable_ranges", [](HelloInputs* i) { i->stable_crc = 0x1234; }},
   };
   for (const Case& c : cases)

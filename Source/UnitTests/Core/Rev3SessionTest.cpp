@@ -296,6 +296,17 @@ public:
   u64 Now() const override { return now_us; }
   ConnState State() const override { return state; }
   void Pump() override { ++pumps; }
+  // M5: what the real transport's TimeSync would report (off until has_offset), and how often the session asked to forget the samples.
+  bool TimeOffsetUs(s32* out, u32* samples) const override
+  {
+    if (!has_offset)
+      return false;
+    *out = offset_us;
+    *samples = offset_samples;
+    return true;
+  }
+  void ResetTimeOffsets() override { ++offset_resets; }
+  u64 RttUs() const override { return rtt_us; }
 
   void Deliver(s32 frame, const Pad8& pad)
   {
@@ -328,6 +339,11 @@ public:
   u64 now_us = 0;
   ConnState state = ConnState::Connected;
   int pumps = 0;
+  bool has_offset = false;
+  s32 offset_us = 0;         // microseconds; positive = the local machine is ahead of the peer
+  u32 offset_samples = 30;
+  u64 rtt_us = 0;            // 0 = no RTT estimate yet
+  int offset_resets = 0;
 };
 
 Gate Open()
@@ -381,6 +397,13 @@ struct Rig
     cfg.hello.game_id = "RNEEDA";
     cfg.hello.items = {{"cpu_core", "JIT64"}, {"dsp", "HLE"}};
     wait = [](const std::function<bool()>& pred, u32) { return pred(); };
+    session = std::make_unique<RollbackSession>(
+        cfg, net, store, sink, [this](const std::function<bool()>& pred, u32 timeout) { return wait(pred, timeout); });
+  }
+
+  // A new session with the (changed) cfg; the old one is dropped.
+  void Rebuild()
+  {
     session = std::make_unique<RollbackSession>(
         cfg, net, store, sink, [this](const std::function<bool()>& pred, u32 timeout) { return wait(pred, timeout); });
   }
@@ -1958,6 +1981,471 @@ TEST(Rev3Session, SummaryCarriesTheM4Counters)
     EXPECT_TRUE(rig.sink.Has(key)) << key;
 }
 
+// ---- M5: pacing policy, time offsets, stall run, resimulation cost, adaptive MAXR ----------------------------------------------
+
+class RecordingPacer final : public PaceActuator
+{
+public:
+  void Delay(u32 microseconds) override
+  {
+    delays.push_back(microseconds);
+    total += microseconds;
+  }
+  std::vector<u32> delays;
+  u64 total = 0;
+};
+
+// `n` ARMED calls with every remote pad in time and equal to the one the lockstep ended with: no prediction, no rollback, no stall.
+void ArmedFrames(Rig& rig, s32 n)
+{
+  const Pad8 same = RemotePadScript(9);
+  for (s32 i = 0; i < n; ++i)
+  {
+    rig.net.Deliver(rig.counter, same);
+    rig.Frame(LocalPad(rig.counter), Open());
+    rig.net.now_us += 16683;
+  }
+}
+
+// One rollback of `depth` frames whose resimulation takes `cost_us` of (test) time; afterwards every pad is in and the next call is a fresh one.
+void RollbackOf(Rig& rig, s32 depth, u64 cost_us, int tag)
+{
+  const s32 c = rig.counter;
+  for (s32 i = 0; i < depth; ++i)
+    rig.Frame(LocalPad(rig.counter), Open());  // c .. c+depth-1, predicted
+  const Pad8 wrong = P(static_cast<u8>(0x90 + tag % 100), static_cast<u8>(tag), static_cast<u8>(tag >> 8));
+  for (s32 f = c; f < c + depth; ++f)
+    rig.net.Deliver(f, wrong);
+  Reply r;
+  ASSERT_TRUE(rig.TryFrame(LocalPad(rig.counter), Open(), &r));  // the call that finds frame c wrong
+  ASSERT_EQ(r.flags, REPLY_FLAG_RESTORED);
+  for (s32 i = 0; i < depth; ++i)
+  {
+    if (i == depth - 1)
+      rig.net.now_us += cost_us;
+    rig.Frame(P(0xFF, 0xFF), Open());
+  }
+  rig.net.Deliver(c + depth, wrong);  // the frame the rollback call re-ran was predicted with `wrong` already
+}
+
+TEST(Rev3Session, DecidePaceHardInTheFirst120FramesThenGentle)
+{
+  const PaceConfig c;
+  // Hard: ahead by more than t1 (10 ms) loses the excess over hard_target (5 ms), at most hard_max (5 frames).
+  EXPECT_STREQ(DecidePace(c, 30, 9000).action, "none");
+  EXPECT_STREQ(DecidePace(c, 30, 10000).action, "none");
+  EXPECT_STREQ(DecidePace(c, 30, 10001).action, "hard");
+  EXPECT_EQ(DecidePace(c, 30, 10001).delay_us, 5001);
+  EXPECT_EQ(DecidePace(c, 30, 40000).delay_us, 35000);
+  EXPECT_EQ(DecidePace(c, 30, 1000000).delay_us, 5 * PACE_FRAME_US);
+  EXPECT_STREQ(DecidePace(c, 30, -10001).action, "behind");
+  EXPECT_EQ(DecidePace(c, 30, -1000000).delay_us, 0);  // behind: nothing here, the peer slows
+  EXPECT_STREQ(DecidePace(c, 30, -10000).action, "none");
+  // The 120th frame after the gate is still hard, the 121st is gentle.
+  EXPECT_STREQ(DecidePace(c, 120, 40000).action, "hard");
+  EXPECT_STREQ(DecidePace(c, 121, 40000).action, "gentle");
+  // Gentle: nothing inside the dead band (8 ms), then proportional up to 1 % of the interval at a lead of 3 frames and beyond.
+  EXPECT_STREQ(DecidePace(c, 121, 8000).action, "none");
+  EXPECT_STREQ(DecidePace(c, 121, 8001).action, "gentle");
+  EXPECT_GE(DecidePace(c, 121, 8001).delay_us, 799);
+  EXPECT_LE(DecidePace(c, 121, 8001).delay_us, 801);
+  EXPECT_EQ(DecidePace(c, 500, 50000).delay_us, 5000);
+  const s32 most = DecidePace(c, 500, 50049).delay_us;
+  EXPECT_EQ(DecidePace(c, 500, 1000000).delay_us, most);
+  EXPECT_LE(most, c.interval_frames * PACE_FRAME_US / 100);  // never more than 1 % of an interval
+  EXPECT_STREQ(DecidePace(c, 500, -8001).action, "behind");
+  EXPECT_STREQ(DecidePace(c, 500, -8000).action, "none");
+  // A hard correction is bounded by one hard_max however large the offset is.
+  for (s32 off : {20000, 60000, 200000, 60000000})
+    EXPECT_LE(DecidePace(c, 10, off).delay_us, c.hard_max_us);
+}
+
+TEST(Rev3Session, TimeSyncUsesTheSendTimeOfTheSameFrameAndAveragesTheMiddleThird)
+{
+  TimeSync t;
+  s32 off = 0;
+  EXPECT_FALSE(t.OffsetUs(&off));
+  constexpr u64 RTT = 40000;
+  // The peer sends every frame 20 ms later than we do; its pad arrives half an RTT after it was sent.
+  for (s32 f = 0; f < 30; ++f)
+  {
+    const u64 sent = 100000 + static_cast<u64>(f) * 16683;
+    t.OnLocalSend(f, sent);
+    t.OnRemote(f, sent + 20000 + RTT / 2, RTT);
+  }
+  u32 n = 0;
+  ASSERT_TRUE(t.OffsetUs(&off, &n));
+  EXPECT_EQ(off, 20000);
+  EXPECT_EQ(n, 30u);
+  // The same frame arriving again (a re-send) or an older one is no sample.
+  t.OnRemote(29, 900000, RTT);
+  t.OnRemote(3, 900000, RTT);
+  EXPECT_EQ(t.Samples(), 30u);
+  t.Reset();
+  EXPECT_EQ(t.Samples(), 0u);
+  EXPECT_FALSE(t.OffsetUs(&off));
+}
+
+TEST(Rev3Session, TimeSyncDropsJitterSpikesAtBothEnds)
+{
+  TimeSync t;
+  constexpr u64 RTT = 40000;
+  // 10 samples at +5 ms, 10 spikes of +1 s (a late re-send) and 10 of -1 s: the middle third is the 5 ms ones.
+  for (s32 f = 0; f < 30; ++f)
+  {
+    const u64 sent = 5000000 + static_cast<u64>(f) * 16683;
+    const s64 delta = f % 3 == 0 ? 5000 : (f % 3 == 1 ? 1000000 : -1000000);
+    t.OnLocalSend(f, sent);
+    t.OnRemote(f, static_cast<u64>(static_cast<s64>(sent) + delta + static_cast<s64>(RTT / 2)), RTT);
+  }
+  s32 off = 0;
+  ASSERT_TRUE(t.OffsetUs(&off));
+  EXPECT_EQ(off, 5000);
+}
+
+TEST(Rev3Session, TimeSyncNeedsAnRttAndALocalSendAndFallsBackToSlippisFormulaForFramesNotSentYet)
+{
+  TimeSync t;
+  s32 off = 0;
+  t.OnRemote(0, 50000, 20000);  // we have not sent anything yet
+  EXPECT_FALSE(t.OffsetUs(&off));
+  t.OnLocalSend(0, 1000);
+  t.OnRemote(1, 60000, 0);  // no RTT estimate: the arrival time would be wrong by RTT/2, so it is not a sample
+  EXPECT_FALSE(t.OffsetUs(&off));
+  // Frames 0..2 went out at 0, 1 and 2 frame times after 100 ms; the peer's frame 5 arrives at 200 ms (RTT 20 ms): we have not sent frame 5.
+  TimeSync u;
+  for (s32 f = 0; f <= 2; ++f)
+    u.OnLocalSend(f, 100000 + static_cast<u64>(f) * PACE_FRAME_US);
+  u.OnRemote(5, 200000, 20000);
+  ASSERT_TRUE(u.OffsetUs(&off));
+  // Slippi: (now - rtt/2) - newest_send + frame_time * (our newest - their frame) = 190000 - 133366 - 3 * 16683 = 6585.
+  EXPECT_EQ(off, 190000 - (100000 + 2 * PACE_FRAME_US) - 3 * PACE_FRAME_US);
+}
+
+TEST(Rev3Session, AnAheadMachineDelaysItselfInSlicesAfterEveryThirtiethArmedFrameAndForgetsTheSamples)
+{
+  Rig rig(Role::Host, 0, 5);
+  RecordingPacer pacer;
+  rig.session->SetPaceActuator(&pacer);
+  rig.net.has_offset = true;
+  rig.net.offset_us = 40000;  // 2.4 frames ahead
+  rig.net.rtt_us = 100000;
+  rig.ReadyToArm(10);
+  ArmedFrames(rig, 30);  // calls 10..39: no check yet (the first one is a full interval after arming)
+  EXPECT_TRUE(pacer.delays.empty());
+  EXPECT_EQ(rig.session->stats().pace_checks, 0u);
+  EXPECT_EQ(rig.net.offset_resets, 1);  // arming forgot the lockstep samples
+  ArmedFrames(rig, 1);  // call 40: the check; its first slice goes out with it
+  EXPECT_EQ(rig.session->stats().pace_checks, 1u);
+  ASSERT_EQ(pacer.delays.size(), 1u);
+  EXPECT_EQ(pacer.delays[0], 4000u);
+  EXPECT_TRUE(rig.sink.Has("PACE frame=40 since_gate=30 offset_us=40000 adv=2.40 rtt_ms=100.0 samples=30 action=hard sleep_us=35000"));
+  ArmedFrames(rig, 8);  // the rest: 7 more slices of 4000 and a last one of 3000
+  ASSERT_EQ(pacer.delays.size(), 9u);
+  for (size_t i = 0; i + 1 < pacer.delays.size(); ++i)
+    EXPECT_EQ(pacer.delays[i], 4000u);
+  EXPECT_EQ(pacer.delays.back(), 3000u);
+  EXPECT_EQ(pacer.total, 35000u);
+  EXPECT_EQ(rig.net.offset_resets, 2);  // after the last slice
+  ArmedFrames(rig, 20);                 // calls 49..68: next check is at 70
+  EXPECT_EQ(pacer.delays.size(), 9u);
+  EXPECT_EQ(rig.session->stats().pace_slowdowns, 1u);
+  EXPECT_EQ(rig.session->stats().pace_sleep_us_total, 35000u);
+}
+
+TEST(Rev3Session, PacingTurnsGentleAfter120FramesAndNeverAsksForMoreThanASlicePerCall)
+{
+  Rig rig(Role::Host, 0, 5);
+  RecordingPacer pacer;
+  rig.session->SetPaceActuator(&pacer);
+  rig.net.has_offset = true;
+  rig.net.offset_us = 50000;
+  rig.net.rtt_us = 100000;
+  rig.ReadyToArm(10);
+  ArmedFrames(rig, 160 - 10 + 12);  // calls 10..161: checks at 40, 70, 100, 130 (since_gate 120: still hard) and 160 (gentle)
+  EXPECT_EQ(rig.session->stats().pace_checks, 5u);
+  EXPECT_TRUE(rig.sink.Has("PACE frame=130 since_gate=120 offset_us=50000 adv=3.00 rtt_ms=100.0 samples=30 action=hard sleep_us=45000"));
+  EXPECT_TRUE(rig.sink.Has("PACE frame=160 since_gate=150 offset_us=50000 adv=3.00 rtt_ms=100.0 samples=30 action=gentle sleep_us=5000"));
+  EXPECT_EQ(pacer.total, 4u * 45000u + 5000u);
+  for (u32 d : pacer.delays)
+    EXPECT_LE(d, 4000u);
+}
+
+TEST(Rev3Session, AMachineThatIsBehindOrOnTimeIsNeverDelayed)
+{
+  for (s32 offset : {-40000, -9000, 0, 6000, 8000})
+  {
+    Rig rig(Role::Host, 0, 5);
+    RecordingPacer pacer;
+    rig.session->SetPaceActuator(&pacer);
+    rig.net.has_offset = true;
+    rig.net.offset_us = offset;
+    rig.net.rtt_us = 100000;
+    rig.ReadyToArm(10);
+    ArmedFrames(rig, 200);
+    EXPECT_GE(rig.session->stats().pace_checks, 5u) << offset;
+    EXPECT_TRUE(pacer.delays.empty()) << offset;
+    EXPECT_EQ(rig.net.offset_resets, 1) << offset;  // only the arming one: no correction, so the samples are kept
+    EXPECT_TRUE(rig.sink.Has(offset < -10000 ? "action=behind sleep_us=0" : "action=none sleep_us=0")) << offset;
+  }
+}
+
+TEST(Rev3Session, PacingOffMeasuresAndLogsWhatItWouldHaveDone)
+{
+  Rig rig(Role::Host, 0, 5);
+  rig.cfg.pace.enabled = false;
+  rig.Rebuild();
+  RecordingPacer pacer;
+  rig.session->SetPaceActuator(&pacer);
+  rig.net.has_offset = true;
+  rig.net.offset_us = 40000;
+  rig.net.rtt_us = 100000;
+  rig.ReadyToArm(10);
+  ArmedFrames(rig, 100);
+  EXPECT_TRUE(pacer.delays.empty());
+  EXPECT_EQ(rig.session->stats().pace_slowdowns, 0u);
+  EXPECT_EQ(rig.session->stats().pace_sleep_us_total, 0u);
+  EXPECT_GE(rig.session->stats().pace_checks, 3u);
+  EXPECT_TRUE(rig.sink.Has("action=off sleep_us=0 would=hard:35000"));
+  EXPECT_EQ(rig.net.offset_resets, 1);
+  rig.session->Finish();
+  EXPECT_TRUE(rig.sink.Has("pace=off pace_checks="));
+}
+
+TEST(Rev3Session, NoCheckWithoutAnRttOrEnoughSamplesAndNothingInLockstep)
+{
+  Rig rig(Role::Host, 0, 5);
+  RecordingPacer pacer;
+  rig.session->SetPaceActuator(&pacer);
+  rig.net.has_offset = true;
+  rig.net.offset_us = 40000;
+  rig.Handshake();
+  rig.Lockstep(100);  // LOCKSTEP: pacing never runs, whatever the transport says
+  EXPECT_TRUE(rig.session->mode() == Mode::LOCKSTEP);
+  rig.net.rtt_us = 100000;
+  rig.Lockstep(100);
+  EXPECT_EQ(rig.session->stats().pace_checks, 0u);
+  EXPECT_TRUE(pacer.delays.empty());
+  EXPECT_EQ(rig.sink.Count("PACE "), 0u);
+
+  rig.PeerStartCheck();
+  rig.net.rtt_us = 0;  // armed, but no RTT estimate: no decision (the offset subtracts RTT/2)
+  ArmedFrames(rig, 80);
+  EXPECT_EQ(rig.session->stats().pace_checks, 0u);
+  rig.net.rtt_us = 100000;
+  rig.net.offset_samples = 14;  // too few samples
+  ArmedFrames(rig, 40);
+  EXPECT_EQ(rig.session->stats().pace_checks, 0u);
+  rig.net.offset_samples = 15;
+  ArmedFrames(rig, 1);  // due since long: decided on the next call
+  EXPECT_EQ(rig.session->stats().pace_checks, 1u);
+  EXPECT_EQ(pacer.delays.size(), 1u);
+}
+
+TEST(Rev3Session, WithoutAnActuatorPacingOnlyMeasuresAndSaysSoOnce)
+{
+  Rig rig(Role::Host, 0, 5);  // no actuator set
+  rig.net.has_offset = true;
+  rig.net.offset_us = 40000;
+  rig.net.rtt_us = 100000;
+  rig.ReadyToArm(10);
+  ArmedFrames(rig, 100);
+  EXPECT_EQ(rig.session->stats().pace_slowdowns, 0u);
+  EXPECT_TRUE(rig.sink.Has("NOTE pacing has no actuator"));
+  EXPECT_EQ(rig.sink.Count("NOTE pacing has no actuator"), 1u);
+}
+
+TEST(Rev3Session, PaceLogLinesAreBoundedAndSummaryCarriesThePaceCounters)
+{
+  Rig rig(Role::Host, 0, 5);
+  rig.net.has_offset = true;
+  rig.net.offset_us = 1000;
+  rig.net.rtt_us = 100000;
+  RecordingPacer pacer;
+  rig.session->SetPaceActuator(&pacer);
+  rig.ReadyToArm(10);
+  ArmedFrames(rig, 6000);  // ~199 checks
+  const SessionStats& st = rig.session->stats();
+  EXPECT_GT(st.pace_checks, 150u);
+  const size_t lines = rig.sink.Count("PACE frame=");
+  EXPECT_LE(lines, PACE_LOG_FULL_LINES + st.pace_checks / PACE_LOG_EVERY + 1);
+  EXPECT_EQ(lines + st.pace_lines_left_out, st.pace_checks);
+  rig.session->Finish();
+  for (const char* key : {"pace=on", "pace_checks=", "pace_slowdowns=0", "pace_sleep_ms_total=0.0", "adv_mean=0.06", "adv_max=0.06", "adv_min=0.06",
+                          "stall_run_max=0", "resim_n=0", "resim_ms_p50=0.00", "resim_ms_p95=0.00", "maxr_eff=5", "maxr_changes=0"})
+    EXPECT_TRUE(rig.sink.Has(key)) << key;
+}
+
+TEST(Rev3Session, ARunOf420StalledCallsThatTakeAWholeFrameEachEndsTheSession)
+{
+  Rig rig(Role::Host, 0, 2);
+  rig.ReadyToArm(10);
+  const Pad8 same = RemotePadScript(9);
+  rig.Frame(LocalPad(10), Open());  // predicted 1 and 2 frames: allowed
+  rig.Frame(LocalPad(11), Open());
+  s32 next_pad = 10;
+  u32 stalls = 0;
+  while (rig.session->mode() == Mode::ARMED && stalls < 600)
+  {
+    if (rig.TryFrame(LocalPad(rig.counter), Open()))
+      continue;
+    ++stalls;
+    rig.net.now_us += 20000;  // a 20 ms wait: more than a frame time
+    rig.net.Deliver(next_pad++, same);
+    EXPECT_TRUE(rig.session->BlockSatisfied());
+  }
+  EXPECT_TRUE(rig.session->mode() == Mode::OFFLINE);
+  EXPECT_EQ(stalls, 420u);
+  EXPECT_TRUE(rig.sink.Has("stall: 420 consecutive stalled frames, 8.4 s of waiting for the peer"));
+  EXPECT_EQ(rig.net.CountOut(MsgType::Bye), 1u);
+}
+
+TEST(Rev3Session, ShortStallsAndInterruptedRunsDoNotEndTheSession)
+{
+  Rig rig(Role::Host, 0, 2);
+  rig.ReadyToArm(10);
+  const Pad8 same = RemotePadScript(9);
+  rig.Frame(LocalPad(10), Open());
+  rig.Frame(LocalPad(11), Open());
+  s32 next_pad = 10;
+  const auto stall_once = [&](u64 wait_us) {
+    for (int guard = 0; rig.TryFrame(LocalPad(rig.counter), Open()); ++guard)  // calls that do not stall (pads ahead) reset the run
+      ASSERT_LT(guard, 100) << "the session never stalled (mode " << ModeName(rig.session->mode()) << ")";
+    rig.net.now_us += wait_us;
+    rig.net.Deliver(next_pad++, same);
+    ASSERT_TRUE(rig.session->BlockSatisfied());
+    ASSERT_TRUE(rig.TryFrame(LocalPad(rig.counter), Open()));
+  };
+  // 500 stalls of 5 ms: a slow link, but 2.5 s is not 7 s of waiting.
+  for (int i = 0; i < 500; ++i)
+    stall_once(5000);
+  EXPECT_TRUE(rig.session->mode() == Mode::ARMED);
+  EXPECT_EQ(rig.session->stats().stalls, 500u);
+  // 300 stalls of 20 ms, calls that do not stall (the peer's pads are ahead), 300 more: never 420 in a row.
+  for (int i = 0; i < 6; ++i)
+    rig.net.Deliver(next_pad++, same);
+  for (int i = 0; i < 300; ++i)
+    stall_once(20000);
+  for (int i = 0; i < 6; ++i)
+    rig.net.Deliver(next_pad++, same);
+  for (int i = 0; i < 300; ++i)
+    stall_once(20000);
+  EXPECT_TRUE(rig.session->mode() == Mode::ARMED);
+  EXPECT_FALSE(rig.sink.Has("consecutive stalled frames"));
+  EXPECT_GE(rig.session->stats().stall_run_max, 300u);
+}
+
+TEST(Rev3Session, ClosingTheWindowWhileArmedSendsAClearByeAndThePeersLogNamesTheReason)
+{
+  Rig a(Role::Host, 0, 5);
+  a.ReadyToArm(10);
+  ArmedFrames(a, 5);
+  EXPECT_TRUE(a.session->mode() == Mode::ARMED);
+  a.session->Abort("the emulator was closed");  // what the glue calls when the window closes while a wait (or a frame) is running
+  EXPECT_TRUE(a.session->mode() == Mode::OFFLINE);
+  ASSERT_EQ(a.net.CountOut(MsgType::Bye), 1u);
+  const Message* bye = a.net.LastOut(MsgType::Bye);
+  ASSERT_TRUE(bye != nullptr);
+  EXPECT_EQ(std::string(bye->bytes.begin(), bye->bytes.end()), "the emulator was closed");
+  EXPECT_TRUE(a.sink.Has("LEAVE frame="));
+  EXPECT_TRUE(a.sink.Has("reason=the emulator was closed"));
+  EXPECT_TRUE(a.sink.Has("SUMMARY "));  // the SUMMARY is written on the way out
+
+  // The peer: it gets the BYE while it waits for a pad that will never come, logs why, leaves, and the game goes on offline.
+  Rig b(Role::Guest, 0, 5);
+  b.ReadyToArm(10);
+  ArmedFrames(b, 3);
+  b.net.inbox.push_back(*bye);
+  Reply r;
+  EXPECT_TRUE(b.session->Step(b.Cmd(b.counter, LocalPad(b.counter)), Open(), &r));
+  EXPECT_TRUE(b.session->mode() == Mode::OFFLINE);
+  EXPECT_TRUE(b.sink.Has("BYE from the peer: the emulator was closed"));
+  EXPECT_TRUE(b.sink.Has("reason=the peer left (the emulator was closed)"));
+  EXPECT_EQ(b.net.CountOut(MsgType::Bye), 0u);  // no echo
+  EXPECT_TRUE(b.session->Step(b.Cmd(b.counter + 1, LocalPad(b.counter + 1)), Open(), &r));  // offline: pass-through, never blocks
+}
+
+TEST(Rev3Session, ResimulationCostIsMeasuredPerRollbackAndSummarisedAsPercentiles)
+{
+  Rig rig(Role::Host, 0, 5);
+  rig.ReadyToArm(10);
+  for (int k = 1; k <= 20; ++k)
+    RollbackOf(rig, 1, static_cast<u64>(k) * 1000, k);
+  EXPECT_EQ(rig.session->stats().rollbacks, 20u);
+  EXPECT_EQ(rig.session->stats().resim_costs, 20u);
+  u32 v = 0;
+  ASSERT_TRUE(rig.session->ResimCostPercentileUs(50, &v));
+  EXPECT_EQ(v, 10000u);
+  ASSERT_TRUE(rig.session->ResimCostPercentileUs(95, &v));
+  EXPECT_EQ(v, 19000u);
+  ASSERT_TRUE(rig.session->ResimCostPercentileUs(100, &v));
+  EXPECT_EQ(v, 20000u);
+  rig.session->Finish();
+  EXPECT_TRUE(rig.sink.Has("resim_n=20 resim_skipped=0 resim_ms_p50=10.00 resim_ms_p95=19.00 resim_ms_max=20.00"));
+}
+
+TEST(Rev3Session, WithoutTheSwitchMaxrNeverAdaptsHoweverSlowTheResimulationIs)
+{
+  Rig rig(Role::Host, 0, 5);
+  rig.ReadyToArm(10);
+  for (int k = 1; k <= 30; ++k)
+    RollbackOf(rig, 2, 60000, k);
+  EXPECT_EQ(rig.session->maxr_eff(), 5);
+  EXPECT_EQ(rig.session->stats().maxr_changes, 0u);
+  EXPECT_FALSE(rig.sink.Has("MAXR eff"));
+}
+
+TEST(Rev3Session, AdaptiveMaxrDropsToTheLargestKWhoseP95CostFitsTheBudgetAndOnlyChangesTheStallRule)
+{
+  Rig rig(Role::Host, 0, 5);
+  rig.cfg.maxr_adapt = true;
+  rig.cfg.maxr_budget_us = 14000;
+  rig.Rebuild();
+  rig.ReadyToArm(10);
+  // Depth 2 rollbacks that cost 20 ms: 10 ms per frame, so one frame fits the 14 ms budget and two do not. The first change comes with the
+  // 8th measured rollback.
+  for (int k = 1; k <= 7; ++k)
+    RollbackOf(rig, 2, 20000, k);
+  EXPECT_EQ(rig.session->maxr_eff(), 5);
+  RollbackOf(rig, 2, 20000, 8);
+  EXPECT_EQ(rig.session->maxr_eff(), 1);
+  EXPECT_EQ(rig.session->stats().maxr_changes, 1u);
+  EXPECT_EQ(rig.session->stats().maxr_eff_min, 1);
+  EXPECT_TRUE(rig.sink.Has("MAXR eff 5 -> 1 (p95 resimulation cost 10.00 ms per frame, budget 14.0 ms, configured 5, 8 rollbacks measured)"));
+  // The stall rule now allows one predicted frame; the configured MAXR (which the gate close and the HELLO use) is untouched: only the stall rule moved.
+  EXPECT_TRUE(rig.TryFrame(LocalPad(rig.counter), Open()));   // predicted 1
+  EXPECT_FALSE(rig.TryFrame(LocalPad(rig.counter), Open()));  // predicted 2 > 1
+  EXPECT_TRUE(rig.sink.Has("maxr=1"));
+}
+
+TEST(Rev3Session, AdaptiveMaxrComesBackOneStepAtATimeWhenResimulationGetsCheapAgainAndNeverPassesTheConfiguredValue)
+{
+  Rig rig(Role::Host, 0, 5);
+  rig.cfg.maxr_adapt = true;
+  rig.Rebuild();
+  rig.ReadyToArm(10);
+  for (int k = 1; k <= 8; ++k)
+    RollbackOf(rig, 1, 40000, k);  // 40 ms per frame: K = 1 (never below 1)
+  ASSERT_EQ(rig.session->maxr_eff(), 1);
+  int last = 1;
+  int steps = 0;
+  for (int k = 9; k < 400 && rig.session->maxr_eff() < 5; ++k)
+  {
+    RollbackOf(rig, 1, 2000, k);  // 2 ms per frame: K = 7 -> capped at the configured 5
+    const int now = rig.session->maxr_eff();
+    EXPECT_LE(now - last, 1);
+    EXPECT_GE(now, last);
+    steps += now - last;
+    last = now;
+  }
+  EXPECT_EQ(rig.session->maxr_eff(), 5);
+  EXPECT_EQ(steps, 4);
+  for (int k = 500; k < 540; ++k)
+    RollbackOf(rig, 1, 1000, k);
+  EXPECT_EQ(rig.session->maxr_eff(), 5);
+  EXPECT_EQ(rig.session->stats().maxr_changes, 5u);
+}
+
 // ---- checksums -------------------------------------------------------------------------------------------------------------------
 
 TEST(Rev3Session, LockstepChecksumsGoOutEvery30FramesAndMatchingOnesLogChk)
@@ -2180,22 +2668,32 @@ public:
   u64 Now() const override;
   ConnState State() const override;
   void Pump() override { Tick(); }
+  // M5: the same TimeSync as the real transport (PadLink), and an ack based RTT like PadLink's (first send of the acked frame, EWMA 7/8).
+  bool TimeOffsetUs(s32* out, u32* samples) const override { return m_time.OffsetUs(out, samples); }
+  void ResetTimeOffsets() override { m_time.Reset(); }
+  u64 RttUs() const override { return m_rtt_us; }
+  std::map<s32, u64> send_log;  // exploration: when each local frame went out
 
   void Tick();
   void OnPadPacket(const PadPacket& packet);
-  void OnAck(s32 frame)
-  {
-    while (!m_unacked.empty() && m_unacked.front().first <= frame)
-      m_unacked.pop_front();
-  }
+  void OnAck(s32 frame);
   void OnReliable(const Message& m) { m_inbox.push_back(m); }
 
 private:
-  void Transmit();
+  void Transmit(bool timer_resend = false);
 
   SimNet* net;
   int me;
   std::deque<std::pair<s32, Pad8>> m_unacked;  // ascending
+  struct SendInfo
+  {
+    u64 first_us = 0;
+    u32 sent = 0;
+    bool timer_resent = false;  // re-sent by the timer: the ack cannot be matched to one send
+  };
+  std::map<s32, SendInfo> m_send_info;  // unacked frames
+  TimeSync m_time;
+  u64 m_rtt_us = 0;
   s32 m_chk_frame = -1;
   u32 m_chk = 0;
   u64 m_last_send_us = 0;
@@ -2292,8 +2790,24 @@ void SimEndpoint::SendReliable(MsgType type, const std::vector<u8>& bytes)
 {
   net->PostReliable(me, Message{type, bytes});
 }
+void SimEndpoint::OnAck(s32 frame)
+{
+  const auto info = m_send_info.find(frame);
+  if (info != m_send_info.end() && !info->second.timer_resent && net->now >= info->second.first_us)
+  {
+    const u64 sample = net->now - info->second.first_us;
+    m_rtt_us = m_rtt_us == 0 ? sample : (7 * m_rtt_us + sample) / 8;
+  }
+  while (!m_unacked.empty() && m_unacked.front().first <= frame)
+  {
+    m_send_info.erase(m_unacked.front().first);
+    m_unacked.pop_front();
+  }
+}
 void SimEndpoint::SendLocal(s32 frame, const Pad8& pad, s32 checksum_frame, u32 checksum)
 {
+  m_time.OnLocalSend(frame, net->now);
+  send_log[frame] = net->now;
   m_unacked.emplace_back(frame, pad);
   while (m_unacked.size() > 128)
     m_unacked.pop_front();
@@ -2301,11 +2815,19 @@ void SimEndpoint::SendLocal(s32 frame, const Pad8& pad, s32 checksum_frame, u32 
   m_chk = checksum;
   Transmit();
 }
-void SimEndpoint::Transmit()
+void SimEndpoint::Transmit(bool timer_resend)
 {
   PadPacket p;
   for (size_t i = m_unacked.size(); i > 0; --i)
+  {
     p.pads.push_back(m_unacked[i - 1]);
+    SendInfo& info = m_send_info[m_unacked[i - 1].first];
+    if (info.sent == 0)
+      info.first_us = net->now;
+    ++info.sent;
+    if (timer_resend)
+      info.timer_resent = true;
+  }
   p.chk_frame = m_chk_frame;
   p.chk = m_chk;
   m_last_send_us = net->now;
@@ -2314,12 +2836,13 @@ void SimEndpoint::Transmit()
 void SimEndpoint::Tick()
 {
   if (!m_unacked.empty() && net->now >= m_last_send_us + net->params.resend_us)
-    Transmit();
+    Transmit(true);
 }
 void SimEndpoint::OnPadPacket(const PadPacket& packet)
 {
   if (packet.pads.empty())
     return;
+  m_time.OnRemote(packet.pads.front().first, net->now, m_rtt_us);
   for (const auto& fp : packet.pads)
     m_got.emplace(fp.first, fp.second);
   while (m_got.count(m_contig + 1) != 0)
@@ -2340,6 +2863,7 @@ struct SimParams
   s32 close_at = 270;                  // closes for good: the last frames run in lockstep so the end states are exact
   s32 mid_close = -1, mid_reopen = -1; // optional close / reopen in the middle
   u32 change_pct = 15;                 // chance per frame that a player's pad changes (otherwise a prediction is right)
+  s32 guest_change_pct = -1;           // >= 0: the guest's pad changes at this rate instead (0: it never moves, so the HOST never rolls back: D's loopback)
   bool busy_hardware = false;          // each machine independently reports "hardware busy" on ~10% of its calls, and in bursts (HOLD)
   u32 lost_mod = 0;                    // != 0: a fighter is "at health 0" when (state word 0 >> 5) % lost_mod == 0, a function of the LIVE state:
                                        // a mispredicted timeline can show it where the real one does not (0 = only the frame windows below)
@@ -2347,6 +2871,18 @@ struct SimParams
   u64 period_us[2] = {16667, 16700};   // each machine's frame period (clock drift)
   u64 start_us[2] = {0, 0};
   s32 bug_frame = -1;                  // machine 1's game has a rules difference at this frame (a desync)
+  // M5. Dolphin's throttle: a machine that is late (it waited for the peer) catches up by running the next frames without sleeping, until it is
+  // back on its schedule or MAIN_MAX_FALLBACK behind it. Without this the simulated stalls shift the machine's phase for free and the skew that
+  // pacing is about cannot exist (the older tests keep the simple model: next call = this call + period).
+  bool catch_up = false;
+  u64 compute_us[2] = {2000, 2000};    // what one frame of work costs on each host when nothing throttles it (catch_up only)
+  u64 resim_compute_us[2] = {2000, 2000};  // what one hidden resimulated frame costs (catch_up only; the throttle clock restarts when it ends)
+  u64 max_fallback_us = 100000;        // MAIN_MAX_FALLBACK: a lag beyond this is forgiven (catch_up only)
+  bool pace = false;                   // pacing on (Config::pace.enabled) with a simulated actuator; false: the sessions only measure
+  u64 gate_skew_us[2] = {0, 0};        // catch_up only: when machine i first turns ARMED its throttle schedule restarts at "now + this", i.e. it is that
+                                       // far BEHIND a machine that restarts on time. Two greedy machines (each runs as early as the peer's pads allow)
+                                       // come out of the lockstep with some skew like this; the one in front then sits at the stall limit, which is what
+                                       // D's loopback showed (host: 1902 stalls, guest: 5)
 };
 
 struct SimMachineResult
@@ -2360,6 +2896,12 @@ struct SimMachineResult
   size_t chk_lines = 0;
   s32 counter = 0;
   bool left_session = false;
+  u64 slept_us = 0;           // pacing delay actually handed out by the actuator
+  u32 delay_calls = 0;
+  u32 bad_delay_calls = 0;    // pacing delays asked in LOCKSTEP / DRAIN / a resimulation (a bug if not 0)
+  u64 largest_delay_us = 0;
+  u64 end_us = 0;
+  std::map<s32, u64> send_log;  // when each local frame went out (the true timing, to judge the offset estimate)
 };
 
 struct SimResult
@@ -2415,6 +2957,26 @@ u64 HashString(u64 h, const std::string& s)
   return h;
 }
 
+// The simulated PaceActuator: "sleep, then restart the throttle clock". The machine applies it when the call completes.
+class SimPacer final : public PaceActuator
+{
+public:
+  void Delay(u32 microseconds) override
+  {
+    pending_us += microseconds;
+    ++calls;
+    largest_us = std::max<u64>(largest_us, microseconds);
+    if (!armed_normal_call)
+      ++bad_calls;
+  }
+  bool armed_normal_call = false;  // set by the machine before each Step: the call is ARMED and not a resimulation (the only place pacing may delay)
+  u32 bad_calls = 0;               // delays requested anywhere else (must stay 0)
+  u64 pending_us = 0;
+  u64 total_us = 0;
+  u32 calls = 0;
+  u64 largest_us = 0;
+};
+
 struct SimMachine
 {
   SimMachine(int idx_, const SimParams& p, SimNet* net, const std::vector<Pad8>& script_)
@@ -2423,6 +2985,7 @@ struct SimMachine
     if (idx == 1)
       game.bug_frame = p.bug_frame;
     Config cfg;
+    cfg.pace.enabled = p.pace;
     cfg.role = idx == 0 ? Role::Host : Role::Guest;
     cfg.delay = idx == 0 ? p.delay : (p.delay + 1) % 5;  // the guest asks for something else; the host's value must win
     cfg.max_rollback = p.maxr;
@@ -2430,8 +2993,11 @@ struct SimMachine
     cfg.hello.items = {{"cpu_core", "JIT64"}};
     session = std::make_unique<RollbackSession>(cfg, net->ep[idx], store, sink, nullptr);
     session->SetFinalObserver([this](s32 f, u32 c) { finals[f] = c; });
+    if (p.pace)
+      session->SetPaceActuator(&pacer);
     ep = &net->ep[idx];
     next_at = p.start_us[idx];
+    target_us = p.start_us[idx];
     period = p.period_us[idx];
     total = p.frames;
   }
@@ -2453,6 +3019,9 @@ struct SimMachine
   bool blocking = false;
   u64 block_start = 0;
   u32 phantom_lost = 0;
+  SimPacer pacer;
+  u64 target_us = 0;     // catch_up: when the throttle wants the next call
+  bool skewed = false;
   u32 busy_left = 0;     // calls left in the current hardware-busy burst
   u32 busy_streak = 0;   // consecutive busy calls so far
   bool layout_pending = false;
@@ -2470,7 +3039,7 @@ bool RunSim(const SimParams& p, SimResult* out)
     Pad8 cur = RandomPad(srng);
     for (s32 f = 0; f < p.frames + 8; ++f)
     {
-      if (srng.Below(100) < p.change_pct)
+      if (srng.Below(100) < (i == 1 && p.guest_change_pct >= 0 ? static_cast<u32>(p.guest_change_pct) : p.change_pct))
         cur = RandomPad(srng);
       script[i].push_back(cur);
     }
@@ -2514,6 +3083,8 @@ bool RunSim(const SimParams& p, SimResult* out)
       gate.why = "sim";
       const bool armed_call = m.session->mode() == Mode::ARMED && !m.session->Resimulating();
       Reply r;
+      m.pacer.armed_normal_call = armed_call;
+      const bool resim_call = m.session->Resimulating();  // this call re-runs a frame after a RESTORED reply
       if (!m.session->Step(c, gate, &r))
       {
         if (!m.blocking)
@@ -2566,7 +3137,34 @@ bool RunSim(const SimParams& p, SimResult* out)
       ++m.counter;
       if (m.counter >= m.total && !m.session->Resimulating())
         m.done = true;
-      m.next_at = net.now + m.period;
+      const u64 shift = m.pacer.pending_us;  // a pacing delay of this call: sleep, then the throttle clock restarts
+      m.pacer.total_us += shift;
+      m.pacer.pending_us = 0;
+      if (p.catch_up)
+      {
+        if (!m.skewed && m.session->mode() == Mode::ARMED)
+        {
+          m.skewed = true;
+          m.target_us = net.now + p.gate_skew_us[m.idx];
+        }
+        if (m.session->Resimulating())
+        {
+          // Hidden resimulation (v1): the throttle is off, so the frames run back to back and every Throttle call restarts the clock.
+          m.target_us = net.now;
+          m.next_at = net.now + p.resim_compute_us[m.idx];
+        }
+        else
+        {
+          if (shift != 0 || resim_call)
+            m.target_us = net.now + shift;  // a pacing delay (sleep, then the throttle clock restarts) or the end of a resimulation (the clock was restarted)
+          m.target_us += m.period;
+          if (m.target_us + p.max_fallback_us < net.now)
+            m.target_us = net.now - p.max_fallback_us;  // lagging by more than MAIN_MAX_FALLBACK: the lag is forgiven
+          m.next_at = std::max(m.target_us, net.now + p.compute_us[m.idx]);
+        }
+      }
+      else
+        m.next_at = net.now + shift + m.period;
     }
   }
   out->finished = true;
@@ -2585,6 +3183,11 @@ bool RunSim(const SimParams& p, SimResult* out)
     r.chk_lines = m.sink.Count("CHK frame=");
     r.counter = m.counter;
     r.left_session = m.sink.Has("LEAVE");
+    r.send_log = net.ep[i].send_log;
+    r.slept_us = m.pacer.total_us;
+    r.delay_calls = m.pacer.calls;
+    r.bad_delay_calls = m.pacer.bad_calls;
+    r.largest_delay_us = m.pacer.largest_us;
     out->log_hash = HashString(out->log_hash, r.log);
   }
   return true;
@@ -2968,4 +3571,169 @@ TEST(Rev3Session, MismatchingHellosEndBothSessionsBeforeFrameZero)
   EXPECT_TRUE(ka.Has("HELLO item cpu_core: own=JIT64 peer=CachedInterpreter"));
   EXPECT_TRUE(kb.Has("HELLO item cpu_core: own=CachedInterpreter peer=JIT64"));
 }
+// ---- M5: pacing in the closed loop --------------------------------------------------------------------------------------------
+// D's loopback (two Dolphins, 80 ms delay, 30 ms jitter, 5 % loss, input delay 2, MAXR 5): the host stalled 1902 of 7788 frames and never rolled
+// back, the guest stalled 5 times and rolled back 42 times. The host's pads were the ones that kept changing, the guest's stayed the same; the
+// host sat at the stall limit all match long because Dolphin's throttle lets a machine that waited run the next frames unthrottled, so two
+// greedy machines settle with the leader pinned. Every guest rollback restarts the guest's throttle clock (the hidden resimulation runs with the
+// throttle off), which moves the guest LATER again and again: the guest can never catch up on its own.
+SimParams LoopbackLikeParams(u64 seed, u64 lead_frames, u64 resim_us, bool pace)
+{
+  SimParams p;
+  p.seed = seed;
+  p.delay = 2;
+  p.maxr = 5;
+  p.net.delay_us = 50000;
+  p.net.jitter_us = 30000;
+  p.net.loss_pct = 5;
+  p.net.resend_us = 25000;
+  p.catch_up = true;
+  p.pace = pace;
+  p.frames = 2400;
+  p.open_at = 60;
+  p.close_at = 2300;
+  p.change_pct = 8;        // the host's pad moves (the guest predicts it and rolls back)
+  p.guest_change_pct = 0;  // the guest's pad never does (the host never rolls back)
+  p.resim_compute_us[0] = p.resim_compute_us[1] = resim_us;
+  p.period_us[0] = p.period_us[1] = 16683;
+  p.gate_skew_us[1] = lead_frames * 16683;  // the guest's throttle schedule starts this late: the host starts `lead_frames` ahead
+  return p;
+}
+
+TEST(Rev3Session, PacingRemovesTheLeadersPersistentStallsWhenOneSideStartsFiveFramesAhead)
+{
+  u32 compared = 0;
+  for (u64 seed : {11ull, 12ull, 13ull, 14ull})
+    for (u64 resim_us : {2000ull, 8000ull})
+    {
+      SimResult off, on;
+      const SimParams p_off = LoopbackLikeParams(seed, 5, resim_us, false);
+      const SimParams p_on = LoopbackLikeParams(seed, 5, resim_us, true);
+      ASSERT_TRUE(RunSim(p_off, &off));
+      ASSERT_TRUE(RunSim(p_on, &on));
+      const std::string what = "seed " + std::to_string(seed) + " resim " + std::to_string(resim_us) + " us";
+      EXPECT_EQ(CheckHealthy(p_off, off), "") << what;
+      EXPECT_EQ(CheckHealthy(p_on, on), "") << what;
+      // Both sides end in the same state, the reference one, with and without pacing.
+      EXPECT_TRUE(off.m[0].state == off.m[1].state) << what;
+      EXPECT_TRUE(on.m[0].state == on.m[1].state) << what;
+      EXPECT_TRUE(on.m[0].state == off.m[0].state) << what;
+      // The baseline reproduces D's picture: the host pinned at the stall limit, the guest hardly ever stalling.
+      EXPECT_GT(off.m[0].stats.stalls, 300u) << what;
+      EXPECT_LT(off.m[1].stats.stalls, 20u) << what;
+      EXPECT_EQ(off.m[0].stats.rollbacks, 0u) << what;
+      // Pacing: the leader's stalls drop by a large factor (and the time it spends waiting with them).
+      EXPECT_LE(on.m[0].stats.stalls * (resim_us <= 2000 ? 8 : 4), off.m[0].stats.stalls) << what;
+      EXPECT_LE(on.m[0].stats.stall_us_total * 4, off.m[0].stats.stall_us_total) << what;
+      // The lead was turned into delay on the leader's side only.
+      EXPECT_GT(on.m[0].stats.pace_slowdowns, 0u) << what;
+      EXPECT_GT(on.m[0].slept_us, 0u) << what;
+      EXPECT_EQ(on.m[0].stats.pace_sleep_us_total, on.m[0].slept_us) << what;
+      EXPECT_EQ(off.m[0].slept_us, 0u) << what;
+      EXPECT_EQ(off.m[0].delay_calls, 0u) << what;
+      EXPECT_GT(off.m[0].stats.pace_checks, 10u) << what;  // pacing off still measures
+      EXPECT_TRUE(off.m[0].log.find("action=off") != std::string::npos) << what;
+      // The sleep is bounded: slices of at most 4 ms per call, one check never asks for more than 5 frames, and the whole run loses well under
+      // 2 % of its length to it (the run lasts about 40 s; D's loopback lasted 130 s).
+      for (const SimMachineResult& m : on.m)
+      {
+        EXPECT_LE(m.largest_delay_us, 4000u) << what;
+        EXPECT_LE(m.slept_us, static_cast<u64>(m.stats.pace_slowdowns) * 5 * PACE_FRAME_US) << what;
+        EXPECT_LT(m.slept_us * 50, on.end_us) << what;
+        EXPECT_EQ(m.bad_delay_calls, 0u) << what;
+      }
+      // Pacing is not allowed to make the match longer by more than the sleep it took.
+      EXPECT_LE(on.end_us, off.end_us + 1000000) << what;
+      // The checksums the two sides exchanged agree (no DESYNC, the final ones are the reference ones).
+      EXPECT_GT(on.m[0].chk_lines, 10u) << what;
+      EXPECT_EQ(on.m[0].stats.checks_bad, 0u) << what;
+      EXPECT_EQ(on.m[1].stats.checks_bad, 0u) << what;
+      ++compared;
+    }
+  EXPECT_EQ(compared, 8u);
+}
+
+TEST(Rev3Session, PacingBarelyActsOnABalancedPairAndStillAgrees)
+{
+  for (u64 seed : {21ull, 22ull, 23ull})
+  {
+    SimParams p = LoopbackLikeParams(seed, 0, 2000, true);
+    p.change_pct = 15;
+    p.guest_change_pct = -1;  // both players move: both machines predict and roll back
+    SimResult res;
+    ASSERT_TRUE(RunSim(p, &res));
+    EXPECT_EQ(CheckHealthy(p, res), "") << seed;
+    EXPECT_TRUE(res.m[0].state == res.m[1].state) << seed;
+    for (const SimMachineResult& m : res.m)
+    {
+      EXPECT_GT(m.stats.rollbacks, 100u) << seed;
+      EXPECT_LT(m.slept_us * 100, res.end_us) << seed;  // under 1 % of the run
+      EXPECT_EQ(m.bad_delay_calls, 0u) << seed;
+    }
+  }
+}
+
+TEST(Rev3Session, PacingRunsAreReproducible)
+{
+  const SimParams p = LoopbackLikeParams(31, 5, 2000, true);
+  SimResult a, b;
+  ASSERT_TRUE(RunSim(p, &a));
+  ASSERT_TRUE(RunSim(p, &b));
+  EXPECT_EQ(a.log_hash, b.log_hash);
+  EXPECT_EQ(a.m[0].slept_us, b.m[0].slept_us);
+}
+
+TEST(Rev3Session, ThousandSeedsWithThrottleAndPacingAgreeWithTheReferenceAndNeverPaceOutsideNormalArmedCalls)
+{
+  u64 delay_calls = 0, slept = 0, rollbacks = 0, resims = 0, checks = 0, reopens = 0;
+  u32 failures = 0;
+  for (u64 seed = 1; seed <= 1000; ++seed)
+  {
+    SimParams p = ParamsFromSeed(seed);
+    Rng r(seed * 31 + 7);
+    p.catch_up = true;
+    p.pace = true;
+    p.compute_us[0] = 500 + r.Below(4000);
+    p.compute_us[1] = 500 + r.Below(4000);
+    p.resim_compute_us[0] = 500 + r.Below(9000);
+    p.resim_compute_us[1] = 500 + r.Below(9000);
+    p.max_fallback_us = 50000 + r.Below(100000);
+    p.gate_skew_us[0] = r.Below(3) == 0 ? r.Below(8 * 16683) : 0;
+    p.gate_skew_us[1] = r.Below(3) == 0 ? r.Below(8 * 16683) : 0;
+    SimResult res;
+    ASSERT_TRUE(RunSim(p, &res));
+    const std::string problem = CheckHealthy(p, res);
+    if (!problem.empty())
+    {
+      EXPECT_EQ(problem, "") << "seed " << seed;
+      if (++failures >= 5)
+        break;
+      continue;
+    }
+    EXPECT_TRUE(res.m[0].state == res.m[1].state) << "seed " << seed;
+    for (const SimMachineResult& m : res.m)
+    {
+      EXPECT_EQ(m.bad_delay_calls, 0u) << "seed " << seed << ": a pacing delay outside a normal ARMED call";
+      EXPECT_LE(m.largest_delay_us, 4000u) << "seed " << seed;
+      EXPECT_LE(m.slept_us, static_cast<u64>(m.stats.pace_slowdowns) * 5 * PACE_FRAME_US) << "seed " << seed;
+      EXPECT_EQ(m.slept_us, m.stats.pace_sleep_us_total) << "seed " << seed;
+      delay_calls += m.delay_calls;
+      slept += m.slept_us;
+      rollbacks += m.stats.rollbacks;
+      resims += m.stats.resim_calls;
+      checks += m.stats.pace_checks;
+      if (m.stats.gate_opens > 1)
+        ++reopens;
+    }
+  }
+  // The seeds must reach pacing, rollbacks, resimulations and re-opened gates, or the test proves nothing.
+  EXPECT_GT(delay_calls, 1000u);
+  EXPECT_GT(slept, 1000000u);
+  EXPECT_GT(checks, 2000u);
+  EXPECT_GT(rollbacks, 5000u);
+  EXPECT_GT(resims, 5000u);
+  EXPECT_GT(reopens, 100u);
+}
+
 }  // namespace
+
