@@ -1,0 +1,1294 @@
+// Rev3 online rollback session (milestone M2): implementation of Rev3Session.h. Pure logic: no Dolphin core, no sockets, no clock of its
+// own (Transport::Now and the injected WaitFn), so Source/UnitTests/Core/Rev3SessionTest.cpp runs two sessions against each other in one
+// process. See Rev3Session.h for what the modes mean and docs/rollback_netplay_plan.md (rev3-mod) section 3.3 for the per-call rules.
+//
+// ONE CALL, in the order this file implements it (N = the hook frame of the command):
+//   1. local pad: not on a resim call: local[N + D] = pad (or the previous one when PADRead failed), SendLocal(N + D)
+//   2. LOCKSTEP: wait for R >= N, reply {local[N], remote[N]}.
+//   3. ARMED: (a) gate closed -> DRAIN. (b) stall: wait while N - R > MAXR. (c) misprediction scan over the unverified frames
+//      V+1..min(R, N-1); the first frame whose played remote pad differs from the real one is the rollback target g: Restore(g), reply
+//      RESTORED naming g with the pads for g. (d) otherwise Capture(N), predict the remote pad (last confirmed) if it is not here, reply.
+//   4. resim calls (after RESTORED): the frame must be next_expected; replies the best-known pads, re-captures the slot.
+//   Differences from the plan's text: the stall wait runs BEFORE the scan (plan: after) so a rollback is never deeper than MAXR even when
+//   packets arrive while waiting; the stall disconnect is "a stall that lasts 420 frames of time" (7 s), not 420 consecutive stalled calls
+//   (with a permanently slow link every call stalls briefly and that must not end the session).
+//
+// FINAL FRAMES. Frame f is final when V >= f - 1: every remote pad below f is known and was the pad the game played, so the start state
+// of f cannot change any more. Only final frames are reported to the observer and, for f % 30 == 0, exchanged as checksums.
+
+#include "Core/Slippi/Rev3Session.h"
+
+#include <algorithm>
+#include <cstdarg>
+#include <cstdio>
+#include <cstring>
+
+#include "Common/Hash.h"
+
+namespace Rev3::Net
+{
+namespace
+{
+std::string Fmt(const char* format, ...)
+{
+  char buf[1024];
+  va_list args;
+  va_start(args, format);
+  const int n = vsnprintf(buf, sizeof(buf), format, args);
+  va_end(args);
+  if (n < 0)
+    return {};
+  return std::string(buf, std::min<size_t>(static_cast<size_t>(n), sizeof(buf) - 1));
+}
+
+const Pad8 NEUTRAL_PAD{};  // all zero: buttons up, sticks and triggers at rest (PADStatus raw, sticks are signed and centred on 0)
+
+// ---- little big-endian byte writer / reader for the messages -------------------------------------------------------------------
+class Writer
+{
+public:
+  void U8(u8 v) { m_out.push_back(v); }
+  void U16(u16 v)
+  {
+    U8(static_cast<u8>(v >> 8));
+    U8(static_cast<u8>(v));
+  }
+  void U32(u32 v)
+  {
+    U16(static_cast<u16>(v >> 16));
+    U16(static_cast<u16>(v));
+  }
+  void S32(s32 v) { U32(static_cast<u32>(v)); }
+  void Str(const std::string& s)
+  {
+    const size_t n = std::min<size_t>(s.size(), 0xFFFF);
+    U16(static_cast<u16>(n));
+    m_out.insert(m_out.end(), s.begin(), s.begin() + static_cast<std::ptrdiff_t>(n));
+  }
+  void Fields(const FieldSet& f)
+  {
+    U8(f.present);
+    for (const auto& player : f.value)
+      for (u32 v : player)
+        U32(v);
+  }
+  std::vector<u8> Take() { return std::move(m_out); }
+
+private:
+  std::vector<u8> m_out;
+};
+
+class Reader
+{
+public:
+  explicit Reader(const std::vector<u8>& bytes) : m_bytes(bytes) {}
+  bool ok() const { return m_ok; }
+  bool done() const { return m_pos == m_bytes.size(); }
+  u8 U8()
+  {
+    if (m_pos + 1 > m_bytes.size())
+    {
+      m_ok = false;
+      return 0;
+    }
+    return m_bytes[m_pos++];
+  }
+  u16 U16()
+  {
+    const u16 hi = U8();
+    const u16 lo = U8();
+    return static_cast<u16>((hi << 8) | lo);
+  }
+  u32 U32()
+  {
+    const u32 hi = U16();
+    const u32 lo = U16();
+    return (hi << 16) | lo;
+  }
+  s32 S32() { return static_cast<s32>(U32()); }
+  std::string Str()
+  {
+    const size_t n = U16();
+    if (m_pos + n > m_bytes.size())
+    {
+      m_ok = false;
+      return {};
+    }
+    std::string s(reinterpret_cast<const char*>(m_bytes.data() + m_pos), n);
+    m_pos += n;
+    return s;
+  }
+  void Fields(FieldSet* f)
+  {
+    f->present = U8();
+    for (auto& player : f->value)
+      for (u32& v : player)
+        v = U32();
+  }
+
+private:
+  const std::vector<u8>& m_bytes;
+  size_t m_pos = 0;
+  bool m_ok = true;
+};
+
+constexpr u32 HELLO_MAGIC = 0x52334831;        // "R3H1"
+constexpr u32 START_CHECK_MAGIC = 0x52335331;  // "R3S1"
+constexpr u32 DUMP_MAGIC = 0x52334431;         // "R3D1"
+constexpr size_t MAX_DUMP_FRAMES = 64;
+constexpr size_t MAX_HELLO_ITEMS = 256;
+constexpr size_t MAX_FIELD_DIFFS_LOGGED = 20;
+
+const char* RoleName(Role role)
+{
+  return role == Role::Host ? "host" : "guest";
+}
+
+// "p1 action own=0x.. peer=0x.." for the first differing fields of two sets (limit lines); returns how many differ.
+size_t DiffFields(const FieldSet& own, const FieldSet& peer, size_t limit, std::vector<std::string>* lines)
+{
+  size_t count = 0;
+  if (own.present != peer.present)
+  {
+    if (lines != nullptr)
+      lines->push_back(Fmt("fighters found: own=0x%X peer=0x%X", own.present, peer.present));
+    ++count;
+  }
+  for (size_t p = 0; p < 2; ++p)
+  {
+    if (((own.present & peer.present) & (1u << p)) == 0)
+      continue;
+    for (size_t i = 0; i < FIELD_COUNT; ++i)
+    {
+      if (own.value[p][i] == peer.value[p][i])
+        continue;
+      if (lines != nullptr && count < limit)
+        lines->push_back(Fmt("p%zu %s own=0x%08X peer=0x%08X", p + 1, FIELDS[i].name, own.value[p][i], peer.value[p][i]));
+      ++count;
+    }
+  }
+  return count;
+}
+}  // namespace
+
+// ---- helpers ---------------------------------------------------------------------------------------------------------------
+
+Pad8 SanitizePad(const PadBytes& pad)
+{
+  Pad8 out;
+  std::copy_n(pad.begin(), out.size(), out.begin());
+  return out;
+}
+
+PadBytes ToPadBytes(const Pad8& pad)
+{
+  PadBytes out{};  // analogA/B (+8/+9), +11 and err (+10) = 0: Rev3 never reads them and the hook wants err 0 for a connected port
+  std::copy(pad.begin(), pad.end(), out.begin());
+  return out;
+}
+
+u32 FieldsDigest()
+{
+  std::string text;
+  for (const FieldDef& f : FIELDS)
+    text += Fmt("%s:%u:%u;", f.name, static_cast<unsigned>(f.offset), 4u);
+  text += Fmt("v%u", FIELDS_VERSION);
+  return Common::ComputeCRC32(reinterpret_cast<const u8*>(text.data()), text.size());
+}
+
+const char* ModeName(Mode mode)
+{
+  switch (mode)
+  {
+  case Mode::OFFLINE:
+    return "OFFLINE";
+  case Mode::CONNECTING:
+    return "CONNECTING";
+  case Mode::LOCKSTEP:
+    return "LOCKSTEP";
+  case Mode::ARMED:
+    return "ARMED";
+  case Mode::DRAIN:
+    return "DRAIN";
+  }
+  return "?";
+}
+
+// ---- messages --------------------------------------------------------------------------------------------------------------
+
+std::vector<u8> SerializeHello(const Hello& hello)
+{
+  Writer w;
+  w.U32(HELLO_MAGIC);
+  w.U8(static_cast<u8>(hello.role));
+  w.Str(hello.game_id);
+  w.U32(hello.protocol);
+  w.U32(hello.fields_version);
+  w.U32(hello.fields_digest);
+  w.U32(hello.delay);
+  w.U16(static_cast<u16>(std::min(hello.items.size(), MAX_HELLO_ITEMS)));
+  for (size_t i = 0; i < hello.items.size() && i < MAX_HELLO_ITEMS; ++i)
+  {
+    w.Str(hello.items[i].first);
+    w.Str(hello.items[i].second);
+  }
+  return w.Take();
+}
+
+bool ParseHello(const std::vector<u8>& bytes, Hello* out)
+{
+  Reader r(bytes);
+  if (r.U32() != HELLO_MAGIC)
+    return false;
+  Hello h;
+  const u8 role = r.U8();
+  if (role > 1)
+    return false;
+  h.role = static_cast<Role>(role);
+  h.game_id = r.Str();
+  h.protocol = r.U32();
+  h.fields_version = r.U32();
+  h.fields_digest = r.U32();
+  h.delay = r.U32();
+  const size_t count = r.U16();
+  if (count > MAX_HELLO_ITEMS)
+    return false;
+  for (size_t i = 0; i < count && r.ok(); ++i)
+  {
+    std::string key = r.Str();
+    std::string value = r.Str();
+    h.items.emplace_back(std::move(key), std::move(value));
+  }
+  if (!r.ok() || !r.done())
+    return false;
+  *out = std::move(h);
+  return true;
+}
+
+std::vector<std::string> HelloMismatches(const Hello& mine, const Hello& theirs)
+{
+  std::vector<std::string> out;
+  if (mine.role == theirs.role)
+    out.push_back(Fmt("role: both sides are %s (one must be host, one guest)", RoleName(mine.role)));
+  if (mine.game_id != theirs.game_id)
+    out.push_back("game_id: own=" + mine.game_id + " peer=" + theirs.game_id);
+  if (mine.protocol != theirs.protocol)
+    out.push_back(Fmt("protocol: own=%u peer=%u", mine.protocol, theirs.protocol));
+  if (mine.fields_version != theirs.fields_version)
+    out.push_back(Fmt("fields_version: own=%u peer=%u", mine.fields_version, theirs.fields_version));
+  if (mine.fields_digest != theirs.fields_digest)
+    out.push_back(Fmt("fields_digest: own=0x%08X peer=0x%08X", mine.fields_digest, theirs.fields_digest));
+  // The items: every key of either side. A key only one side has is a difference too.
+  std::map<std::string, std::pair<const std::string*, const std::string*>> keys;
+  for (const auto& item : mine.items)
+    keys[item.first].first = &item.second;
+  for (const auto& item : theirs.items)
+    keys[item.first].second = &item.second;
+  for (const auto& entry : keys)
+  {
+    const std::string* a = entry.second.first;
+    const std::string* b = entry.second.second;
+    if (a != nullptr && b != nullptr)
+    {
+      if (*a != *b)
+        out.push_back("item " + entry.first + ": own=" + *a + " peer=" + *b);
+    }
+    else if (a != nullptr)
+      out.push_back("item " + entry.first + ": own=" + *a + " peer=(absent)");
+    else
+      out.push_back("item " + entry.first + ": own=(absent) peer=" + *b);
+  }
+  return out;
+}
+
+std::vector<u8> SerializeStartCheck(const StartCheck& check)
+{
+  Writer w;
+  w.U32(START_CHECK_MAGIC);
+  w.S32(check.frame);
+  w.U32(check.checksum);
+  w.U32(check.stable_crc);
+  w.Fields(check.fields);
+  return w.Take();
+}
+
+bool ParseStartCheck(const std::vector<u8>& bytes, StartCheck* out)
+{
+  Reader r(bytes);
+  if (r.U32() != START_CHECK_MAGIC)
+    return false;
+  StartCheck c;
+  c.frame = r.S32();
+  c.checksum = r.U32();
+  c.stable_crc = r.U32();
+  r.Fields(&c.fields);
+  if (!r.ok() || !r.done())
+    return false;
+  *out = c;
+  return true;
+}
+
+std::vector<std::string> StartCheckMismatches(const StartCheck& mine, const StartCheck& theirs)
+{
+  std::vector<std::string> out;
+  if (mine.frame != theirs.frame)
+    out.push_back(Fmt("frame: own=%d peer=%d (the arm gate opened on different frames)", mine.frame, theirs.frame));
+  if (mine.checksum != theirs.checksum)
+    out.push_back(Fmt("checksum: own=0x%08X peer=0x%08X", mine.checksum, theirs.checksum));
+  if (mine.stable_crc != theirs.stable_crc)
+    out.push_back(Fmt("stable_ranges_crc: own=0x%08X peer=0x%08X", mine.stable_crc, theirs.stable_crc));
+  if (mine.checksum != theirs.checksum || !(mine.fields == theirs.fields))
+  {
+    std::vector<std::string> lines;
+    const size_t n = DiffFields(mine.fields, theirs.fields, MAX_FIELD_DIFFS_LOGGED, &lines);
+    for (std::string& line : lines)
+      out.push_back("field " + line);
+    if (n > lines.size())
+      out.push_back(Fmt("... and %zu more differing fields", n - lines.size()));
+  }
+  return out;
+}
+
+std::vector<u8> SerializeDesyncDump(const DesyncDump& dump)
+{
+  Writer w;
+  w.U32(DUMP_MAGIC);
+  w.S32(dump.frame);
+  w.U16(static_cast<u16>(std::min(dump.trace.size(), MAX_DUMP_FRAMES)));
+  for (size_t i = 0; i < dump.trace.size() && i < MAX_DUMP_FRAMES; ++i)
+  {
+    w.S32(dump.trace[i].first);
+    w.Fields(dump.trace[i].second);
+  }
+  return w.Take();
+}
+
+bool ParseDesyncDump(const std::vector<u8>& bytes, DesyncDump* out)
+{
+  Reader r(bytes);
+  if (r.U32() != DUMP_MAGIC)
+    return false;
+  DesyncDump d;
+  d.frame = r.S32();
+  const size_t count = r.U16();
+  if (count > MAX_DUMP_FRAMES)
+    return false;
+  for (size_t i = 0; i < count && r.ok(); ++i)
+  {
+    const s32 frame = r.S32();
+    FieldSet fields;
+    r.Fields(&fields);
+    d.trace.emplace_back(frame, fields);
+  }
+  if (!r.ok() || !r.done())
+    return false;
+  *out = std::move(d);
+  return true;
+}
+
+// ---- construction and small helpers ----------------------------------------------------------------------------------------------
+
+RollbackSession::RollbackSession(const Config& config, Transport& transport, SnapshotStore& store, Sink& sink, WaitFn wait)
+    : m_cfg(config), m_net(transport), m_store(store), m_sink(sink), m_wait(std::move(wait))
+{
+  m_cfg.max_rollback = std::max(1, std::min(m_cfg.max_rollback, MAX_ROLLBACK_CEILING));
+  m_cfg.delay = std::max(0, std::min(m_cfg.delay, MAX_DELAY));
+  m_delay = m_cfg.delay;
+  m_cfg.hello.role = m_cfg.role;
+  m_cfg.hello.delay = static_cast<u32>(m_delay);
+  Line(Fmt("SESSION start role=%s delay=%d maxr=%d", RoleName(m_cfg.role), m_delay, m_cfg.max_rollback));
+}
+
+void RollbackSession::Line(const std::string& text)
+{
+  m_sink.Line(text);
+}
+
+s32 RollbackSession::Confirmed() const
+{
+  // The frames below D carry the neutral pad on both sides by construction, so they count as known even before the packets arrive.
+  return std::max(m_net.RemoteConfirmed(), m_delay - 1);
+}
+
+Pad8 RollbackSession::RemoteAt(s32 frame) const
+{
+  if (frame < 0 || frame < m_delay)
+    return NEUTRAL_PAD;
+  Pad8 pad{};
+  if (!m_net.RemotePad(frame, &pad))
+    return NEUTRAL_PAD;  // only for a frame above R: callers check Confirmed() first
+  return pad;
+}
+
+Pad8 RollbackSession::Predict() const
+{
+  const s32 r = Confirmed();
+  return r >= 0 ? RemoteAt(r) : NEUTRAL_PAD;
+}
+
+Pad8 RollbackSession::LocalAt(s32 frame) const
+{
+  if (frame < 0)
+    return NEUTRAL_PAD;
+  const PadSlot& slot = m_local[static_cast<size_t>(frame) % RING];
+  return slot.frame == frame ? slot.pad : NEUTRAL_PAD;
+}
+
+void RollbackSession::StoreLocal(const Command& command, s32 frame)
+{
+  // PADRead failed (-3): the block holds the previous poll, so the previous local pad is the best statement of the player's input.
+  const Pad8 pad = command.pad_return != 0 ? m_last_local : SanitizePad(command.pads[0]);
+  m_last_local = pad;
+  const s32 target = frame + m_delay;
+  PadSlot& slot = m_local[static_cast<size_t>(target) % RING];
+  slot.frame = target;
+  slot.pad = pad;
+  m_input_frame = frame;
+  m_net.SendLocal(target, pad, m_send_chk_frame, m_send_chk_value);
+}
+
+Reply RollbackSession::MakeReply(const Pad8& local, const Pad8& remote, u32 flags, s32 frame) const
+{
+  Reply r;
+  r.flags = flags;
+  r.frame = static_cast<u32>(frame);
+  const size_t local_port = m_cfg.role == Role::Host ? 0 : 1;  // host = game port 0, guest = game port 1
+  r.pads[local_port] = ToPadBytes(local);
+  r.pads[1 - local_port] = ToPadBytes(remote);
+  return r;
+}
+
+Reply RollbackSession::EchoReply(const Command& command) const
+{
+  Reply r;
+  r.flags = 0;
+  r.frame = command.frame;
+  r.pads = command.pads;
+  return r;
+}
+
+bool RollbackSession::Blocked(Block block)
+{
+  m_block = block;
+  return false;
+}
+
+bool RollbackSession::EndCall(s32 frame, const Reply& reply, Reply* out)
+{
+  *out = reply;
+  m_cur_frame = -1;
+  m_expected_next = frame + 1;
+  m_block = Block::None;
+  m_stalled_this_call = false;
+  m_postpone_counted = false;
+  return true;
+}
+
+void RollbackSession::CaptureUsed(s32 frame, const Pad8& local, const Pad8& remote, bool predicted, const CaptureInfo& info)
+{
+  Used& u = UsedAt(frame);
+  u.frame = frame;
+  u.local = local;
+  u.remote = remote;
+  u.predicted = predicted;
+  u.has_checksum = true;
+  u.checksum = info.checksum;
+  u.has_fields = frame % CHECK_INTERVAL == 0;
+  if (u.has_fields)
+    u.fields = info.fields;
+}
+
+// ---- the blocking wrapper ------------------------------------------------------------------------------------------------------
+
+Reply RollbackSession::OnCommand(const Command& command, const Gate& gate)
+{
+  Reply reply;
+  while (!Step(command, gate, &reply))
+  {
+    const bool satisfied = m_wait ? m_wait([this] { return BlockSatisfied(); }, BlockTimeoutMs()) : false;
+    if (!satisfied)
+      BlockTimedOut();
+  }
+  return reply;
+}
+
+u32 RollbackSession::BlockTimeoutMs() const
+{
+  switch (m_block)
+  {
+  case Block::Barrier:
+    return m_cfg.barrier_timeout_ms;
+  case Block::Stall:
+    return m_cfg.stall_disconnect_frames * 1000 / 60;  // 420 frames of 1/60 s = 7000 ms
+  case Block::StartCheck:
+    return m_cfg.start_check_timeout_ms;
+  case Block::None:
+  case Block::Lockstep:
+  case Block::DrainA:
+  case Block::DrainB:
+    break;
+  }
+  return m_cfg.wait_timeout_ms;
+}
+
+bool RollbackSession::BlockSatisfied()
+{
+  m_net.Pump();
+  PumpMessages();
+  if (m_mode == Mode::OFFLINE || m_net.State() == ConnState::Failed)
+    return true;  // Step() sees it and answers offline
+  const s32 n = m_cur_frame;
+  switch (m_block)
+  {
+  case Block::None:
+    return true;
+  case Block::Barrier:
+    return m_net.State() == ConnState::Connected && m_peer_hello_ok;
+  case Block::Lockstep:
+    return Confirmed() >= n;
+  case Block::Stall:
+    return n - Confirmed() <= m_cfg.max_rollback;
+  case Block::DrainA:
+    return Confirmed() >= n - 1;
+  case Block::DrainB:
+    return Confirmed() >= n;
+  case Block::StartCheck:
+    return !m_peer_start.empty();
+  }
+  return true;
+}
+
+void RollbackSession::BlockTimedOut()
+{
+  switch (m_block)
+  {
+  case Block::Barrier:
+    LeaveSession(Fmt("no connection / HELLO within %u ms (frame-0 barrier)", m_cfg.barrier_timeout_ms), true);
+    break;
+  case Block::Stall:
+    EndStall(true);
+    LeaveSession(Fmt("stall: no remote pad for %u frames (%u ms)", m_cfg.stall_disconnect_frames, BlockTimeoutMs()), true);
+    break;
+  case Block::StartCheck:
+    // The peer is not asking for the same arm (see "Known gap" in Rev3Session.h): stay in lockstep, correct but slower.
+    Line(Fmt("ARM frame=%d refused: no START_CHECK from the peer within %u ms; staying in lockstep", m_cur_frame,
+             m_cfg.start_check_timeout_ms));
+    m_arm_blocked = true;
+    ++m_stats.arm_refused;
+    break;
+  case Block::None:
+  case Block::Lockstep:
+  case Block::DrainA:
+  case Block::DrainB:
+    LeaveSession(Fmt("no remote pad for %u ms (frame %d, R=%d)", m_cfg.wait_timeout_ms, m_cur_frame, Confirmed()), true);
+    break;
+  }
+}
+
+// ---- the call --------------------------------------------------------------------------------------------------------------------
+
+bool RollbackSession::Step(const Command& command, const Gate& gate, Reply* reply)
+{
+  const bool was_offline = m_mode == Mode::OFFLINE;
+  if (!StepInner(command, gate, reply))
+    return false;
+  if (!was_offline)
+    ++m_stats.calls;
+  // A desync / error that left the session in the middle of a call answers with the local pads, unless the memory was already rewound
+  // (a RESTORED reply is never replaced).
+  if (m_mode == Mode::OFFLINE && (reply->flags & REPLY_FLAG_RESTORED) == 0)
+    *reply = EchoReply(command);
+  return true;
+}
+
+bool RollbackSession::StepInner(const Command& command, const Gate& gate, Reply* reply)
+{
+  m_block = Block::None;
+  if (m_mode == Mode::OFFLINE)
+  {
+    PollOffline();
+    m_cur_frame = -1;
+    *reply = EchoReply(command);
+    return true;
+  }
+  if (m_net.State() == ConnState::Failed)
+  {
+    LeaveSession("connection lost", false);
+    *reply = EchoReply(command);
+    return true;
+  }
+  PumpMessages();
+  if (m_mode == Mode::OFFLINE)
+  {
+    m_cur_frame = -1;
+    *reply = EchoReply(command);
+    return true;
+  }
+
+  const s32 n = static_cast<s32>(command.frame);
+
+  // ---- frame-0 barrier
+  if (m_mode == Mode::CONNECTING)
+  {
+    if (!m_hello_sent && m_net.State() == ConnState::Connected)
+      SendHello();
+    if (m_mode == Mode::OFFLINE)
+    {
+      *reply = EchoReply(command);
+      return true;
+    }
+    if (m_net.State() != ConnState::Connected || !m_peer_hello_ok)
+      return Blocked(Block::Barrier);
+    if (n != 0)
+    {
+      LeaveSession(Fmt("the first command is frame %d, not 0 (a session cannot start mid-game)", n), true);
+      *reply = EchoReply(command);
+      return true;
+    }
+    StartLockstep();
+  }
+
+  // ---- a fresh call (not a retry after a wait)?
+  if (m_cur_frame != n)
+  {
+    if (!m_resim && n != m_expected_next)
+    {
+      Line(Fmt("ERROR frame jump: expected %d, the game sent %d", m_expected_next, n));
+      LeaveSession(Fmt("frame counter jumped (expected %d, got %d)", m_expected_next, n), true);
+      *reply = EchoReply(command);
+      return true;
+    }
+    m_cur_frame = n;
+    m_stalled_this_call = false;
+    m_postpone_counted = false;
+  }
+
+  if (m_resim)
+    return StepResim(command, gate, reply);
+
+  if (m_input_frame != n)
+    StoreLocal(command, n);
+
+  switch (m_mode)
+  {
+  case Mode::LOCKSTEP:
+    return StepLockstep(command, gate, reply);
+  case Mode::ARMED:
+    return StepArmed(command, gate, reply);
+  case Mode::DRAIN:
+    return StepDrain(command, gate, reply);
+  case Mode::CONNECTING:
+  case Mode::OFFLINE:
+    break;
+  }
+  *reply = EchoReply(command);
+  return true;
+}
+
+void RollbackSession::StartLockstep()
+{
+  m_mode = Mode::LOCKSTEP;
+  // Neutral pads for the frames the input delay covers: the transport's contiguous queues start at frame 0 on both sides.
+  for (s32 f = 0; f < m_delay; ++f)
+  {
+    PadSlot& slot = m_local[static_cast<size_t>(f) % RING];
+    slot.frame = f;
+    slot.pad = NEUTRAL_PAD;
+    m_net.SendLocal(f, NEUTRAL_PAD, -1, 0);
+  }
+  Line(Fmt("SESSION lockstep from frame 0 role=%s delay=%d maxr=%d", RoleName(m_cfg.role), m_delay, m_cfg.max_rollback));
+}
+
+bool RollbackSession::StepLockstep(const Command& command, const Gate& gate, Reply* reply)
+{
+  const s32 n = m_cur_frame;
+  if (!gate.open)
+  {
+    m_arm_blocked = false;  // a refused gate opening is over once the gate has closed
+  }
+  else if (!m_arm_blocked)
+  {
+    const int arm = TryArm(gate);
+    if (arm == 0)
+      return false;
+    if (arm == 1)
+      return StepArmed(command, gate, reply);
+  }
+  if (Confirmed() < n)
+    return Blocked(Block::Lockstep);
+  LockstepCheck(n);
+  return EndCall(n, MakeReply(LocalAt(n), RemoteAt(n), 0, n), reply);
+}
+
+int RollbackSession::TryArm(const Gate& gate)
+{
+  const s32 n = m_cur_frame;
+  if (m_arm_sent_frame != n)
+  {
+    StartCheck mine;
+    mine.frame = n;
+    mine.checksum = m_store.LiveChecksum(n, &mine.fields);
+    mine.stable_crc = m_store.StableCrc();
+    m_arm_mine = mine;
+    m_arm_sent_frame = n;
+    m_net.SendReliable(MsgType::StartCheck, SerializeStartCheck(mine));
+  }
+  const auto it = m_peer_start.find(n);
+  if (it == m_peer_start.end())
+  {
+    if (m_peer_start.empty())
+    {
+      Blocked(Block::StartCheck);
+      return 0;
+    }
+    // The peer asked for an arm at another frame.
+    const s32 other = m_peer_start.begin()->first;
+    Line(Fmt("ARM frame=%d refused: START_CHECK frame mismatch (own=%d peer=%d)", n, n, other));
+    m_sink.Osd(Fmt("Rev3 netplay: not arming (gate opened on frame %d here, %d at the peer); staying in lockstep", n, other));
+    m_peer_start.clear();
+    m_arm_blocked = true;
+    ++m_stats.arm_refused;
+    return 2;
+  }
+  const StartCheck theirs = it->second;
+  m_peer_start.erase(m_peer_start.begin(), m_peer_start.upper_bound(n));
+  const std::vector<std::string> mismatches = StartCheckMismatches(m_arm_mine, theirs);
+  if (!mismatches.empty())
+  {
+    Line(Fmt("ARM frame=%d refused: START_CHECK mismatch (%zu items)", n, mismatches.size()));
+    for (const std::string& m : mismatches)
+      Line("  START_CHECK " + m);
+    m_sink.Osd(Fmt("Rev3 netplay: not arming, the machines differ at frame %d (%s); staying in lockstep", n, mismatches.front().c_str()));
+    m_arm_blocked = true;
+    ++m_stats.arm_refused;
+    return 2;
+  }
+
+  m_mode = Mode::ARMED;
+  m_armed_frame = n;
+  m_verified = n - 1;
+  m_finalized = n - 1;
+  m_store.Clear();
+  for (Used& u : m_used)
+    u = Used{};
+  ++m_stats.gate_opens;
+  Line(Fmt("GATE open frame=%d why=%s", n, gate.why != nullptr ? gate.why : ""));
+  Line(Fmt("CHK start frame=%d value=0x%08X stable_crc=0x%08X (both machines agree)", n, m_arm_mine.checksum, m_arm_mine.stable_crc));
+  return 1;
+}
+
+// ---- ARMED -----------------------------------------------------------------------------------------------------------------------
+
+bool RollbackSession::StepArmed(const Command& command, const Gate& gate, Reply* reply)
+{
+  const s32 n = m_cur_frame;
+  const int maxr = m_cfg.max_rollback;
+
+  if (!gate.open)
+  {
+    EnterDrain(n, gate);
+    return StepDrain(command, gate, reply);
+  }
+
+  // Stall rule: the frames R+1..N are predicted; never more than MAXR of them. (Before the scan, so that a pad that arrives while we
+  // wait is seen by it and no rollback can reach further back than MAXR frames.)
+  if (n - Confirmed() > maxr)
+  {
+    if (!m_stalled_this_call)
+    {
+      m_stalled_this_call = true;
+      m_in_stall = true;
+      m_stall_start_us = m_net.Now();
+      ++m_stats.stalls;
+      Line(Fmt("STALL start frame=%d R=%d predicted=%d maxr=%d", n, Confirmed(), n - Confirmed(), maxr));
+    }
+    return Blocked(Block::Stall);
+  }
+  if (m_in_stall)
+    EndStall(false);
+
+  const s32 g = FindMisprediction(n);
+  if (g >= 0)
+  {
+    const bool quiet = gate.hardware_quiet;
+    const bool forced = !quiet && n - g >= maxr;  // postponing once more would make the rollback deeper than MAXR
+    if (quiet || forced)
+      return DoRollback(command, g, forced, reply);
+    if (!m_postpone_counted)
+    {
+      m_postpone_counted = true;
+      ++m_stats.postponed;
+      Line(Fmt("ROLLBACK postponed frame=%d live=%d depth=%d (hardware busy)", g, n, n - g));
+    }
+  }
+
+  CaptureInfo info;
+  if (!m_store.Capture(n, command.sp, &info))
+  {
+    Line(Fmt("ERROR frame %d: snapshot capture failed", n));
+    LeaveSession("snapshot capture failed", true);
+    return EndCall(n, EchoReply(command), reply);
+  }
+  const Pad8 local = LocalAt(n);
+  const bool known = n <= Confirmed();
+  const Pad8 remote = known ? RemoteAt(n) : Predict();
+  if (!known)
+    ++m_stats.predicted_frames;
+  CaptureUsed(n, local, remote, !known, info);
+  FinalizeChecks(n);
+  return EndCall(n, MakeReply(local, remote, 0, n), reply);
+}
+
+s32 RollbackSession::FindMisprediction(s32 frame)
+{
+  const s32 limit = std::min(Confirmed(), frame - 1);
+  for (s32 f = m_verified + 1; f <= limit; ++f)
+  {
+    const Used& u = UsedAt(f);
+    if (u.frame != f)  // cannot happen while the ring is larger than the longest unverified run; do not rollback to a frame we cannot name
+    {
+      Line(Fmt("ERROR frame %d: no record of what frame %d was played with", frame, f));
+      m_verified = f;
+      continue;
+    }
+    if (u.remote != RemoteAt(f))
+      return f;
+    m_verified = f;
+  }
+  return -1;
+}
+
+bool RollbackSession::DoRollback(const Command& command, s32 target, bool forced, Reply* reply)
+{
+  const s32 n = m_cur_frame;
+  const s32 depth = n - target;
+  if (!m_store.Has(target))
+  {
+    Line(Fmt("ERROR ROLLBACK frame=%d live=%d: no snapshot for the target", target, n));
+    LeaveSession(Fmt("no snapshot for frame %d (rollback from %d)", target, n), true);
+    *reply = EchoReply(command);
+    return true;
+  }
+  if (m_store.SlotSp(target) != command.sp)
+  {
+    Line(Fmt("ERROR ROLLBACK frame=%d live=%d: sp 0x%08X differs from the slot's 0x%08X (desync class)", target, n, command.sp,
+             m_store.SlotSp(target)));
+    LeaveSession(Fmt("hook sp differs at the rollback target %d", target), true);
+    *reply = EchoReply(command);
+    return true;
+  }
+  if (!m_store.Restore(target))
+  {
+    Line(Fmt("ERROR ROLLBACK frame=%d live=%d: restore failed", target, n));
+    LeaveSession(Fmt("restore of frame %d failed", target), true);
+    *reply = EchoReply(command);
+    return true;
+  }
+  ++m_stats.rollbacks;
+  m_stats.max_depth = std::max(m_stats.max_depth, static_cast<u32>(depth));
+  ++m_stats.depth_hist[std::min<size_t>(static_cast<size_t>(depth), m_stats.depth_hist.size() - 1)];
+  if (forced)
+    ++m_stats.forced_hw;
+  Line(Fmt("ROLLBACK depth=%d frame=%d live=%d R=%d%s", depth, target, n, Confirmed(), forced ? " forced=hardware_busy" : ""));
+
+  // The pads FOR the target frame: the remote one is known (that is how the misprediction was found).
+  const Pad8 local = LocalAt(target);
+  const Pad8 remote = RemoteAt(target);
+  Used& u = UsedAt(target);
+  u.local = local;
+  u.remote = remote;
+  u.predicted = false;
+
+  m_resim = true;
+  m_resim_target = n;
+  m_next_expected = target + 1;
+  m_cur_frame = -1;
+  m_block = Block::None;
+  m_stalled_this_call = false;
+  m_postpone_counted = false;
+  *reply = MakeReply(local, remote, REPLY_FLAG_RESTORED, target);
+  return true;
+}
+
+bool RollbackSession::StepResim(const Command& command, const Gate& gate, Reply* reply)
+{
+  const s32 m = m_cur_frame;
+  if (m != m_next_expected)
+  {
+    Line(Fmt("ERROR RESIM expected frame %d, the game sent %d (restore not honoured?); back to lockstep", m_next_expected, m));
+    m_resim = false;
+    m_mode = Mode::LOCKSTEP;
+    m_store.Clear();
+    m_expected_next = m;
+    m_input_frame = -1;
+    m_cur_frame = -1;
+    return StepInner(command, gate, reply);
+  }
+  const bool drain = m_mode == Mode::DRAIN;
+  const bool last = m == m_resim_target;
+  if (drain && last && Confirmed() < m)
+    return Blocked(Block::DrainB);
+
+  const Pad8 local = LocalAt(m);
+  const bool known = m <= Confirmed();
+  const Pad8 remote = known ? RemoteAt(m) : Predict();
+  CaptureInfo info;
+  if (!m_store.Capture(m, command.sp, &info))
+  {
+    Line(Fmt("ERROR RESIM frame %d: snapshot capture failed", m));
+    LeaveSession("snapshot capture failed during the resimulation", true);
+    m_cur_frame = -1;
+    *reply = EchoReply(command);
+    return true;
+  }
+  ++m_stats.resim_calls;
+  if (!known)
+    ++m_stats.predicted_frames;
+  CaptureUsed(m, local, remote, !known, info);
+  m_next_expected = m + 1;
+  if (!last)
+    return EndCall(m, MakeReply(local, remote, 0, m), reply);
+
+  // The second run of the call that was live when the rollback began: the resimulation is over.
+  m_resim = false;
+  Line(Fmt("RESIM done frame=%d", m));
+  if (drain)
+    return FinishDrain(command, reply);
+  return EndCall(m, MakeReply(local, remote, 0, m), reply);
+}
+
+// ---- DRAIN -----------------------------------------------------------------------------------------------------------------------
+
+void RollbackSession::EnterDrain(s32 frame, const Gate& gate)
+{
+  m_mode = Mode::DRAIN;
+  m_arm_blocked = false;
+  ++m_stats.gate_closes;
+  Line(Fmt("GATE close frame=%d why=%s", frame, gate.why != nullptr ? gate.why : ""));
+}
+
+bool RollbackSession::StepDrain(const Command& command, const Gate& gate, Reply* reply)
+{
+  const s32 n = m_cur_frame;
+  if (Confirmed() < n - 1)
+    return Blocked(Block::DrainA);
+  const s32 g = FindMisprediction(n);
+  if (g >= 0)
+    return DoRollback(command, g, !gate.hardware_quiet, reply);  // draining cannot wait for the hardware: a rollback is due now
+  return FinishDrain(command, reply);
+}
+
+bool RollbackSession::FinishDrain(const Command& command, Reply* reply)
+{
+  const s32 n = m_cur_frame;
+  if (Confirmed() < n)
+    return Blocked(Block::DrainB);
+  m_verified = n - 1;  // every remote pad below n is confirmed, and the resimulation (if any) played them as confirmed
+  FinalizeChecks(n - 1);
+  if (m_mode == Mode::OFFLINE)
+    return EndCall(n, EchoReply(command), reply);
+  Line(Fmt("DRAIN done frame=%d", n));
+  m_mode = Mode::LOCKSTEP;
+  m_store.Clear();
+  LockstepCheck(n);
+  return EndCall(n, MakeReply(LocalAt(n), RemoteAt(n), 0, n), reply);
+}
+
+// ---- stall bookkeeping -----------------------------------------------------------------------------------------------------------
+
+void RollbackSession::EndStall(bool hit_timeout)
+{
+  if (!m_in_stall)
+    return;
+  m_in_stall = false;
+  const u64 now = m_net.Now();
+  const u64 us = now >= m_stall_start_us ? now - m_stall_start_us : 0;
+  m_stats.stall_us_total += us;
+  m_stats.stall_us_max = std::max(m_stats.stall_us_max, us);
+  Line(Fmt("STALL %s frame=%d ms=%.1f R=%d", hit_timeout ? "timeout" : "end", m_cur_frame, static_cast<double>(us) / 1000.0, Confirmed()));
+}
+
+// ---- checksums -------------------------------------------------------------------------------------------------------------------
+
+void RollbackSession::FinalizeChecks(s32 limit)
+{
+  const s32 vlimit = std::min(limit, m_verified + 1);
+  for (s32 f = m_finalized + 1; f <= vlimit && m_mode != Mode::OFFLINE; ++f)
+  {
+    const Used& u = UsedAt(f);
+    if (u.frame == f && u.has_checksum)
+    {
+      if (m_final_observer)
+        m_final_observer(f, u.checksum);
+      if (f % CHECK_INTERVAL == 0)
+        RecordFinal(f, u.checksum, u.has_fields ? &u.fields : nullptr);
+    }
+    m_finalized = f;
+  }
+}
+
+void RollbackSession::LockstepCheck(s32 frame)
+{
+  if (frame < 0 || frame % CHECK_INTERVAL != 0)
+    return;
+  FieldSet fields;
+  const u32 value = m_store.LiveChecksum(frame, &fields);
+  RecordFinal(frame, value, &fields);
+}
+
+void RollbackSession::RecordFinal(s32 frame, u32 value, const FieldSet* fields)
+{
+  m_own[frame] = OwnCheck{value, false};
+  if (fields != nullptr)
+    m_own_fields[frame] = *fields;
+  while (m_own.size() > CHECK_KEEP)
+    m_own.erase(m_own.begin());
+  while (m_own_fields.size() > CHECK_KEEP)
+    m_own_fields.erase(m_own_fields.begin());
+  m_send_chk_frame = frame;  // rides in every PAD packet from the next SendLocal on
+  m_send_chk_value = value;
+  CompareChecksums();
+}
+
+void RollbackSession::CompareChecksums()
+{
+  if (m_mode == Mode::OFFLINE)
+    return;
+  for (auto& entry : m_own)
+  {
+    if (entry.second.compared)
+      continue;
+    const auto peer = m_peer.find(entry.first);
+    if (peer == m_peer.end())
+      continue;
+    entry.second.compared = true;
+    if (peer->second == entry.second.value)
+    {
+      ++m_stats.checks_ok;
+      Line(Fmt("CHK frame=%d value=0x%08X", entry.first, entry.second.value));
+      m_peer.erase(peer);
+    }
+    else
+    {
+      Desync(entry.first, entry.second.value, peer->second);
+      return;
+    }
+  }
+  // A peer value older than our oldest kept one can never be compared any more.
+  if (!m_own.empty())
+    m_peer.erase(m_peer.begin(), m_peer.lower_bound(m_own.begin()->first));
+}
+
+DesyncDump RollbackSession::BuildDump(s32 frame)
+{
+  DesyncDump dump;
+  dump.frame = frame;
+  for (s32 f = std::max(0, frame - CHECK_INTERVAL); f <= frame; ++f)
+  {
+    FieldSet fields;
+    if (m_store.Fields(f, &fields))
+      dump.trace.emplace_back(f, fields);
+    else
+    {
+      const auto own = m_own_fields.find(f);
+      if (own != m_own_fields.end())
+        dump.trace.emplace_back(f, own->second);
+    }
+  }
+  return dump;
+}
+
+void RollbackSession::Desync(s32 frame, u32 own, u32 peer)
+{
+  ++m_stats.checks_bad;
+  Line(Fmt("DESYNC frame=%d own=0x%08X peer=0x%08X (the previous check frame matched: the divergence lies in (%d, %d])", frame, own, peer,
+           frame - CHECK_INTERVAL, frame));
+  m_sink.Osd(Fmt("Rev3 netplay: desync at frame %d, leaving the session", frame));
+  m_own_dump = BuildDump(frame);
+  m_dump_pending = true;
+  m_dump_polls = 0;
+  m_net.SendReliable(MsgType::DesyncDump, SerializeDesyncDump(m_own_dump));
+  LeaveSession("desync", true);
+}
+
+void RollbackSession::CompareDumps(const DesyncDump& peer)
+{
+  m_dump_pending = false;
+  for (const auto& theirs : peer.trace)
+  {
+    for (const auto& ours : m_own_dump.trace)
+    {
+      if (ours.first != theirs.first || ours.second == theirs.second)
+        continue;
+      std::vector<std::string> lines;
+      const size_t n = DiffFields(ours.second, theirs.second, 3, &lines);
+      Line(Fmt("DESYNC first_diff frame=%d fields_differing=%zu", ours.first, n));
+      for (const std::string& line : lines)
+        Line("  " + line);
+      return;
+    }
+  }
+  Line(Fmt("DESYNC dump: no differing frame in the common trace (own %zu frames, peer %zu frames)", m_own_dump.trace.size(),
+           peer.trace.size()));
+}
+
+// ---- messages and lifecycle ----------------------------------------------------------------------------------------------------
+
+void RollbackSession::PollOffline()
+{
+  if (!m_dump_pending)
+    return;
+  PumpMessages();
+  if (++m_dump_polls > 600)  // about 10 s of game frames: the peer's dump is not coming
+    m_dump_pending = false;
+}
+
+void RollbackSession::PumpMessages()
+{
+  const std::vector<PeerChecksum> seen = m_net.TakePeerChecksums();
+  if (m_mode != Mode::OFFLINE)
+  {
+    for (const PeerChecksum& e : seen)
+      m_peer[e.frame] = e.value;
+    while (m_peer.size() > 4 * CHECK_KEEP)
+      m_peer.erase(m_peer.begin());
+  }
+  Message message;
+  while (m_net.PollReliable(&message))
+    HandleMessage(message);
+  if (m_mode != Mode::OFFLINE)
+    CompareChecksums();
+}
+
+void RollbackSession::HandleMessage(const Message& message)
+{
+  switch (message.type)
+  {
+  case MsgType::Hello:
+  {
+    if (m_mode != Mode::CONNECTING || m_peer_hello_ok)
+      return;
+    Hello theirs;
+    if (!ParseHello(message.bytes, &theirs))
+    {
+      Line("ERROR bad HELLO message");
+      LeaveSession("malformed HELLO from the peer", true);
+      return;
+    }
+    const std::vector<std::string> mismatches = HelloMismatches(m_cfg.hello, theirs);
+    if (!mismatches.empty())
+    {
+      Line(Fmt("HELLO mismatch (%zu items), refusing the session:", mismatches.size()));
+      for (const std::string& item : mismatches)
+        Line("  HELLO " + item);
+      m_sink.Osd("Rev3 netplay: the two machines differ (" + mismatches.front() + "); playing offline");
+      LeaveSession("HELLO mismatch: " + mismatches.front(), true);
+      return;
+    }
+    if (m_cfg.role == Role::Guest)
+    {
+      const int host_delay = static_cast<int>(std::min<u32>(theirs.delay, static_cast<u32>(MAX_DELAY)));
+      if (host_delay != m_delay)
+        Line(Fmt("HELLO input delay: the host's %d wins (own %d)", host_delay, m_delay));
+      m_delay = host_delay;
+    }
+    m_peer_hello_ok = true;
+    Line(Fmt("HELLO ok peer=%s game=%s protocol=%u delay=%d items=%zu", RoleName(theirs.role), theirs.game_id.c_str(), theirs.protocol,
+             m_delay, theirs.items.size()));
+    return;
+  }
+  case MsgType::StartCheck:
+  {
+    StartCheck check;
+    if (m_mode == Mode::OFFLINE || !ParseStartCheck(message.bytes, &check))
+      return;
+    m_peer_start[check.frame] = check;
+    while (m_peer_start.size() > 8)
+      m_peer_start.erase(m_peer_start.begin());
+    return;
+  }
+  case MsgType::DesyncDump:
+  {
+    DesyncDump dump;
+    if (!ParseDesyncDump(message.bytes, &dump))
+      return;
+    if (m_mode != Mode::OFFLINE)
+    {
+      // The peer saw the mismatch first: record what we have, answer with our dump, leave.
+      ++m_stats.checks_bad;
+      Line(Fmt("DESYNC frame=%d reported by the peer", dump.frame));
+      m_sink.Osd(Fmt("Rev3 netplay: desync at frame %d, leaving the session", dump.frame));
+      m_own_dump = BuildDump(dump.frame);
+      m_net.SendReliable(MsgType::DesyncDump, SerializeDesyncDump(m_own_dump));
+      m_dump_pending = true;
+      CompareDumps(dump);
+      LeaveSession("desync (reported by the peer)", true);
+      return;
+    }
+    if (m_dump_pending)
+      CompareDumps(dump);
+    return;
+  }
+  case MsgType::Bye:
+  {
+    if (m_mode == Mode::OFFLINE)
+      return;
+    const std::string reason(message.bytes.begin(), message.bytes.end());
+    Line("BYE from the peer: " + reason);
+    LeaveSession("the peer left (" + reason + ")", false);
+    return;
+  }
+  }
+}
+
+void RollbackSession::SendHello()
+{
+  m_cfg.hello.role = m_cfg.role;
+  m_cfg.hello.delay = static_cast<u32>(m_delay);
+  m_net.SendReliable(MsgType::Hello, SerializeHello(m_cfg.hello));
+  m_hello_sent = true;
+  Line(Fmt("HELLO sent role=%s game=%s protocol=%u fields_digest=0x%08X delay=%d items=%zu", RoleName(m_cfg.role),
+           m_cfg.hello.game_id.c_str(), m_cfg.hello.protocol, m_cfg.hello.fields_digest, m_delay, m_cfg.hello.items.size()));
+}
+
+void RollbackSession::LeaveSession(const std::string& why, bool tell_peer)
+{
+  if (m_mode == Mode::OFFLINE)
+    return;
+  Line(Fmt("LEAVE frame=%d from=%s reason=%s", m_cur_frame, ModeName(m_mode), why.c_str()));
+  m_sink.Osd("Rev3 netplay: " + why + " (continuing offline)");
+  if (tell_peer && m_net.State() != ConnState::Failed)
+    m_net.SendReliable(MsgType::Bye, std::vector<u8>(why.begin(), why.end()));
+  if (!m_finished)
+  {
+    m_finished = true;
+    SummaryLine("SUMMARY");
+  }
+  m_mode = Mode::OFFLINE;
+  m_resim = false;
+  m_cur_frame = -1;
+  m_block = Block::None;
+  m_store.Clear();
+}
+
+void RollbackSession::SummaryLine(const char* tag)
+{
+  std::string hist;
+  for (size_t d = 1; d < m_stats.depth_hist.size(); ++d)
+    if (m_stats.depth_hist[d] != 0)
+      hist += Fmt("%s%zu:%u", hist.empty() ? "" : ",", d, m_stats.depth_hist[d]);
+  Line(Fmt("%s mode=%s frame=%d calls=%u resim_calls=%u rollbacks=%u max_depth=%u depth_hist=[%s] predicted=%u stalls=%u stall_ms_max=%.1f "
+           "postponed=%u forced_hw=%u chk_ok=%u chk_bad=%u gate_opens=%u gate_closes=%u arm_refused=%u",
+           tag, ModeName(m_mode), m_expected_next, m_stats.calls, m_stats.resim_calls, m_stats.rollbacks, m_stats.max_depth, hist.c_str(),
+           m_stats.predicted_frames, m_stats.stalls, static_cast<double>(m_stats.stall_us_max) / 1000.0, m_stats.postponed,
+           m_stats.forced_hw, m_stats.checks_ok, m_stats.checks_bad, m_stats.gate_opens, m_stats.gate_closes, m_stats.arm_refused));
+}
+
+void RollbackSession::Finish()
+{
+  if (m_finished)
+    return;
+  m_finished = true;
+  SummaryLine("SUMMARY final");
+}
+}  // namespace Rev3::Net
