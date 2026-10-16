@@ -43,6 +43,12 @@
 //   REV3_EF_POOL=0           do not force the nw4r::ef (effect / particle) pool into the snapshot at arm (default 1, see "THE EFFECT POOL")
 //   REV3_SNAPSHOT_INCLUDE=path   JSON, same entries as REV3_SYNCTEST_EXCLUDE ({"start","end"} or {"ptr","size"}): always in the snapshot
 //   REV3_EFCHECK=N|all|0     list consistency check of the effect system after the first N restores (default 200; all = every restore)
+//   REV3_RB_VERIFY=N|all     restore verify (off by default): keep full shadow copies of guest memory (88 MB each) and after N restores compare ALL
+//                            memory with the shadow of the frame restored to, in 32-byte blocks; the blocks that differ are pages the snapshot set
+//                            misses (see "restore verify" below, REV3.md "Restore verify"). Also REV3_RB_VERIFY_EVERY / _SLOTS / _HEAL / _STACK_BELOW /
+//                            _IGNORE (ParseVerifyEnv)
+//   REV3_RESIM_HIDE=0|1|2|3  (or off|draw|sound|all) hook protocol 3 only (M6): what the game hides while a resimulation runs, written as a u32 to
+//                            0x8000241C (default 1 = draw; see "hiding resimulated frames" below). Netplay always; SyncTest with REV3_SYNCTEST_HIDE=1
 //   SyncTest only runs once armed (both fighters found through the TEAMS pointers); menus and loading screens are never
 //   rolled back. See REV3.md for what a clean run looks like.
 //
@@ -104,6 +110,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -118,9 +125,12 @@ class System;
 
 namespace Rev3
 {
-// ---- the wire protocol (version 2), all big-endian ------------------------------------------------------------------------
+// ---- the wire protocol (version 2 and 3), all big-endian ---------------------------------------------------------------------
+// Protocol 3 (rev3-mod rbhook.py build(version=3), docs/resim_skip.md) has the very same command and reply layout; the version byte only
+// says that the game carries the resimulation-hiding patches, which read the flag word HIDE_FLAGS_ADDR. ParseCommand accepts both.
 constexpr u8 CMD_ID = 0xA0;                // +0x00
-constexpr u8 PROTOCOL_VERSION = 2;         // +0x01
+constexpr u8 PROTOCOL_VERSION = 2;         // +0x01 the baseline protocol
+constexpr u8 PROTOCOL_VERSION_HIDE = 3;    // +0x01 baseline + the hiding patches (M6)
 constexpr u32 CMD_MAGIC = 0x52424B31;      // +0x04 "RBK1"
 constexpr u32 REPLY_MAGIC = 0x52425231;    // +0x00 of the reply, "RBR1"
 constexpr size_t CMD_SIZE = 64;
@@ -131,6 +141,7 @@ using PadBytes = std::array<u8, 12>;       // one PADStatus (buttons u16, stickX
 
 struct Command
 {
+  u8 protocol = PROTOCOL_VERSION;          // +0x01 the hook's protocol version (2 or 3)
   u32 frame = 0;                           // +0x08 the hook's frame counter
   std::array<PadBytes, 2> pads{};          // +0x0C port 0, +0x18 port 1
   s32 pad_return = 0;                      // +0x24 return value of the real PADRead
@@ -146,7 +157,7 @@ struct Reply
 
 // True when `data` is a command of ours: size >= 64, byte 0 == 0xA0, magic "RBK1" at +4. (Version is checked by ParseCommand.)
 bool IsCommand(const u8* data, size_t size);
-bool ParseCommand(const u8* data, size_t size, Command* out);  // false: not ours or an unknown version
+bool ParseCommand(const u8* data, size_t size, Command* out);  // false: not ours or a version other than 2 and 3
 void EncodeReply(const Reply& reply, u8* out64);                 // fills exactly REPLY_SIZE bytes
 
 // ---- whitelist ------------------------------------------------------------------------------------------------------------
@@ -201,6 +212,21 @@ struct RangeHash
   u32 end = 0;  // exclusive
   u32 crc = 0;
 };
+
+// ---- learned-page reporting (pure helpers; tools/rollback/learned_include.py reads what they print) ----------------------------
+// "0xSTART-0xEND,0xSTART-0xEND,..." in the order given; at most `max_listed` entries, then ",+N more" (N = the rest). An empty list gives "".
+std::string FormatRangeList(const std::vector<Range>& ranges, size_t max_listed);
+// The bytes in `ranges` (they are assumed not to overlap, e.g. MergeRanges output), and that many 4 KB pages, rounded up.
+u64 RangesBytes(const std::vector<Range>& ranges);
+u64 RangesPages(const std::vector<Range>& ranges);
+// `after` minus `before`: the parts of `after` that `before` does not cover (sorted, merged).
+std::vector<Range> NewRanges(const std::vector<Range>& after, const std::vector<Range>& before);
+// How many ranges of `fresh` touch (share a boundary with) a range of `old`: a page learned right next to a page that was already
+// in the set, i.e. what REV3_SNAPSHOT_PAD would have caught.
+size_t CountTouching(const std::vector<Range>& fresh, const std::vector<Range>& old);
+// Widens every range by `pad_bytes` at both ends, clipped to the MEM1 / MEM2 region that holds it (never across the gap between them);
+// the result is merged. Ranges outside both regions are kept as they are. pad_bytes 0 = MergeRanges only.
+std::vector<Range> PadRanges(std::vector<Range> ranges, u32 pad_bytes);
 
 // REV3_SNAPSHOT_INCLUDE: parses `json_text` with the very entry formats ApplyExclusions takes ({"start","end"} ranges and pointer based
 // {"ptr","size","note"} entries) but for the opposite purpose: the regions are forced INTO the snapshot set when SyncTest (or a netplay
@@ -384,6 +410,54 @@ public:
   virtual void OsdInfo(const std::string& text) { Osd(text); }  // an on-screen message that is good news (green in the real sink)
 };
 
+// ---- hiding resimulated frames, hook protocol 3 (milestone M6; rev3-mod docs/resim_skip.md) ----------------------------------------
+// With protocol 3 the game draws nothing / starts no sounds while the u32 at HIDE_FLAGS_ADDR (inside the hook region, so never in a
+// snapshot) says so: bit 0 HIDE_DRAW (no 3D draw, no EFB copy, no presenting), bit 1 HIDE_SOUND (nw4r StartSound returns "started" without
+// starting). The fork writes the word big-endian from the CPU thread: the flags while a resimulation runs, 0 otherwise (at the end of every
+// resimulation, when the session leaves, at shutdown). Two u32 counters in the same region tell whether the patches ran at all.
+constexpr u32 HIDE_FLAGS_ADDR = 0x8000241C;        // rbhook.D_FLAGS (hook data block +0x1C)
+constexpr u32 HIDE_ITERATIONS_ADDR = 0x800029E4;   // rbhook.V3_DATA +4: main-loop iterations that skipped drawing
+constexpr u32 HIDE_SOUNDS_ADDR = 0x800029E8;       // rbhook.V3_DATA +8: sound starts that were skipped
+constexpr u32 HIDE_DRAW = 1;                       // FLAGS bit 0
+constexpr u32 HIDE_SOUND = 2;                      // FLAGS bit 1
+constexpr u32 HIDE_ALL = HIDE_DRAW | HIDE_SOUND;
+constexpr u32 HIDE_DEFAULT = HIDE_DRAW;            // REV3_RESIM_HIDE unset: draw only (sounds as v1) until `all` has been listened to (resim_skip.md 3.4)
+
+// REV3_RESIM_HIDE: "" -> HIDE_DEFAULT; "0" / "off" -> 0; "1" / "draw"; "2" / "sound"; "3" / "all" (case does not matter). False (and *flags =
+// HIDE_DEFAULT) when the text is none of these.
+bool ParseResimHide(const std::string& text, u32* flags);
+
+class ResimHideFlags
+{
+public:
+  // `flags`: what Set(true) writes (0 = hiding by flag is off). `log` (optional, not owned): the one-time NOTE lines.
+  ResimHideFlags(GuestMemory& memory, u32 flags, Sink* log = nullptr);
+  // The protocol of the command just received (every command; the first one decides). Only protocol 3 has a flag word.
+  void SetProtocol(u8 protocol);
+  u8 Protocol() const { return m_protocol; }
+  u32 Flags() const { return m_flags; }
+  // True: write the flags; false: write 0. Does nothing with protocol 2, flags 0, or when that value is already in the word. CPU thread.
+  void Set(bool hidden);
+  bool Hidden() const { return m_hidden; }
+  u32 Writes() const { return m_writes; }
+  // The two guest counters; false when the protocol is not 3 or the memory is not readable.
+  bool ReadCounters(u32* hidden_iterations, u32* skipped_sounds) const;
+  // " hide_protocol=3 hide_flags=1 hide_writes=4 hidden_iterations=12 skipped_sounds=0" (leading space), appended to SUMMARY lines.
+  std::string SummaryFields() const;
+
+private:
+  GuestMemory& m_memory;
+  Sink* m_log;
+  u32 m_flags;
+  u8 m_protocol = 0;          // 0 = no command yet
+  bool m_hidden = false;      // the latest Set()
+  bool m_known = false;       // m_word is what the guest word holds
+  u32 m_word = 0;
+  u32 m_writes = 0;
+  bool m_noted_on = false;
+  bool m_noted_v2 = false;
+};
+
 // ---- freeze dump (REV3_SYNCTEST_DUMP) ---------------------------------------------------------------------------------------
 // A read-only state dump into the Rev3 log, to see WHERE the game is stuck when SyncTest freezes it (a thread waiting on a hardware event
 // whose software flag was rewound: GX draw done, VI retrace, DVD, AX, IPC). Every line starts with `DUMP <reason> `. Taken (a) when
@@ -501,6 +575,156 @@ private:
   std::atomic<bool> m_seen{false};  // a command arrived at least once
 };
 
+// ---- restore verify (REV3_RB_VERIFY) ------------------------------------------------------------------------------------------
+// "Is guest memory after a restore really what it was when the snapshot was taken?" The snapshot set only rewinds the pages it knows;
+// a page outside the set that the game wrote in the rolled-back frames keeps its new contents (a hit-spark particle in a page the
+// adaptive tracker had not found yet made the effect lists circular and froze the game). The verifier keeps a SHADOW: a full copy of
+// guest MEM1 + MEM2 taken at the same moment as the snapshot of a frame, and after a restore to that frame compares ALL guest memory
+// with it in 32-byte blocks. A block that differs is "wrong": either a page the set misses (outside_set, the useful finding) or memory
+// the restore failed to rewind / something wrote behind it (in_set, a bug or a host thread).
+// Cost: a shadow is 24 + 64 MB (88 MB) per kept frame and taking one is a memcpy of that (about 8-15 ms); a check reads both copies
+// again (about 5-10 ms). So shadows are taken only for every `every`-th frame and only `slots` of them are kept (a rotating ring,
+// slot = (frame / every) % slots); a restore is verified only when it lands on a frame that still has its shadow. After `restores`
+// verified restores shadows stop being taken (the cost disappears). Off by default (restores = 0): no memory, no copies.
+constexpr u32 VERIFY_ALL = 0xFFFFFFFFu;        // VerifyOptions::restores: never stop
+constexpr u32 VERIFY_BLOCK_BYTES = 32;         // granularity of the comparison and of the counts (HowlingWind reports 32-byte blocks too)
+constexpr u32 VERIFY_REGION_BYTES = 0x10000;   // 64 KB regions of the per-region counts
+constexpr u32 VERIFY_FIRST_WORDS = 8;          // words of the first wrong block that are printed (one block = 8 words)
+constexpr u32 VERIFY_MAX_REGIONS_LISTED = 16;  // regions named in one VERIFY line
+constexpr u32 VERIFY_MAX_PAGE_RANGES_LISTED = 16;
+constexpr u32 VERIFY_MAX_WRONG_LOGS = 30;      // restores with wrong blocks that get the full VERIFY lines; the rest only count
+constexpr u32 VERIFY_MAX_OK_LOGS = 3;          // clean restores that get a line ("VERIFY restore n -> m ok ...")
+
+struct VerifyOptions
+{
+  u32 restores = 0;      // REV3_RB_VERIFY=N: verify the first N restores that land on a shadowed frame (count); VERIFY_ALL = all; 0 = off
+  u32 every = 0;         // REV3_RB_VERIFY_EVERY=P: take a shadow when frame % P == 0 (frames); 0 = automatic (the owner picks, SyncTest: K + 1)
+  u32 slots = 1;         // REV3_RB_VERIFY_SLOTS=S: shadows kept (1..8), 88 MB each (MEM1 + MEM2)
+  bool heal = false;     // REV3_RB_VERIFY_HEAL=1: copy the shadow's bytes back over wrong blocks and add their pages to the set (next layout)
+  u32 stack_below = 0x4000;  // REV3_RB_VERIFY_STACK_BELOW: bytes below the hook's sp that are dead stack and never compared (bytes), used when
+                             // the running thread's stack end cannot be read from the OSThread
+};
+
+// What to compare after one restore.
+struct VerifyInput
+{
+  u32 from_frame = 0;                  // the frame the restore was asked at (log only)
+  u32 to_frame = 0;                    // the frame restored: its shadow is compared
+  std::vector<Range> skip;             // memory nobody rewinds on purpose (hook region, hardware cuts, user exclusions, dead stack)
+  std::vector<Range> in_set;           // the memory the restore rewrote (snapshot ranges + the stack window)
+};
+
+struct VerifyRegionCount
+{
+  u32 base = 0;     // start of the 64 KB region
+  u32 blocks = 0;   // wrong 32-byte blocks inside it
+  u32 pages = 0;    // wrong 4 KB pages inside it
+};
+
+struct VerifyResult
+{
+  bool checked = false;           // a shadow of to_frame existed and was compared
+  u32 wrong_blocks = 0;           // 32-byte blocks that differ
+  u32 wrong_pages = 0;            // 4 KB pages holding at least one
+  u32 in_set_blocks = 0;          // ... of which inside the memory the restore rewrote (restore bug or a host thread writing)
+  u32 outside_set_blocks = 0;     // ... of which outside it (pages the set is missing)
+  u64 compared_bytes = 0;
+  u64 skipped_bytes = 0;          // bytes not compared (skip ranges, memory that is not there)
+  u32 first_addr = 0;             // the first wrong block (lowest address); first_snapshot / first_memory = its 8 words
+  std::array<u32, VERIFY_FIRST_WORDS> first_snapshot{};
+  std::array<u32, VERIFY_FIRST_WORDS> first_memory{};
+  bool has_first_in_set = false;  // the first wrong block that lies in the rewritten memory, if any
+  u32 first_in_set_addr = 0;
+  std::array<u32, VERIFY_FIRST_WORDS> first_in_set_snapshot{};
+  std::array<u32, VERIFY_FIRST_WORDS> first_in_set_memory{};
+  std::vector<VerifyRegionCount> regions;  // 64 KB regions with wrong blocks, ascending
+  std::vector<Range> outside_pages;        // 4 KB pages with wrong blocks outside the rewritten memory, merged
+  std::vector<Range> healed_pages;         // pages whose wrong blocks were overwritten with the shadow (heal), merged
+  u32 healed_blocks = 0;
+  u64 us = 0;                     // time of the comparison (and the heal)
+};
+
+class RestoreVerifier
+{
+public:
+  // `micros` is a monotonic clock in microseconds (default: steady_clock). Allocates nothing until the first shadow is taken.
+  RestoreVerifier(const VerifyOptions& options, GuestMemory& memory, Sink& sink, std::function<u64()> micros = {});
+
+  // True while shadows are still wanted: enabled and the budget of verified restores is not used up.
+  bool Active() const { return m_options.restores != 0 && (m_options.restores == VERIFY_ALL || m_checked < m_options.restores); }
+  // True when `frame` should get a shadow now (Active and frame % every == 0).
+  bool WantsShadow(u32 frame) const { return Active() && m_options.every != 0 && frame % m_options.every == 0; }
+  // Copies all of guest MEM1 + MEM2 (the parts that exist) into the shadow slot of `frame`. False: a read failed (nothing is kept).
+  bool TakeShadow(u32 frame);
+  bool HasShadow(u32 frame) const;
+  void DropShadows();  // forget every shadow (the memory stays allocated)
+
+  // Compares all guest memory with the shadow of in.to_frame, 32-byte blocks, minus in.skip. With options.heal also copies the shadow's
+  // bytes back over every wrong block (and reports their pages in healed_pages). result.checked is false when there is no shadow.
+  // Counts the restore as verified (budget) and updates the totals below. Does not log (SyncTest formats the lines).
+  VerifyResult Check(const VerifyInput& in);
+
+  const VerifyOptions& Options() const { return m_options; }
+  // Totals over all checks.
+  u32 Checked() const { return m_checked; }                    // restores verified
+  u32 Wrong() const { return m_wrong; }                        // ... that left at least one wrong block
+  u64 WrongBlocksTotal() const { return m_blocks_total; }      // wrong blocks summed over the restores
+  u64 InSetBlocksTotal() const { return m_in_set_total; }
+  u64 OutsideSetBlocksTotal() const { return m_outside_total; }
+  u64 DistinctBlocks() const { return m_distinct_blocks; }     // different 32-byte blocks that were ever wrong
+  u64 DistinctPages() const { return m_distinct_pages; }       // different 4 KB pages that were ever wrong
+  u32 FirstWrongFrom() const { return m_first_wrong_from; }    // the first restore that left memory wrong: asked at this frame ...
+  u32 FirstWrongTo() const { return m_first_wrong_to; }        // ... back to this one ...
+  u32 FirstWrongBlocks() const { return m_first_wrong_blocks; }  // ... with this many wrong blocks (0: none so far)
+  u32 Shadows() const { return m_shadows; }                    // shadows taken
+  u64 ShadowUs() const { return m_shadow_us + m_check_us; }    // time spent copying shadows and comparing (microseconds)
+  size_t ShadowBytes() const;                                  // bytes held by the shadow slots now
+
+private:
+  struct Shadow
+  {
+    bool valid = false;
+    u32 frame = 0;
+    std::array<std::vector<u8>, 2> data;  // MEM1, MEM2
+  };
+  Shadow& SlotFor(u32 frame) { return m_slots[(frame / m_options.every) % m_slots.size()]; }
+  const Shadow& SlotFor(u32 frame) const { return m_slots[(frame / m_options.every) % m_slots.size()]; }
+  void Probe();
+  const u8* View(u32 addr, size_t n);  // host pointer to guest memory (Peek, or a copy in m_buf)
+
+  VerifyOptions m_options;
+  GuestMemory& m_memory;
+  Sink& m_sink;
+  std::function<u64()> m_micros;
+  std::vector<Shadow> m_slots;
+  std::array<bool, 2> m_present{};  // MEM1 / MEM2 readable (probed once)
+  bool m_probed = false;
+  bool m_error_logged = false;
+  std::vector<u8> m_buf;
+  std::vector<u64> m_seen_blocks;   // bitmap of 32-byte blocks that were ever wrong (MEM1 then MEM2)
+  std::vector<u64> m_seen_pages;    // bitmap of 4 KB pages that were ever wrong
+  u32 m_checked = 0;
+  u32 m_wrong = 0;
+  u64 m_blocks_total = 0;
+  u64 m_in_set_total = 0;
+  u64 m_outside_total = 0;
+  u64 m_distinct_blocks = 0;
+  u64 m_distinct_pages = 0;
+  u32 m_first_wrong_from = 0;
+  u32 m_first_wrong_to = 0;
+  u32 m_first_wrong_blocks = 0;
+  u32 m_shadows = 0;
+  u64 m_shadow_us = 0;
+  u64 m_check_us = 0;
+};
+
+// "gcd(a, b) divides k" test used to pick shadow frames that a SyncTest (roll back K frames every EVERY-th frame) restores to: a restore at
+// frame n goes to n - K, so shadows at frame % P == 0 are hit only when some multiple of P is congruent to -K modulo EVERY.
+bool VerifyEveryCanHit(u32 every_p, u32 k, u32 sync_every);
+// The smallest P >= K + 1 for which VerifyEveryCanHit holds (K + 1 keeps one shadow alive until its restore: the next shadow is taken K + 1
+// frames later).
+u32 AutoVerifyEvery(u32 k, u32 sync_every);
+
 // ---- SyncTest -------------------------------------------------------------------------------------------------------------
 struct SyncTestOptions
 {
@@ -521,8 +745,12 @@ struct SyncTestOptions
   u32 scan_slices = 16;           // REV3_SYNCTEST_SCAN_SLICES: each hook call hashes 1/scan_slices of all pages (1..4096)
   u32 learn_cycles = 20;          // REV3_SYNCTEST_LEARN: full scan cycles (scan_slices calls each) needed before arming
   bool ef_pool = true;            // REV3_EF_POOL: force the nw4r::ef pool into the snapshot set at arm (FindEfPool)
+  u32 learn_pad_pages = 0;        // REV3_SNAPSHOT_PAD: every page the tracker learned also pulls this many 4 KB pages on each side into the set
+                                  // (0 = off, 0..16). More bytes per snapshot (see the NOTE learn pad line), fewer late relayouts when a game
+                                  // block spans pages that change one after the other. A page that never changes costs only copy time.
   u32 ef_check_restores = 200;    // REV3_EFCHECK: restores (count, not frames) that get the ef list check before / after the write-back;
                                   // 0 = off, EF_CHECK_ALL = every restore. 200 restores = 200 checks of a few thousand reads each (microseconds)
+  VerifyOptions verify;           // REV3_RB_VERIFY*: shadow copy of guest memory and a full comparison after restores (see "restore verify" above)
 };
 
 constexpr u32 EF_CHECK_ALL = 0xFFFFFFFFu;  // SyncTestOptions::ef_check_restores: check every restore
@@ -587,6 +815,7 @@ struct SyncTestStats
   u32 ef_bad_before = 0;          // checks before a restore that found a broken list (the game's own state was already bad)
   u32 layout_refused = 0;         // restores refused because the snapshot was taken under another snapshot layout
   u32 late_learn_rollbacks = 0;   // rollbacks done within one scan cycle before pages were learned (those pages were not rewound)
+  u32 verify_pages_added = 0;     // pages the restore verify (heal) added to the snapshot set
 };
 
 class SyncTest
@@ -615,11 +844,32 @@ public:
   // One command in, one reply out. All work (reads, snapshots, restores, logging) happens inside this call.
   Reply OnCommand(const Command& command);
 
+  // Optional: REV3_SYNCTEST_HIDE=1. While SyncTest resimulates (from the RESTORED reply to the reply of the last resimulated frame) the
+  // flags are set, so a SyncTest run exercises the protocol 3 patches. Not owned; must outlive this object. Cleared by Finish().
+  void SetResimHide(ResimHideFlags* hide) { m_hide = hide; }
+
   // Optional: the freeze dump (REV3_SYNCTEST_DUMP). SyncTest dumps once when it arms, logs the RESTOREHW lines around the first
   // restores, and tells it about every command (frame, time, armed) for the stall watchdog. Not owned; null = off.
   void SetFreezeDump(FreezeDump* dump) { m_dump = dump; }
 
-  // Writes the final summary line (once). The destructor does not.
+  // Restore verify (options.verify, REV3_RB_VERIFY*; REV3.md "Restore verify"). Capture takes the shadows, Restore compares after the
+  // write-back, so both SyncTest and the netplay session (NetCapture / NetRestore call the same two functions) are covered.
+  // SetVerifyIgnore: memory the comparison never looks at (REV3_RB_VERIFY_IGNORE), on top of what the snapshot already cuts (hook region,
+  // user exclusions, hardware regions) and the dead stack below the hook's sp. Call before the first command.
+  void SetVerifyIgnore(std::vector<Range> ranges) { m_verify_ignore = MergeRanges(std::move(ranges)); }
+  const RestoreVerifier* Verifier() const { return m_verify.get(); }
+  // Heal found pages the set misses; they are part of ComputeRanges() already, but the layout (m_ranges) does not have them yet. SyncTest
+  // installs them by itself between a resimulation and the next frame; the netplay session installs them at its next arm (NetPrepareArm
+  // calls ComputeRanges()). The pages learned this way, merged, are VerifyExtraRanges().
+  bool VerifyPagesPending() const { return m_verify_dirty; }
+  // " restores_checked=.. restores_wrong=.. verify_blocks=.. first_wrong_frame=.. shadow_ms=.." (leading space), appended to the SUMMARY line;
+  // empty when verify is off. The netplay stats line appends it too.
+  std::string VerifyStatsFields() const;
+  // "VERIFY summary ..." (the end-of-run line); only call with verify on.
+  std::string VerifySummaryText() const;
+  const std::vector<Range>& VerifyExtraRanges() const { return m_verify_extra; }
+
+  // Writes the final summary line (once). The destructor does not. Also clears the resimulation hiding flags.
   void Finish();
 
   // Optional: returns a one-line description of the DSP / audio DMA state (read without side effects). It is logged once when
@@ -659,6 +909,7 @@ public:
   void NetObserve(const Command& command, bool resimulating);
   bool NetFightersFound() const { return m_net_found; }
   const std::array<u32, 2>& NetFighters() const { return m_fighters; }
+  // True when the set would change but slots are in use: learned pages, a new hardware cut, or pages the restore verify heal found missing.
   bool NetLayoutPending() const { return m_net_pending; }
   // The arm gate is about to open (session in lockstep, no slot in use): re-checks the hardware cuts, installs the current set (stack
   // window of this call's sp included) and verifies that all 61 fields of both fighters are inside it. False (logged): do not arm.
@@ -670,13 +921,27 @@ public:
   u32 NetSlotSp(u32 frame) const;
   bool NetRestore(u32 frame);
   size_t NetSlotCount() const { return m_ring.size(); }
-  // "NOTE snapshot stats ..." (restores, restore / icache / audio times, postponed reads); written at shutdown.
+  // "NOTE snapshot stats ..." (restores, restore / icache / audio times, postponed reads); written at shutdown. Ends with VerifyStatsFields()
+  // (restore verify) when REV3_RB_VERIFY is on.
   std::string NetStatsLine() const;
+  // Fields appended to the session's SUMMARY lines: the restore verify counters and the resimulation hiding counters (leading space, may be
+  // empty). Writes the `NOTE learned summary` line first when the learned pages changed since the last one, so every SUMMARY of a netplay
+  // run is preceded by it. The session reaches this through SnapshotStore::SummaryNote.
+  std::string NetSummaryNote();
+  // Sets the hiding flags object whose counters NetSummaryNote reports (netplay: the session's ResimHiding writes the flags itself). Not owned.
+  void SetHideCounters(const ResimHideFlags* hide) { m_hide_counters = hide; }
   // Writes the pending RESTORE summary window (options.restore_log_full policy); call before the final stats at shutdown.
   void NetFlushLog();
   // REV3_NET_RANGE_CRC: the CRC of each snapshot range (m_ranges) as it was at the start of `frame`: from the frame's slot, or from live
   // memory when `live` (the caller is at that frame's own hook call). False: no slot and not live, or the set is empty.
   bool NetRangeCrcs(u32 frame, bool live, std::vector<RangeHash>* out) const;
+
+  // Learned-page bookkeeping (pages that entered the set after the first arm). NoteLearned adds `after` minus `before` to the all-time list
+  // and to the list of pages not yet logged, and returns the new part. LearnedSummaryLine writes `NOTE learned summary pages=N ranges=[..]`
+  // (+ `NOTE learned adjacency ..`); SyncTest::Finish and every SUMMARY line do. The netplay session calls NoteLearned when the set grows.
+  std::vector<Range> NoteLearned(const std::vector<Range>& before, const std::vector<Range>& after);
+  void LearnedSummaryLine();
+  const std::vector<Range>& LearnedRanges() const { return m_learned_all; }
 
 private:
   struct Slot
@@ -718,6 +983,12 @@ private:
   void RebuildLayout();
   // One page-tracker slice (timed, with the "learning complete" note); returns the pages that just became dynamic.
   u32 ScanSlice(u32 frame);
+  Reply OnCommandImpl(const Command& command);  // OnCommand without the hiding flags bookkeeping
+  void SyncHideFlags();                         // writes m_hide's flags when m_resim changed since the last call
+  // Netplay: installs `next` as the snapshot set (NetPrepareArm, NetClear). After the first install of a match, the pages that join the set are
+  // learned pages: NoteLearned, `NOTE learned +n pages <when> (frame f): new=[..]` (tools/rollback/learned_include.py reads it), and the part
+  // that the restore verify heal found is counted in verify_pages_added. Does not rebuild the layout.
+  void NetInstallSet(std::vector<Range> next, u32 frame, const char* when);
   // Queries the hardware / pointer exclusions and records the new ones (with their NOTE lines) in m_exclusions_logged; true when a new
   // cut takes something away from the current set. Does not touch m_ranges.
   bool CollectExclusions();
@@ -737,6 +1008,10 @@ private:
   // The ef list check around a restore (options.ef_check_restores): `when` = "before" / "after". Logs EFCHECK lines.
   void EfCheck(const char* when, u32 from, u32 to);
   void LearnWhileArmed(u32 added);
+  // Restore verify: compares all memory with the shadow of `to` after a write-back and logs / counts the result (see VerifyOptions).
+  void VerifyAfterRestore(const Slot& s, const Command& command, u32 to);
+  // Installs the pages the heal added (m_verify_extra) into the layout: new set, relayout, history cleared. SyncTest only, never mid-resim.
+  void ApplyVerifyPages();
   bool Arm(const Command& command, const std::array<u32, 2>& fighters);
   // "0xSTART-0xEND" of the current snapshot range that holds [addr, addr + 4); empty when none does.
   std::string RangeContaining(u32 addr) const;
@@ -751,6 +1026,12 @@ private:
   std::vector<Range> m_include_fixed;           // REV3_SNAPSHOT_INCLUDE ranges
   std::vector<PtrExclusion> m_include_ptrs;     // REV3_SNAPSHOT_INCLUDE pointer entries (resolved at arm)
   std::vector<Range> m_forced;                  // resolved at the latest arm: ef pool + the user entries, merged
+  std::unique_ptr<RestoreVerifier> m_verify;    // null = restore verify off (options.verify.restores == 0)
+  std::vector<Range> m_verify_ignore;           // REV3_RB_VERIFY_IGNORE: never compared
+  std::vector<Range> m_verify_extra;            // pages the heal found missing: part of every ComputeRanges() from then on
+  bool m_verify_dirty = false;                  // m_verify_extra has pages the current layout (m_ranges) lacks
+  u32 m_verify_wrong_logs = 0;                  // VERIFY lines written for restores with wrong blocks (limit VERIFY_MAX_WRONG_LOGS)
+  u32 m_verify_ok_logs = 0;
   EfPool m_ef;
   bool m_ef_found = false;
   u32 m_ef_checks_done = 0;                     // restores that got the check (limit: options.ef_check_restores)
@@ -791,6 +1072,11 @@ private:
   u32 m_learn_logs = 0;          // "NOTE learned" lines written
   u32 m_learn_log_call = 0;      // m_armed_calls at the last such line
   u32 m_learned_unlogged = 0;    // pages learned since that line
+  std::vector<Range> m_learned_all;       // every range that entered the set after the first arm (merged)
+  std::vector<Range> m_learned_unlogged_ranges;  // the part of it not yet named in a "NOTE learned" line
+  size_t m_learned_fresh_ranges = 0;      // learned ranges (one per growth) ... and how many touched the set as it was
+  size_t m_learned_touching = 0;
+  u64 m_learned_summary_pages = ~0ull;    // pages in the latest `learned summary` line (a SUMMARY line repeats it only when this changed)
   u64 m_scan_iv_total = 0;       // scan time since the last HB line (microseconds), its count and its maximum
   u32 m_scan_iv_n = 0;
   u64 m_scan_iv_max = 0;
@@ -823,6 +1109,11 @@ private:
   bool m_net_pending = false;      // the set would change (learned pages / new hardware cuts) but slots are in use
   bool m_net_active = false;       // slots have been captured since the latest NetClear
   u32 m_net_calls = 0;             // NetObserve calls with slots in use (paces the hardware re-check)
+  bool m_net_mode = false;         // NetObserve has been called: this is a netplay run (the restore verify heal then asks for a relayout)
+  bool m_net_armed_once = false;   // a set has been installed in this match: pages joining later are learned pages (the first one learns nothing)
+  ResimHideFlags* m_hide = nullptr;                // SyncTest: REV3_SYNCTEST_HIDE
+  bool m_hide_on = false;                          // the latest value passed to m_hide->Set
+  const ResimHideFlags* m_hide_counters = nullptr; // netplay: only read, for the summary fields
 
   u32 m_streak = 0;          // consecutive commands with both fighters found
   bool m_armed = false;
@@ -954,6 +1245,11 @@ void HandleCommand(Core::System& system, const u8* command, size_t size, std::ve
 // everything of Slippi's online stack (Rust extensions, login, matchmaking, spectator, replays, reporting): a Rev3 session talks only to
 // its peer.
 bool NetplayRequested();
+
+// Reads REV3_RB_VERIFY, REV3_RB_VERIFY_EVERY, REV3_RB_VERIFY_SLOTS, REV3_RB_VERIFY_HEAL, REV3_RB_VERIFY_STACK_BELOW into options->verify and
+// REV3_RB_VERIFY_IGNORE (a {"ranges":[..]} file) into *ignore; problems are logged to `sink` as ERROR lines and that variable stays at its
+// default. Shared by SyncTest and the netplay session's options code. Defined in the Dolphin glue (needs the environment and files).
+void ParseVerifyEnv(SyncTestOptions* options, std::vector<Range>* ignore, Sink& sink);
 
 // Writes the final summary and closes the log; the next command starts a fresh session. Safe to call any time.
 void Shutdown();

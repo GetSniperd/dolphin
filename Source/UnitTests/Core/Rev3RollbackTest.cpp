@@ -24,33 +24,43 @@ using namespace Rev3;
 
 // ---- fakes -----------------------------------------------------------------------------------------------------------------
 
-// MEM1 only (24 MB, zero filled); reads and writes outside it fail like the real accessor's range check.
+// MEM1 (24 MB, zero filled) and, when asked for, MEM2 (64 MB); reads and writes outside them fail like the real accessor's range check.
 class FakeMemory final : public GuestMemory
 {
 public:
-  FakeMemory() : m_mem1(0x1800000, 0) {}
+  explicit FakeMemory(bool with_mem2 = false) : m_mem1(0x1800000, 0)
+  {
+    if (with_mem2)
+      m_mem2.assign(0x4000000, 0);
+  }
 
   bool Read(u32 addr, void* dst, size_t n) const override
   {
-    if (!Inside(addr, n))
+    const u8* p = Locate(addr, n);
+    if (p == nullptr)
       return false;
-    std::memcpy(dst, &m_mem1[addr - 0x80000000], n);
+    std::memcpy(dst, p, n);
     return true;
   }
   bool Write(u32 addr, const void* src, size_t n) override
   {
-    if (!Inside(addr, n))
+    u8* p = Locate(addr, n);
+    if (p == nullptr)
       return false;
-    std::memcpy(&m_mem1[addr - 0x80000000], src, n);
+    if (drop_writes_hi > drop_writes_lo && n >= 16 && addr < drop_writes_hi && addr + n > drop_writes_lo)
+      return true;  // a restore bug: a bulk write (the game's own word writes are shorter) "succeeds" and changes nothing
+    std::memcpy(p, src, n);
     return true;
   }
+  u32 drop_writes_lo = 0;  // writes of 16+ bytes that touch [lo, hi) are silently dropped (0, 0 = off)
+  u32 drop_writes_hi = 0;
 
   // Direct pointer for the page tracker; switch off to exercise its Read() fallback.
   const u8* Peek(u32 addr, size_t n) const override
   {
-    if (!peek_enabled || !Inside(addr, n))
+    if (!peek_enabled)
       return nullptr;
-    return &m_mem1[addr - 0x80000000];
+    return Locate(addr, n);
   }
   bool peek_enabled = true;
 
@@ -95,8 +105,17 @@ public:
   }
 
 private:
-  static bool Inside(u32 addr, size_t n) { return addr >= 0x80000000 && u64(addr) + n <= 0x81800000; }
+  u8* Locate(u32 addr, size_t n)
+  {
+    if (addr >= 0x80000000 && u64(addr) + n <= 0x81800000)
+      return &m_mem1[addr - 0x80000000];
+    if (!m_mem2.empty() && addr >= 0x90000000 && u64(addr) + n <= 0x94000000)
+      return &m_mem2[addr - 0x90000000];
+    return nullptr;
+  }
+  const u8* Locate(u32 addr, size_t n) const { return const_cast<FakeMemory*>(this)->Locate(addr, n); }
   std::vector<u8> m_mem1;
+  std::vector<u8> m_mem2;
 };
 
 class FakeSink final : public Sink
@@ -288,6 +307,7 @@ public:
     if (m_audio != nullptr)
       m_audio_seen.emplace(m_counter, m_audio->Key());
     Command c;
+    c.protocol = m_protocol;
     c.frame = m_counter;
     c.pads = PadsFor(m_counter);
     if (m_z.has_value())
@@ -337,6 +357,7 @@ public:
   bool HwWordIntact() const { return m_hw_word_intact; }  // every RESTORED reply left the hardware word alone
   int RestoresSeen() const { return m_restores_seen; }
 
+  void SetProtocol(u8 protocol) { m_protocol = protocol; }  // the hook protocol its commands carry (2 or 3)
   void SetQuiet() { m_quiet = true; }  // Step changes nothing: only the hook's stack frame (written by Frame) changes
   // From this frame on a counter in the page LATE_PAGE (outside every seed) counts up and feeds p1's combo_count.
   void SetLatePage(u32 from_frame) { m_late_page_from = from_frame; }
@@ -386,6 +407,7 @@ private:
   bool m_leak;
   u32 m_late_from;
   bool m_quiet = false;
+  u8 m_protocol = PROTOCOL_VERSION;
   std::function<void(FakeMemory&, u32)> m_step_hook;
   u32 m_late_page_from = 0;
   u32 m_walk_from = 0;
@@ -2899,7 +2921,8 @@ std::vector<Range> NetSeed()
 // game's own frame (FakeGame::Step with the pads of that frame) in between.
 struct NetRig
 {
-  explicit NetRig(const SyncTestOptions& options, const std::vector<Range>& seed = {}) : game(false), test(options, seed, game.Mem(), sink, FakeClock())
+  explicit NetRig(const SyncTestOptions& options, const std::vector<Range>& seed = {}, bool leak = false)
+      : game(leak), test(options, seed, game.Mem(), sink, FakeClock())
   {
   }
   Command Cmd(u32 frame) const
@@ -4426,4 +4449,993 @@ TEST(Rev3Rollback, LearningAPageWhileArmedBlocksRollbacksToOlderSnapshots)
   EXPECT_TRUE(LinesContain(sink, "NOTE learned +1 pages", "WARNING a rollback ran within the last scan cycle"));
   test.Finish();
   EXPECT_TRUE(sink.Contains("layout_refused=0 late_learn_rollbacks="));
+}
+
+// ---- learned-page reporting (names the pages; the include-file tool reads these lines) ----------------------------------------------
+
+TEST(Rev3Rollback, FormatRangeListNamesRangesAndCapsTheList)
+{
+  EXPECT_EQ(FormatRangeList({}, 4), "");
+  EXPECT_EQ(FormatRangeList({{0x80A00000, 0x80A01000}}, 4), "0x80A00000-0x80A01000");
+  const std::vector<Range> five = {{0x80000000, 0x80001000}, {0x80002000, 0x80003000}, {0x80004000, 0x80005000},
+                                   {0x90000000, 0x90002000}, {0x93FFF000, 0x94000000}};
+  EXPECT_EQ(FormatRangeList(five, 3), "0x80000000-0x80001000,0x80002000-0x80003000,0x80004000-0x80005000,+2 more");
+  EXPECT_EQ(FormatRangeList(five, 5), "0x80000000-0x80001000,0x80002000-0x80003000,0x80004000-0x80005000,0x90000000-0x90002000,"
+                                       "0x93FFF000-0x94000000");
+  EXPECT_EQ(FormatRangeList(five, 0), "+5 more");
+}
+
+TEST(Rev3Rollback, NewRangesAndPageCounts)
+{
+  const std::vector<Range> before = {{0x80001000, 0x80003000}, {0x80010000, 0x80011000}};
+  const std::vector<Range> after = {{0x80001000, 0x80004000}, {0x8000F000, 0x80011000}, {0x80020000, 0x80021000}};
+  const std::vector<Range> fresh = NewRanges(after, before);
+  ASSERT_EQ(fresh.size(), 3u);
+  EXPECT_EQ(fresh[0].start, 0x80003000u);
+  EXPECT_EQ(fresh[0].end, 0x80004000u);
+  EXPECT_EQ(fresh[1].start, 0x8000F000u);
+  EXPECT_EQ(fresh[1].end, 0x80010000u);
+  EXPECT_EQ(fresh[2].start, 0x80020000u);
+  EXPECT_EQ(RangesBytes(fresh), 0x3000u);
+  EXPECT_EQ(RangesPages(fresh), 3u);
+  EXPECT_EQ(RangesPages({{0x80000000, 0x80000010}, {0x80002000, 0x80002800}}), 1u);  // 0x810 bytes round up to one page
+  EXPECT_EQ(RangesPages({}), 0u);
+  EXPECT_TRUE(NewRanges(before, before).empty());
+  EXPECT_EQ(CountTouching(fresh, before), 2u);  // 0x80003000 starts where an old range ends; 0x8000F000-0x80010000 ends where one starts
+}
+
+TEST(Rev3Rollback, PadRangesIsClippedToTheRegion)
+{
+  // 1 page each side, merged where the pads meet.
+  std::vector<Range> padded = PadRanges({{0x80005000, 0x80006000}, {0x80007000, 0x80008000}}, 0x1000);
+  ASSERT_EQ(padded.size(), 1u);
+  EXPECT_EQ(padded[0].start, 0x80004000u);
+  EXPECT_EQ(padded[0].end, 0x80009000u);
+  // Not past the start of MEM1, not past the end of MEM1 / MEM2, never across the gap between them.
+  padded = PadRanges({{0x80000000, 0x80001000}, {0x817FF000, 0x81800000}, {0x90000000, 0x90001000}, {0x93FFF000, 0x94000000}}, 0x3000);
+  ASSERT_EQ(padded.size(), 4u);
+  EXPECT_EQ(padded[0].start, 0x80000000u);
+  EXPECT_EQ(padded[0].end, 0x80004000u);
+  EXPECT_EQ(padded[1].start, 0x817FC000u);
+  EXPECT_EQ(padded[1].end, 0x81800000u);
+  EXPECT_EQ(padded[2].start, 0x90000000u);
+  EXPECT_EQ(padded[2].end, 0x90004000u);
+  EXPECT_EQ(padded[3].start, 0x93FFC000u);
+  EXPECT_EQ(padded[3].end, 0x94000000u);
+  // Zero pad = merge only; ranges outside both regions are untouched; an empty range disappears.
+  padded = PadRanges({{0x2000, 0x3000}, {0x2800, 0x3800}, {0x80001000, 0x80001000}}, 0);
+  ASSERT_EQ(padded.size(), 1u);
+  EXPECT_EQ(padded[0].start, 0x2000u);
+  EXPECT_EQ(padded[0].end, 0x3800u);
+  padded = PadRanges({{0x2000, 0x3000}}, 0x1000);
+  ASSERT_EQ(padded.size(), 1u);
+  EXPECT_EQ(padded[0].start, 0x2000u);
+  EXPECT_EQ(padded[0].end, 0x3000u);
+}
+
+TEST(Rev3Rollback, LearnedSummaryNamesEveryPageLearnedAfterArming)
+{
+  FakeGame game(false);
+  game.SetLatePage(1500);
+  FakeSink sink;
+  SyncTest test(AdaptiveOptions(3), {}, game.Mem(), sink, FakeClock());
+  while (game.Counter() < 1500)
+    game.Frame(test);
+  ASSERT_TRUE(test.Active());
+  EXPECT_FALSE(sink.Contains("NOTE learned summary"));
+  for (int i = 0; i < 400 && !sink.Contains("NOTE learned +"); ++i)
+    game.Frame(test);
+  ASSERT_TRUE(LinesContain(sink, "NOTE learned +1 pages", "new=[0x80A00000-0x80A01000]"));
+  // The periodic SUMMARY line carries the summary only when it changed; Finish always writes it once.
+  test.Finish();
+  EXPECT_EQ(test.LearnedRanges().size(), 1u);
+  EXPECT_TRUE(sink.Contains("NOTE learned summary pages=1 ranges=[0x80A00000-0x80A01000]"));
+  EXPECT_TRUE(sink.Contains("NOTE learned adjacency growths=1 ranges_touching_old_set=0 learn_pad_pages=0"));
+  int summaries = 0;
+  for (const std::string& l : sink.lines)
+    summaries += l.rfind("NOTE learned summary", 0) == 0;
+  EXPECT_EQ(summaries, 1);
+}
+
+TEST(Rev3Rollback, LearnedSummaryIsWrittenEvenWhenNothingWasLearned)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTest test(AdaptiveOptions(2), {}, game.Mem(), sink, FakeClock());
+  for (int i = 0; i < 400; ++i)
+    game.Frame(test);
+  ASSERT_TRUE(test.Active());
+  test.Finish();
+  EXPECT_TRUE(sink.Contains("NOTE learned summary pages=0 ranges=[]"));
+}
+
+TEST(Rev3Rollback, RateLimitedLearnLinesStillNameEveryPageInTheSummary)
+{
+  FakeGame game(false);
+  game.SetWalker(4400, 22 * 0x1000);  // see LearningWhileArmedIsRateLimitedInTheLog: 60 growths in a row, each 22 pages further on
+  FakeSink sink;
+  SyncTest test(AdaptiveOptions(2, 1024, 3), {}, game.Mem(), sink, FakeClock());
+  while (game.Counter() < 4400 + 1100)
+    game.Frame(test);
+  ASSERT_TRUE(test.Active());
+  test.Finish();
+  // Every learned page is in the summary, whether or not its own line was logged: the walker's pages are 22 pages apart, so one range each.
+  EXPECT_EQ(RangesPages(test.LearnedRanges()), test.Stats().pages_learned_armed);
+  EXPECT_GE(test.LearnedRanges().size(), 50u);
+  std::string summary;
+  for (const std::string& l : sink.lines)
+  {
+    if (l.rfind("NOTE learned summary", 0) == 0)
+      summary = l;
+  }
+  EXPECT_NE(summary.find("0x80C00000-0x80C01000"), std::string::npos) << summary;
+  EXPECT_EQ(summary.find("more"), std::string::npos) << summary;  // far under MAX_LEARN_SUMMARY_RANGES
+  // A "NOTE learned +n" line is capped (16 ranges named, the rest counted) and the pages named in all of them are the learned ones.
+  size_t named = 0;
+  for (const std::string& l : sink.lines)
+  {
+    if (l.rfind("NOTE learned +", 0) != 0)
+      continue;
+    const size_t at = l.find("new=[");
+    ASSERT_NE(at, std::string::npos) << l;
+    const size_t close = l.find(']', at);
+    ASSERT_NE(close, std::string::npos) << l;
+    const std::string list = l.substr(at + 5, close - at - 5);
+    named += static_cast<size_t>(std::count(list.begin(), list.end(), '-'));
+  }
+  EXPECT_GE(named, 10u);
+}
+
+TEST(Rev3Rollback, LearnPadTakesTheNeighbouringPagesAlong)
+{
+  for (const u32 pad : {0u, 1u, 2u})
+  {
+    FakeGame game(false);
+    game.SetLatePage(1500);
+    FakeSink sink;
+    SyncTestOptions o = AdaptiveOptions(3);
+    o.learn_pad_pages = pad;
+    SyncTest test(o, {}, game.Mem(), sink, FakeClock());
+    while (game.Counter() < 1500)
+      game.Frame(test);
+    ASSERT_TRUE(test.Active());
+    for (int i = 0; i < 400 && !sink.Contains("NOTE learned +"); ++i)
+      game.Frame(test);
+    ASSERT_TRUE(sink.Contains("NOTE learned +"));
+    EXPECT_TRUE(SetContains(test.Ranges(), LATE_PAGE));
+    EXPECT_EQ(SetContains(test.Ranges(), LATE_PAGE - 0x1000), pad >= 1) << pad;
+    EXPECT_EQ(SetContains(test.Ranges(), LATE_PAGE + 0x1000), pad >= 1) << pad;
+    EXPECT_EQ(SetContains(test.Ranges(), LATE_PAGE + 0x2000), pad >= 2) << pad;
+    EXPECT_FALSE(SetContains(test.Ranges(), LATE_PAGE + 0x3000)) << pad;
+    // The log names the whole learned run, pad included.
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "new=[0x%08X-0x%08X]", LATE_PAGE - pad * 0x1000, LATE_PAGE + 0x1000 + pad * 0x1000);
+    const std::string expect = buf;
+    EXPECT_TRUE(LinesContain(sink, "NOTE learned +1 pages", expect)) << pad;
+  }
+}
+
+TEST(Rev3Rollback, LearnPadMakesTheNeighbourPageFreeToLearnLater)
+{
+  // A page next to a learned one that starts to change later is already in the set: no relayout, no cleared history.
+  FakeGame game(false);
+  game.SetLatePage(1500);
+  FakeSink sink;
+  SyncTestOptions o = AdaptiveOptions(3);
+  o.learn_pad_pages = 1;
+  SyncTest test(o, {}, game.Mem(), sink, FakeClock());
+  while (game.Counter() < 1500)
+    game.Frame(test);
+  for (int i = 0; i < 400 && !sink.Contains("NOTE learned +"); ++i)
+    game.Frame(test);
+  ASSERT_TRUE(sink.Contains("NOTE learned +"));
+  for (int i = 0; i < 30; ++i)
+    game.Frame(test);
+  const size_t bytes = test.SnapshotBytes();
+  const u32 growths = static_cast<u32>(test.LearnedRanges().size());
+  game.Mem().SetU32(LATE_PAGE + 0x1000, 1);  // the neighbour page changes for the first time
+  for (int i = 0; i < 100; ++i)
+    game.Frame(test);
+  EXPECT_EQ(test.SnapshotBytes(), bytes);
+  EXPECT_EQ(test.LearnedRanges().size(), growths);
+}
+
+// ---- restore verify (REV3_RB_VERIFY) ---------------------------------------------------------------------------------------------
+
+namespace
+{
+VerifyOptions VOpts(u32 restores, u32 every, u32 slots = 1, bool heal = false)
+{
+  VerifyOptions v;
+  v.restores = restores;
+  v.every = every;
+  v.slots = slots;
+  v.heal = heal;
+  return v;
+}
+
+// A verifier over a memory with MEM1 + MEM2 and a known set of changes after the shadow of frame 100 was taken.
+struct VerifierRig
+{
+  explicit VerifierRig(bool heal = false, bool peek = true) : mem(true), verifier(VOpts(VERIFY_ALL, 1, 1, heal), mem, sink, FakeClock())
+  {
+    mem.peek_enabled = peek;
+    mem.SetU32(0x80010000, 0x11111111);  // something non-zero in the shadow
+    mem.SetU32(0x90030000 + 5 * 32 + 8, 0x22222222);
+    EXPECT_TRUE(verifier.TakeShadow(100));
+    mem.SetU32(0x80010020 + 4, 0xAAAA0001);         // block 0x80010020
+    mem.SetU32(0x80010100 + 28, 0xAAAA0002);        // block 0x80010100, same page
+    mem.SetU32(0x80021000, 0xAAAA0003);             // another page, another 64 KB region
+    mem.SetU32(0x90030000 + 5 * 32 + 8, 0xAAAA0004);  // MEM2
+    mem.SetU32(0x80030040, 0xAAAA0005);             // inside the skip range below
+    in.from_frame = 103;
+    in.to_frame = 100;
+    in.skip = {{0x80030000, 0x80031000}};
+    in.in_set = {{0x80010000, 0x80011000}};
+  }
+  FakeMemory mem;
+  FakeSink sink;
+  RestoreVerifier verifier;
+  VerifyInput in;
+};
+}  // namespace
+
+TEST(Rev3Rollback, VerifierCountsBlocksPagesAndRegionsExactly)
+{
+  for (const bool peek : {true, false})  // with and without a direct host pointer (the Read() fallback)
+  {
+    VerifierRig rig(false, peek);
+    const VerifyResult r = rig.verifier.Check(rig.in);
+    ASSERT_TRUE(r.checked);
+    EXPECT_EQ(r.wrong_blocks, 4u) << "peek=" << peek;
+    EXPECT_EQ(r.wrong_pages, 3u);
+    EXPECT_EQ(r.in_set_blocks, 2u);
+    EXPECT_EQ(r.outside_set_blocks, 2u);
+    EXPECT_EQ(r.first_addr, 0x80010020u);
+    EXPECT_EQ(r.first_snapshot[1], 0u);
+    EXPECT_EQ(r.first_memory[1], 0xAAAA0001u);
+    EXPECT_TRUE(r.has_first_in_set);
+    EXPECT_EQ(r.first_in_set_addr, 0x80010020u);
+    ASSERT_EQ(r.regions.size(), 3u);
+    EXPECT_EQ(r.regions[0].base, 0x80010000u);
+    EXPECT_EQ(r.regions[0].blocks, 2u);
+    EXPECT_EQ(r.regions[0].pages, 1u);
+    EXPECT_EQ(r.regions[1].base, 0x80020000u);
+    EXPECT_EQ(r.regions[2].base, 0x90030000u);
+    ASSERT_EQ(r.outside_pages.size(), 2u);
+    EXPECT_EQ(r.outside_pages[0].start, 0x80021000u);
+    EXPECT_EQ(r.outside_pages[0].end, 0x80022000u);
+    EXPECT_EQ(r.outside_pages[1].start, 0x90030000u);
+    EXPECT_EQ(r.skipped_bytes, 0x1000u);
+    EXPECT_EQ(r.compared_bytes, 0x5800000u - 0x1000u);  // 24 MB + 64 MB minus the skipped page
+    EXPECT_EQ(r.healed_blocks, 0u);
+    EXPECT_EQ(rig.verifier.DistinctBlocks(), 4u);
+    EXPECT_EQ(rig.verifier.DistinctPages(), 3u);
+    EXPECT_EQ(rig.verifier.Checked(), 1u);
+    EXPECT_EQ(rig.verifier.Wrong(), 1u);
+    EXPECT_EQ(rig.verifier.FirstWrongFrom(), 103u);
+    EXPECT_EQ(rig.verifier.FirstWrongTo(), 100u);
+    EXPECT_EQ(rig.verifier.FirstWrongBlocks(), 4u);
+    EXPECT_EQ(rig.mem.U32(0x80021000), 0xAAAA0003u) << "no heal: memory is left as it is";
+    // Checking again counts the restore again but no new distinct blocks.
+    const VerifyResult again = rig.verifier.Check(rig.in);
+    EXPECT_EQ(again.wrong_blocks, 4u);
+    EXPECT_EQ(rig.verifier.DistinctBlocks(), 4u);
+    EXPECT_EQ(rig.verifier.WrongBlocksTotal(), 8u);
+    EXPECT_EQ(rig.verifier.FirstWrongBlocks(), 4u) << "the first wrong restore stays the first";
+  }
+}
+
+TEST(Rev3Rollback, VerifierHealCopiesTheShadowBackOverWrongBlocksOnly)
+{
+  VerifierRig rig(true);
+  const VerifyResult r = rig.verifier.Check(rig.in);
+  EXPECT_EQ(r.wrong_blocks, 4u);
+  EXPECT_EQ(r.healed_blocks, 4u);
+  ASSERT_EQ(r.healed_pages.size(), 3u);  // 0x80010000, 0x80021000, 0x90030000 (not adjacent)
+  EXPECT_EQ(rig.mem.U32(0x80010024), 0u);
+  EXPECT_EQ(rig.mem.U32(0x8001011C), 0u);
+  EXPECT_EQ(rig.mem.U32(0x80021000), 0u);
+  EXPECT_EQ(rig.mem.U32(0x90030000 + 5 * 32 + 8), 0x22222222u);
+  EXPECT_EQ(rig.mem.U32(0x80030040), 0xAAAA0005u) << "the skipped range is not touched";
+  EXPECT_EQ(rig.mem.U32(0x80010000), 0x11111111u);
+  const VerifyResult again = rig.verifier.Check(rig.in);
+  EXPECT_EQ(again.wrong_blocks, 0u);
+  EXPECT_EQ(rig.verifier.Checked(), 2u);
+  EXPECT_EQ(rig.verifier.Wrong(), 1u);
+}
+
+TEST(Rev3Rollback, VerifierComparesPartialBlocksAtTheEdgesOfSkipRanges)
+{
+  FakeMemory mem;
+  FakeSink sink;
+  RestoreVerifier v(VOpts(VERIFY_ALL, 1), mem, sink, FakeClock());
+  ASSERT_TRUE(v.TakeShadow(7));
+  VerifyInput in;
+  in.to_frame = 7;
+  in.skip = {{0x80000010, 0x80000030}};  // starts and ends in the middle of 32-byte blocks
+  mem.SetU32(0x80000014, 1);             // inside the skip range: invisible
+  mem.SetU32(0x80000028, 1);             // same
+  EXPECT_EQ(v.Check(in).wrong_blocks, 0u);
+  mem.SetU32(0x8000000C, 1);             // block 0x80000000, outside the skip range
+  mem.SetU32(0x80000030, 1);             // block 0x80000020, outside the skip range (the block is split by the skip range)
+  const VerifyResult r = v.Check(in);
+  EXPECT_EQ(r.wrong_blocks, 2u);
+  EXPECT_EQ(r.first_addr, 0x80000000u);
+  EXPECT_EQ(r.first_memory[3], 1u);
+}
+
+TEST(Rev3Rollback, VerifierShadowSlotsRotateAndTheBudgetEndsTheCopying)
+{
+  FakeMemory mem;
+  FakeSink sink;
+  RestoreVerifier v(VOpts(2, 4, 2), mem, sink, FakeClock());
+  EXPECT_TRUE(v.WantsShadow(8));
+  EXPECT_FALSE(v.WantsShadow(9));
+  EXPECT_FALSE(v.HasShadow(8));
+  ASSERT_TRUE(v.TakeShadow(8));
+  ASSERT_TRUE(v.TakeShadow(12));
+  EXPECT_TRUE(v.HasShadow(8));
+  EXPECT_TRUE(v.HasShadow(12));
+  ASSERT_TRUE(v.TakeShadow(16));  // slot of frame 8
+  EXPECT_FALSE(v.HasShadow(8));
+  EXPECT_TRUE(v.HasShadow(12));
+  EXPECT_TRUE(v.HasShadow(16));
+  EXPECT_EQ(v.Shadows(), 3u);
+  EXPECT_EQ(v.ShadowBytes(), 2u * 0x1800000u);  // two slots of MEM1 (this memory has no MEM2)
+  VerifyInput in;
+  in.to_frame = 8;
+  EXPECT_FALSE(v.Check(in).checked) << "no shadow of frame 8 any more";
+  EXPECT_EQ(v.Checked(), 0u) << "an unchecked restore does not use the budget";
+  in.to_frame = 12;
+  EXPECT_TRUE(v.Check(in).checked);
+  EXPECT_TRUE(v.Active());
+  in.to_frame = 16;
+  EXPECT_TRUE(v.Check(in).checked);
+  EXPECT_FALSE(v.Active());
+  EXPECT_FALSE(v.WantsShadow(20)) << "the budget (2 verified restores) is used up: no more shadows";
+  v.DropShadows();
+  EXPECT_FALSE(v.HasShadow(12));
+}
+
+TEST(Rev3Rollback, VerifyEveryPicksFramesTheRestoresLandOn)
+{
+  EXPECT_EQ(AutoVerifyEvery(2, 1), 3u);
+  EXPECT_EQ(AutoVerifyEvery(4, 1), 5u);
+  EXPECT_EQ(AutoVerifyEvery(1, 2), 3u) << "P = 2 never lands on a target n - 1 with n even";
+  EXPECT_EQ(AutoVerifyEvery(2, 4), 3u);
+  EXPECT_TRUE(VerifyEveryCanHit(3, 2, 1));
+  EXPECT_FALSE(VerifyEveryCanHit(2, 1, 2));
+  EXPECT_FALSE(VerifyEveryCanHit(4, 1, 2));
+  EXPECT_TRUE(VerifyEveryCanHit(4, 2, 2));
+  EXPECT_FALSE(VerifyEveryCanHit(0, 2, 1));
+}
+
+namespace
+{
+SyncTestOptions VerifiedOptions(int k, const VerifyOptions& v, int every = 1)
+{
+  SyncTestOptions o = Options(k, every);
+  o.verify = v;
+  return o;
+}
+
+// The fake game's whitelist plus both fighter structs, so that the hidden counter's page is the only thing the set misses.
+std::vector<Range> WithFighters(const FakeGame& game)
+{
+  std::vector<Range> r = game.Ranges();
+  r.push_back({FIGHTER[0], FIGHTER[0] + 0x1800});
+  r.push_back({FIGHTER[1], FIGHTER[1] + 0x1800});
+  return r;
+}
+
+void RunFrames(FakeGame& game, SyncTest& test, int frames)
+{
+  for (int i = 0; i < frames; ++i)
+    game.Frame(test);
+}
+}  // namespace
+
+TEST(Rev3Rollback, RestoreVerifyNamesThePageTheWhitelistMisses)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTest test(VerifiedOptions(2, VOpts(VERIFY_ALL, 1, 3)), WithFighters(game), game.Mem(), sink, FakeClock());
+  ASSERT_NE(test.Verifier(), nullptr);
+  EXPECT_TRUE(sink.Contains("NOTE verify on: restores=all every=1 slots=3 heal=0"));
+  RunFrames(game, test, 150);
+  while (test.Resimulating())
+    game.Frame(test);
+  const RestoreVerifier& v = *test.Verifier();
+  EXPECT_GT(v.Checked(), 20u);
+  EXPECT_EQ(v.Wrong(), v.Checked()) << "the hidden counter outside the whitelist changes in every rolled-back frame";
+  EXPECT_EQ(v.InSetBlocksTotal(), 0u) << "everything the restore rewrote is right";
+  EXPECT_EQ(v.OutsideSetBlocksTotal(), v.WrongBlocksTotal());
+  EXPECT_EQ(v.DistinctBlocks(), 1u);
+  EXPECT_EQ(v.DistinctPages(), 1u);
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u) << "the hidden counter does not feed the state in this game";
+  EXPECT_TRUE(sink.Contains("VERIFY first wrong restore: at frame "));
+  EXPECT_TRUE(sink.Contains("blocks of 32 bytes"));
+  EXPECT_TRUE(sink.Contains("wrong_blocks=1 pages=1 in_set=0 outside_set=1 first=[0x80700000: snap "));
+  EXPECT_TRUE(sink.Contains("regions64k=1 [0x80700000:1b/1p]"));
+  EXPECT_TRUE(sink.Contains("missing_pages=1 [0x80700000-0x80701000]"));
+  EXPECT_FALSE(sink.Contains("WARNING blocks inside"));
+  EXPECT_EQ(sink.osd.size(), 1u) << "one on-screen message for the first wrong restore";
+  EXPECT_FALSE(SetContains(test.Ranges(), HIDDEN)) << "without heal the set is not changed";
+  EXPECT_FALSE(test.VerifyPagesPending());
+  // The SUMMARY line and the final line carry the counts.
+  test.Finish();
+  EXPECT_TRUE(sink.Contains("restores_checked="));
+  EXPECT_TRUE(sink.Contains("restores_wrong="));
+  EXPECT_TRUE(sink.Contains("first_wrong_frame="));
+  EXPECT_TRUE(sink.Contains("shadow_ms="));
+  EXPECT_TRUE(sink.Contains("VERIFY summary restores_checked="));
+  EXPECT_TRUE(sink.Contains("distinct_blocks=1 in distinct_pages=1"));
+}
+
+TEST(Rev3Rollback, RestoreVerifyHealRepairsTheFirstRestoreAndLearnsThePage)
+{
+  // The hidden counter feeds the state (an incomplete whitelist): without heal every replay differs.
+  {
+    FakeGame game(true);
+    FakeSink sink;
+    SyncTest test(VerifiedOptions(2, VOpts(VERIFY_ALL, 1, 3, false)), WithFighters(game), game.Mem(), sink, FakeClock());
+    RunFrames(game, test, 150);
+    EXPECT_GT(test.Stats().mismatching_frames, 5u);
+  }
+  FakeGame game(true);
+  FakeSink sink;
+  SyncTest test(VerifiedOptions(2, VOpts(VERIFY_ALL, 1, 3, true)), WithFighters(game), game.Mem(), sink, FakeClock());
+  RunFrames(game, test, 150);
+  while (test.Resimulating())
+    game.Frame(test);
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u) << "the first restore was healed, so the replay agreed";
+  EXPECT_FALSE(sink.Contains("MISMATCH"));
+  EXPECT_TRUE(SetContains(test.Ranges(), HIDDEN)) << "the page joined the snapshot set";
+  EXPECT_EQ(test.Verifier()->Wrong(), 1u) << "after the relayout the page is rewound by the snapshot itself";
+  EXPECT_GT(test.Verifier()->Checked(), 10u);
+  EXPECT_EQ(test.Stats().verify_pages_added, 1u);
+  EXPECT_TRUE(sink.Contains("NOTE learned +1 pages (now ranges="));
+  EXPECT_TRUE(sink.Contains("new=[0x80700000-0x80701000] (restore verify heal)"));
+  EXPECT_TRUE(sink.Contains("healed; added to the snapshot set at the next layout"));
+  EXPECT_FALSE(test.VerifyPagesPending());
+  ASSERT_EQ(test.VerifyExtraRanges().size(), 1u);
+  EXPECT_EQ(test.VerifyExtraRanges()[0].start, 0x80700000u);
+  // The learned-page bookkeeping (and learned_include.py's input) knows the page.
+  test.Finish();
+  EXPECT_TRUE(sink.Contains("NOTE learned summary pages=1 ranges=[0x80700000-0x80701000]"));
+}
+
+TEST(Rev3Rollback, RestoreVerifyOfACompleteAdaptiveSetIsClean)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTestOptions o = AdaptiveOptions(2);
+  o.verify = VOpts(15, 1, 3);
+  SyncTest test(o, {}, game.Mem(), sink, FakeClock());
+  while (game.Counter() < 1600 && test.Verifier()->Checked() < 15)
+    game.Frame(test);
+  ASSERT_TRUE(test.Active());
+  EXPECT_EQ(test.Verifier()->Checked(), 15u);
+  EXPECT_EQ(test.Verifier()->Wrong(), 0u) << "every page the game writes was learned before arming";
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u);
+  EXPECT_FALSE(sink.Contains("VERIFY first wrong"));
+  EXPECT_TRUE(sink.Contains("VERIFY restore "));  // the first clean ones are logged as "ok"
+  EXPECT_TRUE(sink.Contains(" ok wrong_blocks=0 compared_mb="));
+  // The budget is used up: no more shadows are taken.
+  const u32 shadows = test.Verifier()->Shadows();
+  RunFrames(game, test, 30);
+  EXPECT_EQ(test.Verifier()->Shadows(), shadows);
+  EXPECT_EQ(test.Verifier()->Checked(), 15u);
+}
+
+TEST(Rev3Rollback, RestoreVerifySeesARestoreThatDidNotWriteBack)
+{
+  FakeGame game(false);
+  // A bug in the restore: writes into STATE_B (inside the whitelist) are lost.
+  game.Mem().drop_writes_lo = STATE_B;
+  game.Mem().drop_writes_hi = STATE_B + 0x40;
+  FakeSink sink;
+  SyncTest test(VerifiedOptions(2, VOpts(VERIFY_ALL, 1, 3)), WithFighters(game), game.Mem(), sink, FakeClock());
+  RunFrames(game, test, 120);
+  EXPECT_GT(test.Verifier()->Wrong(), 0u);
+  EXPECT_GT(test.Verifier()->InSetBlocksTotal(), 0u);
+  EXPECT_TRUE(sink.Contains("WARNING blocks inside the rewritten memory differ"));
+  EXPECT_TRUE(sink.Contains("first_in_set=[0x") || sink.Contains("in_set=1"));
+}
+
+TEST(Rev3Rollback, RestoreVerifyLeavesOutWhatTheRestoreCutsOnPurpose)
+{
+  // The hardware cut and the ignore list both cover the hidden counter's page: nothing is wrong.
+  for (int variant = 0; variant < 2; ++variant)
+  {
+    FakeGame game(false);
+    FakeSink sink;
+    FakeHardware hw;
+    SyncTest test(VerifiedOptions(2, VOpts(VERIFY_ALL, 1, 3)), WithFighters(game), game.Mem(), sink, FakeClock(), &hw);
+    if (variant == 0)
+      hw.list.push_back({"audio_dma", HIDDEN, HIDDEN + 0x1000});
+    else
+      test.SetVerifyIgnore({{HIDDEN, HIDDEN + 0x1000}});
+    RunFrames(game, test, 120);
+    ASSERT_GT(test.Verifier()->Checked(), 10u) << "variant " << variant;
+    EXPECT_EQ(test.Verifier()->Wrong(), 0u) << "variant " << variant;
+  }
+}
+
+TEST(Rev3Rollback, RestoreVerifyDoesNotCompareTheDeadStackBelowTheHook)
+{
+  // One word 0x100 below the hook's sp and one 0x6000 below it change every frame (leftovers of callees). Without a thread record only
+  // stack_below (0x4000) bytes are skipped; with the running thread's stack end in the OSThread the whole dead stack is.
+  for (int variant = 0; variant < 2; ++variant)
+  {
+    FakeGame game(false);
+    if (variant == 1)
+    {
+      game.Mem().SetU32(0x800000E4, 0x80900000);          // OSGetCurrentThread
+      game.Mem().SetU32(0x80900000 + 0x304, SP + 0x10000);  // stack base (highest)
+      game.Mem().SetU32(0x80900000 + 0x308, SP - 0x8000);   // stack end (lowest)
+    }
+    game.SetStepHook([](FakeMemory& mem, u32 frame) {
+      mem.SetU32(SP - 0x100, frame);
+      mem.SetU32(SP - 0x6000, frame);
+    });
+    FakeSink sink;
+    SyncTest test(VerifiedOptions(2, VOpts(VERIFY_ALL, 1, 3)), WithFighters(game), game.Mem(), sink, FakeClock());
+    test.SetVerifyIgnore({{HIDDEN, HIDDEN + 0x1000}});  // only the stack words are under test
+    RunFrames(game, test, 120);
+    ASSERT_GT(test.Verifier()->Checked(), 10u);
+    if (variant == 0)
+    {
+      EXPECT_EQ(test.Verifier()->Wrong(), test.Verifier()->Checked()) << "the word 0x6000 below sp is outside the fallback";
+      EXPECT_TRUE(sink.Contains("first=[0x807FA000:"));  // SP - 0x6000 rounded down to its 32-byte block
+      EXPECT_FALSE(sink.Contains("0x807FFF00"));
+    }
+    else
+    {
+      EXPECT_EQ(test.Verifier()->Wrong(), 0u) << "the thread's stack end covers both";
+    }
+  }
+}
+
+TEST(Rev3Rollback, RestoreVerifyIsOffByDefaultAndCostsNothing)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTest test(Options(2), WithFighters(game), game.Mem(), sink, FakeClock());
+  EXPECT_EQ(test.Verifier(), nullptr);
+  RunFrames(game, test, 100);
+  EXPECT_FALSE(sink.Contains("VERIFY"));
+  EXPECT_FALSE(sink.Contains("restores_checked"));
+  EXPECT_EQ(test.VerifyStatsFields(), "");
+  test.Finish();
+  EXPECT_FALSE(sink.Contains("VERIFY summary"));
+}
+
+TEST(Rev3Rollback, RestoreVerifyWarnsWhenTheShadowFramesCanNeverBeRestoreTargets)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  // K=1, EVERY=2: restores go to n - 1 with n even, i.e. odd frames; shadows at multiples of 2 never match.
+  SyncTest test(VerifiedOptions(1, VOpts(VERIFY_ALL, 2, 1), 2), WithFighters(game), game.Mem(), sink, FakeClock());
+  EXPECT_TRUE(sink.Contains("NOTE verify: shadows at multiples of 2 never match a restore target"));
+  // The automatic value avoids that.
+  FakeSink sink2;
+  FakeGame game2(false);
+  SyncTest test2(VerifiedOptions(1, VOpts(VERIFY_ALL, 0, 1), 2), WithFighters(game2), game2.Mem(), sink2, FakeClock());
+  EXPECT_TRUE(sink2.Contains("every=3 slots=1"));
+  EXPECT_FALSE(sink2.Contains("never match"));
+}
+
+TEST(Rev3Rollback, RestoreVerifyDropsItsShadowsWhenTheHistoryIsCleared)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTest test(VerifiedOptions(2, VOpts(VERIFY_ALL, 1, 3)), WithFighters(game), game.Mem(), sink, FakeClock());
+  RunFrames(game, test, 100);
+  ASSERT_TRUE(test.Active());
+  ASSERT_GT(test.Verifier()->Shadows(), 3u);
+  game.Mem().SetU32(0x8038FE50, 0);  // the fight is over: fighters lost, history cleared
+  game.Frame(test);
+  EXPECT_FALSE(test.Active());
+  for (u32 f = 1000; f < 1200; ++f)
+    EXPECT_FALSE(test.Verifier()->HasShadow(f)) << f;
+}
+
+// ---- merge of the learned-page work into the netplay path ------------------------------------------------------------------------
+
+namespace
+{
+// Drives a NetRig to an installed set: the learning phase, NetPrepareArm, then `frames` captured frames; leaves `f` at the next frame.
+u32 NetArmAndRun(NetRig& rig, int frames, bool late)
+{
+  u32 f = 1000;
+  for (; f < 3000 && !rig.test.LearningDone(); ++f)
+  {
+    rig.Observe(f);
+    rig.Advance(f);
+  }
+  rig.Observe(f);
+  EXPECT_TRUE(rig.test.NetPrepareArm());
+  for (int i = 0; i < frames; ++i, ++f)
+  {
+    if (i != 0)
+      rig.Observe(f);
+    EXPECT_TRUE(rig.Capture(f));
+    rig.Advance(f, late);
+  }
+  return f;
+}
+}  // namespace
+
+TEST(Rev3Rollback, NetModeNamesTheLearnedPagesWhileSlotsAreInUseAndAtTheClear)
+{
+  NetRig rig(AdaptiveOptions(6));
+  u32 f = 1000;
+  for (; f < 3000 && !rig.test.LearningDone(); ++f)
+  {
+    rig.Observe(f);
+    rig.Advance(f);
+  }
+  rig.Observe(f);
+  ASSERT_TRUE(rig.test.NetPrepareArm());
+  EXPECT_FALSE(rig.sink.Contains("NOTE learned +")) << "the first arm builds the set, it learns nothing";
+  bool pending = false;
+  for (int i = 0; i < 600 && !pending; ++i, ++f)
+  {
+    if (i != 0)
+      rig.Observe(f);
+    ASSERT_TRUE(rig.Capture(f));
+    rig.Advance(f, true);
+    pending = rig.test.NetLayoutPending();
+  }
+  ASSERT_TRUE(pending);
+  char expect[64];
+  std::snprintf(expect, sizeof(expect), "new=[0x%08X-0x%08X]", LATE_PAGE, LATE_PAGE + 0x1000);
+  EXPECT_TRUE(LinesContain(rig.sink, "NOTE learned +1 pages while slots are in use", expect));
+  EXPECT_TRUE(LinesContain(rig.sink, "the snapshot set grows at the next arm; new=[", expect));
+
+  rig.test.NetClear();
+  EXPECT_TRUE(LinesContain(rig.sink, "NOTE learned +1 pages at clear (frame", expect));
+  ASSERT_EQ(rig.test.LearnedRanges().size(), 1u);
+  EXPECT_EQ(rig.test.LearnedRanges()[0].start, LATE_PAGE);
+  // Installed once: the arm that follows learns nothing new.
+  const size_t lines = rig.sink.Count("NOTE learned +");
+  rig.Observe(f);
+  ASSERT_TRUE(rig.test.NetPrepareArm());
+  EXPECT_EQ(rig.sink.Count("NOTE learned +"), lines);
+}
+
+TEST(Rev3Rollback, NetPrepareArmNamesPagesLearnedSinceTheLastArm)
+{
+  NetRig rig(AdaptiveOptions(6));
+  u32 f = NetArmAndRun(rig, 600, true);
+  ASSERT_TRUE(rig.test.NetLayoutPending());
+  rig.Observe(f);
+  ASSERT_TRUE(rig.test.NetPrepareArm());  // what SyncTestStore::Relayout does: no NetClear before
+  char expect[64];
+  std::snprintf(expect, sizeof(expect), "new=[0x%08X-0x%08X]", LATE_PAGE, LATE_PAGE + 0x1000);
+  EXPECT_TRUE(LinesContain(rig.sink, "NOTE learned +1 pages at arm (frame", expect));
+  EXPECT_FALSE(rig.test.NetLayoutPending());
+  EXPECT_TRUE(SetContains(rig.test.Ranges(), LATE_PAGE));
+  // The summary lists it once and is written once (the second call finds nothing changed).
+  const std::string note = rig.test.NetSummaryNote();
+  EXPECT_TRUE(rig.sink.Contains("NOTE learned summary pages=1 ranges=[0x"));
+  const size_t summaries = rig.sink.Count("NOTE learned summary");
+  rig.test.NetSummaryNote();
+  EXPECT_EQ(rig.sink.Count("NOTE learned summary"), summaries);
+  EXPECT_EQ(note, "");  // no verify, no hiding: nothing to append
+}
+
+TEST(Rev3Rollback, NetModeLearnedSummaryIsWrittenEvenWhenNothingWasLearned)
+{
+  NetRig rig(AdaptiveOptions(6));
+  NetArmAndRun(rig, 10, false);
+  rig.test.NetSummaryNote();
+  EXPECT_TRUE(rig.sink.Contains("NOTE learned summary pages=0 ranges=[]"));
+}
+
+TEST(Rev3Rollback, NetModeAppliesTheLearnPadOption)
+{
+  SyncTestOptions o = AdaptiveOptions(6);
+  o.learn_pad_pages = 1;
+  NetRig rig(o);
+  u32 f = NetArmAndRun(rig, 600, true);
+  ASSERT_TRUE(rig.test.NetLayoutPending());
+  rig.Observe(f);
+  ASSERT_TRUE(rig.test.NetPrepareArm());
+  EXPECT_TRUE(SetContains(rig.test.Ranges(), LATE_PAGE));
+  EXPECT_TRUE(SetContains(rig.test.Ranges(), LATE_PAGE - 0x1000));
+  EXPECT_TRUE(SetContains(rig.test.Ranges(), LATE_PAGE + 0x1000));
+  char expect[64];
+  std::snprintf(expect, sizeof(expect), "new=[0x%08X-0x%08X]", LATE_PAGE - 0x1000, LATE_PAGE + 0x2000);
+  EXPECT_TRUE(LinesContain(rig.sink, "NOTE learned +3 pages at arm (frame", expect));
+}
+
+TEST(Rev3Rollback, NetModeANewMatchBuildsItsFirstSetWithoutCallingItLearned)
+{
+  NetRig rig(AdaptiveOptions(6));
+  NetArmAndRun(rig, 10, false);
+  rig.test.NetClear();
+  rig.game.Mem().SetU32(0x8038FE50, 0);  // the fight is over: fighters lost
+  rig.Observe(5000);
+  rig.game.Mem().SetU32(0x8038FE50, TEAM[0]);
+  u32 f = 5001;
+  for (; f < 9000 && !rig.test.LearningDone(); ++f)
+  {
+    rig.Observe(f);
+    rig.Advance(f);
+  }
+  rig.Observe(f);
+  ASSERT_TRUE(rig.test.NetPrepareArm());
+  EXPECT_FALSE(rig.sink.Contains("NOTE learned +"));
+}
+
+TEST(Rev3Rollback, NetModeRestoreVerifyHealQueuesTheMissingPageForTheNextRelayout)
+{
+  SyncTestOptions o = Options(3);
+  o.verify = VOpts(VERIFY_ALL, 1, 4, true);
+  NetRig rig(o, NetSeed(), true);  // the hidden counter feeds the game state and no seed names its page
+  EXPECT_TRUE(rig.sink.Contains("NOTE verify on: restores=all every=1 slots=4 heal=1"));
+  u32 f = 1000;
+  for (; f < 1010; ++f)
+  {
+    rig.Observe(f);
+    rig.Advance(f);
+  }
+  rig.Observe(f);
+  ASSERT_TRUE(rig.test.NetPrepareArm());
+  for (; f < 1014; ++f)
+  {
+    if (f != 1010)
+      rig.Observe(f);
+    ASSERT_TRUE(rig.Capture(f));
+    rig.Advance(f);
+  }
+  rig.Observe(f);
+  EXPECT_FALSE(rig.test.NetLayoutPending());
+  ASSERT_TRUE(rig.test.NetRestore(1011));
+  ASSERT_NE(rig.test.Verifier(), nullptr);
+  EXPECT_EQ(rig.test.Verifier()->Checked(), 1u) << "the restore was verified in the netplay path";
+  EXPECT_EQ(rig.test.Verifier()->Wrong(), 1u);
+  EXPECT_TRUE(rig.sink.Contains("VERIFY restore 1014 -> 1011 wrong_blocks="));
+  EXPECT_TRUE(rig.test.NetLayoutPending()) << "the session must drain and relayout";
+  EXPECT_TRUE(rig.sink.Contains("NOTE restore verify heal found pages missing"));
+  EXPECT_FALSE(SetContains(rig.test.Ranges(), HIDDEN)) << "slots are in use: the set does not change yet";
+
+  rig.test.NetClear();
+  EXPECT_TRUE(SetContains(rig.test.Ranges(), HIDDEN));
+  EXPECT_FALSE(rig.test.NetLayoutPending());
+  EXPECT_EQ(rig.test.Stats().verify_pages_added, 1u);
+  EXPECT_TRUE(LinesContain(rig.sink, "NOTE learned +1 pages at clear (frame", "new=[0x80700000-0x80701000] (1 of them found by the restore verify heal)"));
+  const std::string stats = rig.test.NetStatsLine();
+  EXPECT_NE(stats.find(" restores_checked=1 restores_wrong=1"), std::string::npos) << stats;
+  const std::string note = rig.test.NetSummaryNote();
+  EXPECT_NE(note.find(" restores_checked=1 restores_wrong=1"), std::string::npos) << note;
+  EXPECT_NE(note.find(" verify_pages_added=1"), std::string::npos) << note;
+  EXPECT_TRUE(rig.sink.Contains("NOTE learned summary pages=1 ranges=[0x80700000-0x80701000]"));
+}
+
+TEST(Rev3Rollback, NetModeRestoreVerifyHealPagesAreNamedAtTheArmToo)
+{
+  SyncTestOptions o = Options(3);
+  o.verify = VOpts(VERIFY_ALL, 1, 4, true);
+  NetRig rig(o, NetSeed(), true);
+  u32 f = 1000;
+  for (; f < 1010; ++f)
+  {
+    rig.Observe(f);
+    rig.Advance(f);
+  }
+  rig.Observe(f);
+  ASSERT_TRUE(rig.test.NetPrepareArm());
+  for (; f < 1014; ++f)
+  {
+    if (f != 1010)
+      rig.Observe(f);
+    ASSERT_TRUE(rig.Capture(f));
+    rig.Advance(f);
+  }
+  rig.Observe(f);
+  ASSERT_TRUE(rig.test.NetRestore(1011));
+  ASSERT_TRUE(rig.test.NetPrepareArm());
+  EXPECT_TRUE(LinesContain(rig.sink, "NOTE learned +1 pages at arm (frame", "new=[0x80700000-0x80701000]"));
+  EXPECT_EQ(rig.test.Stats().verify_pages_added, 1u);
+  EXPECT_TRUE(SetContains(rig.test.Ranges(), HIDDEN));
+}
+
+// ---- hook protocol 3: accepting it, the flag word, HELLO ---------------------------------------------------------------------------
+
+namespace
+{
+std::array<u8, CMD_SIZE> RawCommand(u8 version)
+{
+  std::array<u8, CMD_SIZE> raw{};
+  raw[0] = CMD_ID;
+  raw[1] = version;
+  raw[4] = 0x52, raw[5] = 0x42, raw[6] = 0x4B, raw[7] = 0x31;
+  raw[11] = 9;  // frame 9
+  return raw;
+}
+
+struct FlagHider final : Net::ResimHider
+{
+  explicit FlagHider(ResimHideFlags& f) : flags(f) {}
+  void SetHidden(bool hidden) override { flags.Set(hidden); }
+  ResimHideFlags& flags;
+};
+}  // namespace
+
+TEST(Rev3Rollback, ProtocolsTwoAndThreeAreAcceptedAndOthersAreNot)
+{
+  for (const u8 version : {u8(2), u8(3)})
+  {
+    const auto raw = RawCommand(version);
+    Command c;
+    ASSERT_TRUE(ParseCommand(raw.data(), raw.size(), &c)) << int(version);
+    EXPECT_EQ(c.protocol, version);
+    EXPECT_EQ(c.frame, 9u);
+  }
+  for (const u8 version : {u8(0), u8(1), u8(4), u8(0xFF)})
+  {
+    const auto raw = RawCommand(version);
+    Command c;
+    EXPECT_FALSE(ParseCommand(raw.data(), raw.size(), &c)) << int(version);
+  }
+}
+
+TEST(Rev3Rollback, ResimHideEnvValuesParse)
+{
+  struct Case
+  {
+    const char* text;
+    u32 flags;
+    bool ok;
+  };
+  const Case cases[] = {{"", HIDE_DRAW, true}, {"0", 0, true},   {"off", 0, true},  {"1", 1, true},   {"draw", 1, true}, {"DRAW", 1, true},
+                        {"2", 2, true},        {"sound", 2, true}, {"3", 3, true},  {"all", 3, true},  {"4", 1, false},   {"hide", 1, false}};
+  for (const Case& c : cases)
+  {
+    u32 flags = 99;
+    EXPECT_EQ(ParseResimHide(c.text, &flags), c.ok) << c.text;
+    EXPECT_EQ(flags, c.flags) << c.text;
+  }
+}
+
+TEST(Rev3Rollback, TheFlagWordIsWrittenBigEndianWhileHiddenAndClearedAfterwards)
+{
+  FakeMemory mem;
+  FakeSink sink;
+  ResimHideFlags flags(mem, HIDE_ALL, &sink);
+  flags.SetProtocol(PROTOCOL_VERSION_HIDE);
+  EXPECT_EQ(mem.U32(HIDE_FLAGS_ADDR), 0u);
+  flags.Set(true);
+  EXPECT_EQ(mem.U32(HIDE_FLAGS_ADDR), 3u);
+  u8 raw[4];
+  ASSERT_TRUE(mem.Read(HIDE_FLAGS_ADDR, raw, 4));
+  EXPECT_EQ(raw[0], 0);
+  EXPECT_EQ(raw[3], 3);
+  const u32 writes = flags.Writes();
+  flags.Set(true);  // already there: no second write
+  EXPECT_EQ(flags.Writes(), writes);
+  flags.Set(false);
+  EXPECT_EQ(mem.U32(HIDE_FLAGS_ADDR), 0u);
+  flags.Set(false);
+  EXPECT_EQ(flags.Writes(), writes + 1);
+  EXPECT_TRUE(sink.Contains("NOTE resim hiding v3: flags=3 (draw+sound) written to 0x8000241C"));
+  EXPECT_EQ(sink.Count("NOTE resim hiding"), 1u);
+}
+
+TEST(Rev3Rollback, EachFlagValueWritesItsOwnBits)
+{
+  for (const u32 want : {0u, 1u, 2u, 3u})
+  {
+    FakeMemory mem;
+    ResimHideFlags flags(mem, want);
+    flags.SetProtocol(3);
+    flags.Set(true);
+    EXPECT_EQ(mem.U32(HIDE_FLAGS_ADDR), want);
+    flags.Set(false);
+    EXPECT_EQ(mem.U32(HIDE_FLAGS_ADDR), 0u);
+  }
+}
+
+TEST(Rev3Rollback, ProtocolTwoNeverTouchesTheFlagWordAndSaysWhy)
+{
+  FakeMemory mem;
+  mem.SetU32(HIDE_FLAGS_ADDR, 0x77);  // whatever a v2 hook keeps there is not ours
+  FakeSink sink;
+  ResimHideFlags flags(mem, HIDE_DRAW, &sink);
+  flags.SetProtocol(PROTOCOL_VERSION);
+  flags.Set(true);
+  flags.Set(false);
+  flags.Set(true);
+  EXPECT_EQ(mem.U32(HIDE_FLAGS_ADDR), 0x77u);
+  EXPECT_EQ(flags.Writes(), 0u);
+  EXPECT_EQ(sink.Count("NOTE resim hiding: the hook speaks protocol 2"), 1u);
+  u32 a = 0, b = 0;
+  EXPECT_FALSE(flags.ReadCounters(&a, &b));
+}
+
+TEST(Rev3Rollback, TheCountersAreReadFromTheV3DataBlock)
+{
+  FakeMemory mem;
+  ResimHideFlags flags(mem, HIDE_DRAW);
+  flags.SetProtocol(3);
+  mem.SetU32(HIDE_ITERATIONS_ADDR, 1234);
+  mem.SetU32(HIDE_SOUNDS_ADDR, 5);
+  u32 iterations = 0, sounds = 0;
+  ASSERT_TRUE(flags.ReadCounters(&iterations, &sounds));
+  EXPECT_EQ(iterations, 1234u);
+  EXPECT_EQ(sounds, 5u);
+  EXPECT_EQ(flags.SummaryFields(), " hide_protocol=3 hide_flags=1 hide_writes=0 hidden_iterations=1234 skipped_sounds=5");
+}
+
+TEST(Rev3Rollback, ResimHidingDrivesTheFlagWordFromTheRestoredReplyToTheLastResimulatedCall)
+{
+  FakeMemory mem;
+  FakeSink sink;
+  ResimHideFlags flags(mem, HIDE_DRAW, &sink);
+  flags.SetProtocol(3);
+  FlagHider hider(flags);
+  Net::ResimHiding hiding(&hider, sink);
+  hiding.Update(false);
+  EXPECT_EQ(mem.U32(HIDE_FLAGS_ADDR), 0u);
+  hiding.Update(true);  // the RESTORED reply
+  EXPECT_EQ(mem.U32(HIDE_FLAGS_ADDR), 1u);
+  hiding.Update(true);
+  EXPECT_EQ(mem.U32(HIDE_FLAGS_ADDR), 1u);
+  hiding.Update(false);  // the reply of the last resimulated frame (or the session leaving, or shutdown)
+  EXPECT_EQ(mem.U32(HIDE_FLAGS_ADDR), 0u);
+}
+
+TEST(Rev3Rollback, SyncTestSetsTheFlagsOnlyWhileItResimulates)
+{
+  FakeGame game(false);
+  game.SetProtocol(3);
+  FakeSink sink;
+  ResimHideFlags flags(game.Mem(), HIDE_DRAW, &sink);
+  SyncTest test(Options(3), game.Ranges(), game.Mem(), sink, FakeClock());
+  test.SetResimHide(&flags);
+  int hidden_calls = 0;
+  for (int i = 0; i < 200; ++i)
+  {
+    game.Frame(test);
+    EXPECT_EQ(game.Mem().U32(HIDE_FLAGS_ADDR), test.Resimulating() ? 1u : 0u) << i;
+    hidden_calls += test.Resimulating() ? 1 : 0;
+  }
+  EXPECT_GT(hidden_calls, 20) << "SyncTest rolled back and resimulated";
+  EXPECT_GE(flags.Writes(), 4u);
+  game.Mem().SetU32(0x8038FE50, 0);  // losing the fight in the middle of things clears the history; the word must follow
+  game.Frame(test);
+  EXPECT_EQ(game.Mem().U32(HIDE_FLAGS_ADDR), 0u);
+  test.Finish();
+  EXPECT_EQ(game.Mem().U32(HIDE_FLAGS_ADDR), 0u);
+  EXPECT_TRUE(sink.Contains("SUMMARY final"));
+  EXPECT_TRUE(LinesContain(sink, "SUMMARY final", " hide_protocol=3 hide_flags=1"));
+}
+
+TEST(Rev3Rollback, SyncTestWithHooksOfProtocolTwoWritesNothing)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  ResimHideFlags flags(game.Mem(), HIDE_ALL, &sink);
+  SyncTest test(Options(3), game.Ranges(), game.Mem(), sink, FakeClock());
+  test.SetResimHide(&flags);
+  for (int i = 0; i < 150; ++i)
+    game.Frame(test);
+  EXPECT_EQ(flags.Writes(), 0u);
+  EXPECT_EQ(game.Mem().U32(HIDE_FLAGS_ADDR), 0u);
+  EXPECT_TRUE(sink.Contains("NOTE resim hiding: the hook speaks protocol 2"));
+}
+
+TEST(Rev3Rollback, TheHideCountersGoIntoTheNetSummaryNote)
+{
+  NetRig rig(AdaptiveOptions(6));
+  ResimHideFlags flags(rig.game.Mem(), HIDE_DRAW);
+  flags.SetProtocol(3);
+  rig.test.SetHideCounters(&flags);
+  rig.game.Mem().SetU32(HIDE_ITERATIONS_ADDR, 42);
+  const std::string note = rig.test.NetSummaryNote();
+  EXPECT_NE(note.find(" hide_protocol=3 hide_flags=1 hide_writes=0 hidden_iterations=42 skipped_sounds=0"), std::string::npos) << note;
 }

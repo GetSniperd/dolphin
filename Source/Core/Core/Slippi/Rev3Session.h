@@ -108,7 +108,7 @@
 namespace Rev3::Net
 {
 // ---- constants -------------------------------------------------------------------------------------------------------------
-constexpr u32 NET_PROTOCOL_VERSION = 2;       // HELLO: the hook protocol version both sides speak
+constexpr u32 NET_PROTOCOL_VERSION = 2;       // HELLO: the default hook protocol version; the module sends the version byte of the first command (2 or 3)
 constexpr s32 CHECK_INTERVAL = 30;            // frames between exchanged checksums (rbchecksum.CHECK_INTERVAL)
 constexpr size_t CHECK_KEEP = 8;              // own and peer checksums kept
 constexpr int MAX_ROLLBACK_CEILING = 7;       // SlippiNetplay.h ROLLBACK_MAX_FRAMES: the largest MAXR a config may ask for
@@ -331,6 +331,10 @@ public:
   // M4, REV3_NET_RANGE_CRC=1 (testing only). CRC-32 of each snapshot range as it was at the start of `frame`: from the frame's slot, or, when
   // `live` (the caller is at that frame's own hook call), from live memory. False: not available.
   virtual bool RangeCrcs(s32 /*frame*/, bool /*live*/, std::vector<RangeCrc>* /*out*/) { return false; }
+  // Called before every SUMMARY line (also the final one): the store may write its own lines first (the `NOTE learned summary` line of the
+  // snapshot machinery) and returns fields appended to the SUMMARY line (restore verify counters, resimulation hiding counters), with a
+  // leading space, or "".
+  virtual std::string SummaryNote() { return {}; }
 };
 
 // The FieldSet of raw big-endian field bytes (Rev3::ReadFighterFields / SyncTest::NetSnapshotInfo), `present` as in FieldSet.
@@ -345,7 +349,7 @@ struct Hello
 {
   Role role = Role::Host;
   std::string game_id;                         // "RNEEDA"
-  u32 protocol = NET_PROTOCOL_VERSION;         // the hook protocol (2)
+  u32 protocol = NET_PROTOCOL_VERSION;         // the hook protocol (2 or 3, Rev3::Command::protocol): both machines must run the same patch set
   u32 fields_version = FIELDS_VERSION;
   u32 fields_digest = FIELDS_DIGEST_V1;
   u32 delay = 2;                               // input delay D in frames; the HOST's value wins (not a mismatch)

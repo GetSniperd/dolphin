@@ -1972,6 +1972,7 @@ void RollbackSession::SummaryLine(const char* tag)
       adv(static_cast<double>(m_stats.pace_offset_sum_us) / checks), adv(m_stats.pace_offset_max_us), adv(m_stats.pace_offset_min_us),
       m_stats.pace_lines_left_out, m_stats.stall_run_max, m_stats.resim_costs, m_stats.resim_cost_skipped, p50 / 1000.0, p95 / 1000.0,
       pmax / 1000.0, m_stats.maxr_eff, m_stats.maxr_eff_min, m_stats.maxr_changes);
+  const std::string store_note = m_store.SummaryNote();  // may write the `NOTE learned summary` line, so before the SUMMARY line below
   Line(Fmt("%s mode=%s frame=%d calls=%u resim_calls=%u rollbacks=%u max_depth=%u depth_hist=[%s] predicted=%u stalls=%u stall_ms_max=%.1f "
            "postponed=%u forced_hw=%u hw_holds=%u hold_calls=%u relayouts=%u chk_ok=%u chk_bad=%u gate_opens=%u gate_closes=%u gate_late=%u "
            "arm_refused=%u log_suppressed=%u%s%s%s",
@@ -1979,7 +1980,8 @@ void RollbackSession::SummaryLine(const char* tag)
            m_stats.predicted_frames, m_stats.stalls, static_cast<double>(m_stats.stall_us_max) / 1000.0, m_stats.postponed,
            m_stats.forced_hw, m_stats.hw_holds, m_stats.hold_calls, m_stats.relayouts, m_stats.checks_ok, m_stats.checks_bad,
            m_stats.gate_opens, m_stats.gate_closes, m_stats.gate_late, m_stats.arm_refused, m_stats.log_suppressed, sim.c_str(),
-           ranges.c_str(), m5.c_str()));
+           ranges.c_str(), m5.c_str()) +
+       store_note);
 }
 
 void RollbackSession::Finish()

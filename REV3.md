@@ -77,6 +77,7 @@ Run (set the variables before starting Slippi_Dolphin.exe; the patched game with
 | `REV3_SYNCTEST_EXCLUDE=path` | optional JSON `{"ranges":[{"start","end"}]}` (same format as the whitelist) subtracted from the snapshot after the whitelist is loaded; each range is logged as `NOTE exclude user 0x..-0x.. (n bytes were in the whitelist)`. Use it to test excluding audio / scratch ranges without editing the whitelist. A bad file or one that removes everything (classic mode only) turns SyncTest off with an error. Entries may be pointer based, `{"ptr":"0x8049D000","size":"0x3F0000","note":"nw4r sound system"}`: the u32 at `ptr` is read when SyncTest arms and at every exclusion re-check (every 600 hook calls) and `[value, value+size)` is excluded (for heaps the game allocates at run time: sound system work block `*0x8049D000` 0x3F0000 bytes, Home Button sound block `*0x80461B50` 0x18700 bytes). Logged as `NOTE exclude ptr entry 0x.. size=.. note=..` once, then `NOTE exclude ptr 0x8049D000 -> 0xS-0xE (n bytes were in the whitelist)` per resolved region (a region that moves adds a cut, the old one stays) or `NOTE exclude ptr 0x.. skipped: pointer is 0 | pointer is outside MEM1 / MEM2 (value 0x..)` once per value |
 | `REV3_EF_POOL=0` | do not force the nw4r::ef effect pool into the snapshot at arm (default 1, see "Effect pool" below) |
 | `REV3_SNAPSHOT_INCLUDE=path` | optional JSON, the very entry formats of `REV3_SYNCTEST_EXCLUDE` (`{"start","end"}` ranges, `{"ptr","size","note"}` pointer entries): these regions are forced INTO the snapshot set at every arm, on top of the learned pages (and of the ef pool). Logged `NOTE include user 0x..-0x.. (n bytes ...)`, `NOTE include ptr entry ..` at start and `NOTE include ptr 0x.. -> 0xS-0xE (n bytes) note=..` / `NOTE include ptr 0x.. skipped: pointer is 0 \| outside MEM1 / MEM2` at arm, then `NOTE forced include: ranges=.. bytes=..; the snapshot set grows by n bytes`. The cuts (hook region, `REV3_SYNCTEST_EXCLUDE`, hardware regions) still win. A bad file turns SyncTest off with an error (like the exclude file). Use it to test a suspicion without rebuilding |
+| `REV3_SNAPSHOT_PAD=n` | 0..16, default 0 = off. Every page the tracker learns also pulls n neighbouring 4 KB pages on each side into the snapshot set (clipped to MEM1 / MEM2, cuts still win; `NOTE learn pad pages=n ..` at start). Costs snapshot bytes (up to 2n pages per learned run), saves relayouts when a game block spans pages that start to change one after the other. Whether it would have helped a run is in `NOTE learned adjacency` (below) |
 | `REV3_EFCHECK=N\|all\|0` | the ef list check around restores (see "Effect pool"): unset = the first 200 restores, `N` = the first N, `all` = every restore, `0` = off |
 | `REV3_SYNCTEST_LOG=path` | log file (default `<User>\Logs\rev3_synctest.log`), appended, flushed per line |
 
@@ -95,7 +96,7 @@ once (whitelist=(none) and ranges=0 with the adaptive set and no seed); `NOTE ar
 adaptive: `NOTE learning complete: 20 scan cycles (slices=16) dynamic_pages=.. (.. bytes) at frame N`, `NOTE arm deferred: learning (n/20
 cycles)` (once per wish), `NOTE arm cancelled by Z at frame N`, at arm `NOTE adaptive set at arm: dynamic_pages=.. (.. bytes)
 scan_cycles=.. slices=.. ranges=.. bytes=.. snapshot_bytes=..` and `NOTE snapshot now ranges=.. bytes=.. snapshot_bytes=.. slots=..`,
-while armed `NOTE learned +n pages (now ranges=.. bytes=..) frame N, history cleared` followed by `NOTE snapshot now ...` (the first 10
+while armed `NOTE learned +n pages (now ranges=.. bytes=..) frame N, history cleared; new=[0xS-0xE,..]` followed by `NOTE snapshot now ...` (the first 10
 growths, then at most one per 300 hook calls plus `NOTE further learning is logged at most every 300 hook calls`),
 `ERROR frame N: not all fighter fields are inside the snapshot set (an exclusion cuts a fighter struct); not arming` (after the
 `NOTE field coverage` lines naming the missing fields);
@@ -284,8 +285,122 @@ are installed at the next arm (`NOTE learned +n pages while slots are in use`); 
 those pages, so it is counted. The `NOTE snapshot stats` line (end of a stretch) ends with `ef_checks=.. ef_bad=.. ef_bad_before=..
 layout_refused=.. restores_with_pending_set=..`; `ef_bad` and `layout_refused` must be 0.
 
+### Late-learned pages: naming them, and keeping them out of the next relayout
+
+A page is learned when its hash differs between two scans one cycle (16 hook calls) apart, so a page the game writes only now and then
+(an effect, a special move, a sound) is found in the middle of a fight, long after the 20 learning cycles. In netplay each such growth is
+a relayout (`GATE relayout`): the snapshot history is dropped and no rollback is possible until it has refilled (a D match: 25 relayouts of
+1-3 pages each). Three things help, in this order of cost:
+
+1. **Name the pages.** Every `NOTE learned +n pages` line (SyncTest; the netplay line `... while slots are in use` on rev3-net, see below)
+   ends in `new=[0xS-0xE,..]`: merged runs, at most 16 named then `,+N more`. A rate limited SyncTest line names every range learned since the
+   previous line. `NOTE learned summary pages=N ranges=[0xS-0xE,..]` lists ALL pages learned after the first arm, merged (N = bytes / 4 KB,
+   rounded up; at most 2000 ranges named). It is written with the periodic SUMMARY line when the list changed and always at shutdown
+   (`pages=0 ranges=[]` when nothing was learned, so a log shows the fork has the line); `NOTE learned adjacency growths=.. ranges_touching_old_set=..
+   learn_pad_pages=..` says how many of the new ranges lay directly next to a range that was already in the set.
+2. **Include them next time.** `tools/rollback/learned_include.py` (rev3-mod) reads those lines from any number of logs and writes a
+   `REV3_SNAPSHOT_INCLUDE` file: ranges padded to whole pages, gaps under 16 KB joined, optionally only ranges seen in at least N logs
+   (`--min-logs`; the heap layout moves from match to match, so an address seen in one log only may not repeat), a `note` per range (first
+   frame, logs). The fork then puts those pages in the set at every arm: no growth, no relayout. This works exactly as far as the addresses
+   repeat between runs (fixed pools and static data do, a heap block may not); the tool's report says how many ranges all logs agree on.
+3. **Neighbours.** `REV3_SNAPSHOT_PAD=1` is the cheap form of "pages next to a learned one": see the variable table. It is always safe
+   (a page in the set that never changes is rewound to what it already holds) and costs only snapshot bytes and copy time, so it is
+   off by default; try it where `ranges_touching_old_set` is a large share of `growths`. A real "same heap block" rule would need the
+   game's heap block headers; that is not attempted.
+
+Why the old history cannot simply be kept when the set grows: an old slot has no bytes for the new pages, and copying their CURRENT
+contents into it would be wrong unless the page had not changed since that slot was taken, which cannot be known (that is the point: the
+page was only just found to change). So a relayout stays a relayout; the fix is to make fewer of them.
+
+**In netplay (merged into rev3-net).** The set changes only in `NetPrepareArm` / `NetClear` (`SyncTest::NetInstallSet`). The first install of a match builds the
+set and learns nothing (`m_net_armed_once`, cleared when the fighters are lost: a new match builds its first set again). Every later install names what
+joined, in the format `learned_include.py` reads: `NOTE learned +n pages while slots are in use (frame f): the snapshot set grows at the next arm; new=[..]` when
+`NetObserve` first sees the growth, and `NOTE learned +n pages at arm (frame f): new=[..]` (`at clear` when the session drained first) when the set is installed,
+which names every page that joined since the previous install (also pages found after the first line). `LearnedSummaryLine()` is written before every SUMMARY line
+(the store's `SummaryNote()`, called by `RollbackSession::SummaryLine`) and at shutdown. `REV3_SNAPSHOT_PAD` and `REV3_RB_VERIFY*` are read by the shared `BuildSyncTest`, so
+they apply on the net path with no extra code (`NOTE learn pad ..` / `NOTE verify on ..` go to the net log). The runner must still hand `REV3_SNAPSHOT_INCLUDE` /
+`REV3_SNAPSHOT_PAD` to the fork (rev3-mod netplay.py `KEEP_REV3_VARS`).
+
 Tests: `Rev3Rollback.EfPool*`, `InclusionFile*`, `EfCheck*`, `EfDump*`, `FreezeDumpCarriesTheEfLines`, `ArmForcesTheEfPool*`, `WithoutThePool*`,
-`WithThePoolForced*`, `UserInclusionsAreForced*`, `LearningAPageWhileArmed*`, `NetPrepareArm*Ef*`, `NetModeRestoreWithAPendingSet*` (a synthetic ef image with the same offsets).
+`WithThePoolForced*`, `UserInclusionsAreForced*`, `LearningAPageWhileArmed*`, `NetPrepareArm*Ef*`, `NetModeRestoreWithAPendingSet*` (a synthetic ef image with the same offsets),
+`NetModeNamesTheLearnedPages*`, `NetPrepareArmNamesPagesLearned*`, `NetModeLearnedSummary*`, `NetModeAppliesTheLearnPadOption`, `NetModeANewMatch*`.
+
+## Restore verify (`REV3_RB_VERIFY`, off by default)
+
+Why: the adaptive snapshot set learns pages late, and a restore only rewinds the pages it knows. Two symptoms so far: 25 relayouts in a netplay
+match, and a hit-spark particle in a not-yet-learned page that made the restored lists circular (the freeze). The idea (borrowed from another
+project's "RESTORE MISS" mode; no code taken) is to ask the question directly: after a restore to frame f, is ALL of guest memory what it was
+when f was captured?
+
+How: a **shadow** is a full copy of guest MEM1 + MEM2 (24 + 64 MB = 88 MB) taken inside `SyncTest::Capture` at the same moment as the
+snapshot of a frame, for the frames that are a multiple of `every` only, in a ring of `slots` shadows (slot = (frame / every) % slots). After the
+write-back of `SyncTest::Restore` to frame f the verifier compares all guest memory with f's shadow, in 64 KB chunks first, then 4 KB pages, then
+32-byte blocks, and reports the blocks that differ. A restore is verified only when f still has its shadow, so with 1 slot and every = K + 1 one
+restore in K + 1 is checked. Both SyncTest and the netplay session use `Capture` / `Restore` (`NetCapture` / `NetRestore` call them), so the
+hooks are shared. Nothing is allocated and nothing is copied while `REV3_RB_VERIFY` is unset.
+
+Cost (unit: per shadow / per check, desktop core, measured only on the fake memory here, so treat as estimates): a shadow is a 88 MB memcpy
+(roughly 8-15 ms) and holds 88 MB; a check reads both copies again (5-10 ms). After N verified restores the shadows stop being taken. `shadow_ms`
+in the stats is the sum of both. This is a diagnosis mode, not for a match you want to play at full speed (a hitch of ~20 ms every K + 1 frames).
+
+What is not compared (the restore leaves it alone on purpose): the hook region 0x80002400-0x80002A00, the `REV3_SYNCTEST_EXCLUDE` ranges (including
+resolved pointer entries), every hardware cut (GX FIFO, XFB, audio DMA, DVD DMA; the set only grows), `REV3_RB_VERIFY_IGNORE`, and the **dead stack**:
+`[stack end, sp)` of the thread the hook runs on (OSThread `*0x800000E4`, stackBase +0x304, stackEnd +0x308; if that is not readable or does not hold sp,
+`sp - REV3_RB_VERIFY_STACK_BELOW` bytes). The hook's stack window `[sp, sp + REV3_STACK_WINDOW)` IS compared (the restore rewrote it).
+
+| variable | meaning |
+|---|---|
+| `REV3_RB_VERIFY=N\|all` | verify the first N restores that land on a shadowed frame (count); `all` = never stop; unset / 0 = off |
+| `REV3_RB_VERIFY_EVERY=P` | take a shadow when `frame % P == 0` (frames, 0..1000000). 0 / unset = automatic: SyncTest picks the smallest P >= K + 1 that can hit a restore target (`AutoVerifyEvery`; with EVERY>1 not every P can) |
+| `REV3_RB_VERIFY_SLOTS=S` | shadows kept, 1..8, default 1 (88 MB each). One slot is enough when P >= K + 1 (SyncTest); P = 1 with K = 2 needs 3 slots to verify every restore |
+| `REV3_RB_VERIFY_HEAL=1` | copy the shadow's bytes back over every wrong block (so the replay starts from the right state) and add the wrong pages that lie outside the set to the snapshot set (below) |
+| `REV3_RB_VERIFY_STACK_BELOW=bytes` | fallback size of the dead stack below the hook's sp, 0x100..0x400000, default 0x4000 |
+| `REV3_RB_VERIFY_IGNORE=path` | `{"ranges":[{"start","end"}]}` (the whitelist format): memory never compared (host-thread buffers that always differ, say) |
+
+Log lines (all in the Rev3 log):
+
+- `NOTE verify on: restores=.. every=.. slots=.. heal=.. stack_below=0x.. shadow_mb=88 per slot ...` at start; `NOTE verify: shadows at multiples of P never
+  match a restore target ...` when P cannot hit (no restore will be verified).
+- `VERIFY restore n -> m ok wrong_blocks=0 compared_mb=.. skipped_kb=.. us=..` (the first 3 clean restores).
+- `VERIFY first wrong restore: at frame n, back to frame m, k blocks of 32 bytes` once (and one on-screen message).
+- For the first 30 restores with wrong blocks: `VERIFY restore n -> m wrong_blocks=k pages=p in_set=a outside_set=b first=[0xADDR: snap w0 .. w7 | mem w0 .. w7]
+  compared_mb=.. skipped_kb=.. us=..` (`snap` = the shadow's 8 words of the first wrong 32-byte block, `mem` = what guest memory holds now),
+  `VERIFY restore n -> m first_in_set=[..]` (the first wrong block inside memory the restore rewrote, when it is not the first one),
+  `VERIFY restore n -> m regions64k=R [0xBASE:blocks b/pages p,..]` (64 KB regions with wrong blocks, at most 16 named) and
+  `VERIFY restore n -> m missing_pages=P [0xS-0xE,..]` (4 KB pages with wrong blocks that the snapshot set does not hold, merged; with heal `healed; added
+  to the snapshot set at the next layout` follows).
+- **How to read it**: `outside_set` blocks are pages the set is missing (what the tracker would learn late) or memory nobody can rewind (host-thread
+  writes, hardware buffers: add those to `REV3_RB_VERIFY_IGNORE` to see past them); `in_set` blocks (the line then ends `WARNING blocks inside the rewritten
+  memory differ`) mean the restore itself failed or something wrote behind it while it ran, which is a bug.
+- SUMMARY lines end with ` restores_checked=.. restores_wrong=.. verify_blocks=.. first_wrong_frame=.. shadow_ms=..`; at shutdown
+  `VERIFY summary restores_checked=.. restores_wrong=.. wrong_blocks=.. (in_set=.. outside_set=..) distinct_blocks=.. in distinct_pages=..
+  first_wrong_frame=.. first_wrong_back_to=.. first_wrong_blocks=.. shadows=.. shadow_mb_held=.. shadow_ms=.. heal=.. pages_added=..`.
+
+Heal: the wrong blocks are overwritten with the shadow's bytes (JIT invalidated for those pages, the page tracker's baseline for them reset), so the
+replay that follows starts from the true state of frame m. The pages among them that lie outside the snapshot set go into `m_verify_extra`, which is
+part of every `ComputeRanges()` from then on. SyncTest installs them on the first hook call after the resimulation (`ApplyVerifyPages`): relayout,
+history cleared, and a line in the learned-page format so `tools/rollback/learned_include.py` can consume it:
+`NOTE learned +n pages (now ranges=.. bytes=..) frame F, history cleared; new=[0xS-0xE,..] (restore verify heal)`; they also end up in
+`NOTE learned summary`. With the cuts winning as everywhere. Without heal nothing changes in the set; the `missing_pages=[..]` list is the finding.
+
+Tests: `Rev3Rollback.Verifier*`, `VerifyEvery*`, `RestoreVerify*` (exact block / page / region counts across MEM1 and MEM2, the Read fallback without Peek,
+skip ranges starting mid-block, slot rotation and the budget, the missing page named, heal giving a mismatch-free replay with an incomplete whitelist, a
+complete adaptive set verifying clean, a restore that drops writes reported as `in_set`, hardware cuts / ignore list / dead stack left out).
+
+What D runs (SyncTest; the environment is inherited by `phase3.bat`): `set REV3_RB_VERIFY=40` and `phase3.bat synctest --k 4` (play 2-3 minutes in a fight).
+Success: `restores_wrong=0` in the SUMMARY lines and `VERIFY summary ... restores_wrong=0`; otherwise the `VERIFY restore` lines name the pages. First try
+without heal to see everything the set misses; then `set REV3_RB_VERIFY_HEAL=1` plus `REV3_RB_VERIFY_EVERY=1` / `REV3_RB_VERIFY_SLOTS=5` (K + 1 slots: every restore verified
+and healed, 440 MB) to see whether the replay mismatches go away. Feed the `VERIFY ... missing_pages` / `NOTE learned` lines to `learned_include.py`.
+
+**In netplay (merged into rev3-net).** `Capture` / `Restore` are shared, so the shadows are taken at every `NetCapture` and checked after every `NetRestore` (`VERIFY` lines
+in the net log). `ParseVerifyEnv` runs in `BuildSyncTest` for the net path too. Netplay restores land on arbitrary frames: the automatic P (K + 1 = MAXR + 2) verifies about
+one restore in P; `REV3_RB_VERIFY_EVERY=1 REV3_RB_VERIFY_SLOTS=2` verifies depth-1 rollbacks (176 MB, an 88 MB copy per frame: a diagnosis run, not a match to play). The net
+`NOTE snapshot stats` line and every SUMMARY line end with ` restores_checked=.. restores_wrong=.. verify_blocks=.. first_wrong_frame=.. shadow_ms=.. verify_pages_added=..`
+and shutdown writes the `VERIFY summary` line. Heal in netplay: the pages go to `m_verify_extra`, the session is told the layout is pending (`NetLayoutPending()`, line
+`NOTE restore verify heal found pages missing from the snapshot set`), so it drains and relayouts like for a learned page; `NetInstallSet` then names them
+(`NOTE learned +n pages at arm|clear (frame f): new=[..] (k of them found by the restore verify heal)`, counted in `verify_pages_added`). The heal also writes guest memory behind
+the session on that machine only: use `REV3_RB_VERIFY_HEAL=1` in netplay for a diagnosis run.
+Tests: `NetModeRestoreVerifyHeal*`.
 
 ## Freeze dump (`REV3_SYNCTEST_DUMP`, default on)
 
@@ -432,7 +547,7 @@ pad). Every PAD packet carries the checksum of the latest final frame (every 30t
 
 ### HELLO (both machines must match, else the session is refused with an OSD line and a log entry, and the game plays offline)
 
-Game id (`RNEEDA`), hook protocol (2), fields version and digest (0xD4076EF2), fork build (`Common::GetScmRevGitStr`), CPU core, CPU thread
+Game id (`RNEEDA`), hook protocol (the version byte of the hook's first command: 2, or 3 with the hiding patches, M6), fields version and digest (0xD4076EF2), fork build (`Common::GetScmRevGitStr`), CPU core, CPU thread
 (single / dual), SyncGPU, DSP engine (HLE / LLE / LLE thread), custom RTC (enabled + value), overclock, MMU, FastDiscSpeed, cheats,
 Bluetooth passthrough, Wii Remote sources 1..4 + balance board, the CRC-32 of the hook code region 0x800024A0-0x8000291F (read when the
 first command arrives; the data block 0x80002400-0x8000249F changes every frame and is not included), `REV3_NET_ROLLBACK`, the gate
@@ -511,7 +626,7 @@ While `RollbackSession::Resimulating()` is true (from the RESTORED reply to the 
 
 Both are restored when the resimulation ends, when the session leaves (desync, BYE, timeout) and at shutdown. The log has one line
 `NOTE resim hiding v1: throttle off + mute` the first time. The session talks to an injectable `ResimHider` (`Rev3Session.h`); the unit tests use a fake.
-Not in v1: skipping the render / SFX of re-run frames inside the game (M6), so a resimulated frame still draws.
+Not in v1: skipping the render / SFX of re-run frames inside the game (M6, below), so with a protocol 2 hook a resimulated frame still draws.
 
 ### The gate rule (both machines always agree on WHEN the shared mode changes)
 
@@ -724,10 +839,37 @@ was ahead (and few on the other) with `pace_sleep_ms_total` a small part of the 
   delay is ever requested outside a normal ARMED call, nor larger than one slice. The 1000 seeds without the throttle model pass as before.
 - Not yet run: two real Dolphin processes with pacing (D does that), `SleepAndResetThrottle` under a real audio/video backend. The thresholds are the model's and Slippi's; D's numbers will retune them.
 
-## Known gaps (after M5)
+## Netplay (M6): the game skips drawing and sounds in resimulated frames (hook protocol 3)
+
+rev3-mod `docs/resim_skip.md` is the decision record (what is patched in the game and why). The fork side:
+
+- **Protocol.** `ParseCommand` accepts the version byte 2 and 3 (same layout; `Command::protocol` carries it, `PROTOCOL_VERSION_HIDE = 3`). HELLO carries the protocol of the first
+  command (`HelloInputs::hook_protocol`), so both machines must run the same patch set: a 2 / 3 mix is `protocol: own=2 peer=3` and the session is refused.
+- **Flag word.** With protocol 3 the fork writes a big-endian u32 to `0x8000241C` (inside the hook region, never in a snapshot): `REV3_RESIM_HIDE` flags while a resimulation runs,
+  0 otherwise. `ResimHideFlags` (pure, `Rev3Rollback.cpp`) does it; in netplay `DolphinResimHider::SetHidden` calls it next to the v1 throttle-off + mute (kept), so the word is
+  set at the RESTORED reply and cleared at the reply of the last resimulated frame, when the session leaves and at shutdown (the destructor). Protocol 2: nothing is written
+  (`NOTE resim hiding: the hook speaks protocol 2 ...` once, if hiding was wanted).
+- **SyncTest.** `REV3_SYNCTEST_HIDE=1` makes SyncTest set the same flags (`REV3_RESIM_HIDE`) from its RESTORED reply to the reply of its last resimulated frame (cleared when the history
+  is reset and in `Finish`), so a SyncTest run tests the patches: the hidden resimulation must reproduce the drawn original run (no `MISMATCH`).
+- **Counters.** The SUMMARY lines (SyncTest and netplay) end with ` hide_protocol=3 hide_flags=1 hide_writes=n hidden_iterations=n skipped_sounds=n`: the u32 counters at
+  `0x800029E4` (main-loop iterations that skipped drawing) and `0x800029E8` (sound starts skipped). `hidden_iterations` should be about the sum of (N - g) over the rollbacks;
+  `skipped_sounds` is 0 unless bit 1 is set.
+
+| variable | default | meaning |
+|---|---|---|
+| `REV3_RESIM_HIDE=0\|1\|2\|3` (or `off\|draw\|sound\|all`) | 1 (draw) | the flags written while a resimulation runs: bit 0 no 3D draw / EFB copy / presenting, bit 1 the sound start funnel returns "started" without starting. 0 = the v1 hiding only. A bad value is an `ERROR` line and `draw`. Needs a hook built with `rbhook --protocol 3`. Local to a machine (not in HELLO; the protocol is) |
+| `REV3_SYNCTEST_HIDE=1` | 0 | SyncTest only: set the flags during its resimulations |
+
+What D runs: regenerate the INI with `--protocol 3` (rev3-mod `docs/resim_skip.md` section 7), then SyncTest K = 1..7 with `REV3_SYNCTEST_HIDE=1`, then loopback netplay with the netsim,
+then `REV3_RESIM_HIDE=all` for the listening test.
+Tests: `ProtocolsTwoAndThree*`, `ResimHideEnvValuesParse`, `TheFlagWordIs*`, `EachFlagValue*`, `ProtocolTwoNeverTouchesTheFlagWord*`, `TheCountersAreRead*`, `ResimHidingDrivesTheFlagWord*`,
+`SyncTestSetsTheFlagsOnlyWhileItResimulates`, `SyncTestWithHooksOfProtocolTwo*`, `TheHideCountersGoIntoTheNetSummaryNote`, `Rev3NetLink.HelloCarriesTheHookProtocol*`.
+Not done: the optional refinement of resim_skip.md 5.4 (clear bit 0 one call earlier so the corrected frame N - 1 is drawn).
+
+## Known gaps (after M6 fork side)
 
 - Pacing and MAXR measurement are built (M5) but only run in the test network; the real numbers are D's loopback (above). Not done: a pacing OSD line (the log has it), and the adaptive MAXR is off by default.
-- The in-game side of hiding (skip render and SFX of re-run frames, the rbhook patch) is M6; v1 only turns the throttle off and mutes the output.
+- Hiding in the game (M6) needs the INI regenerated with protocol 3 and is untested in the real game; with a protocol 2 hook only the v1 hiding (throttle off + mute) runs.
 - Internet play (NAT traversal beyond simultaneous open, relay, matchmaking) is M7; direct connect only.
 - A HOLD makes a machine wait for the peer's pads more often during a disc read; there is no measurement of how often yet.
 - No spectators, no replay file; rollback depth is capped at 7; the first command must be frame 0 (a game already in progress cannot join); a
