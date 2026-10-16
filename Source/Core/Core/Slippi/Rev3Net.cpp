@@ -580,6 +580,12 @@ bool SyncTestStore::Relayout()
   return m_sync != nullptr && m_sync->NetPrepareArm();
 }
 
+// Before every SUMMARY line: `NOTE learned summary` (when the learned pages changed) and the restore verify / hiding counters for the line.
+std::string SyncTestStore::SummaryNote()
+{
+  return m_sync != nullptr ? m_sync->NetSummaryNote() : std::string();
+}
+
 // REV3_NET_RANGE_CRC: the snapshot ranges (SyncTest's set); before the first arm, or in a lockstep-only run, the REV3_NET_STABLE ranges.
 bool SyncTestStore::RangeCrcs(s32 frame, bool live, std::vector<RangeCrc>* out)
 {
@@ -678,6 +684,7 @@ void NetModule::Start(const Command& command)
     hello_inputs.hook_crc = Common::ComputeCRC32(code.data(), code.size());
     hello_inputs.hook_crc_valid = true;
   }
+  hello_inputs.hook_protocol = command.protocol;  // 2 or 3: both machines must run the same patch set (HELLO compares it)
   hello_inputs.rollback = m_options.rollback;
   hello_inputs.max_rollback = m_options.max_rollback;
   hello_inputs.arm_calls = m_options.arm_calls;
@@ -858,7 +865,10 @@ void NetModule::Shutdown()
   if (m_sync != nullptr && m_started && m_session != nullptr)
   {
     m_sync->NetFlushLog();
+    m_sync->LearnedSummaryLine();  // the session may have left (final SUMMARY already written) before pages were learned
     m_log.Line(m_sync->NetStatsLine());
+    if (m_sync->Verifier() != nullptr)
+      m_log.Line(m_sync->VerifySummaryText());
   }
   if (m_transport != nullptr)
   {

@@ -422,7 +422,7 @@ Hello BuildHello(const HelloInputs& in, Role role, int delay)
   Hello h;
   h.role = role;
   h.game_id = in.game_id;
-  h.protocol = NET_PROTOCOL_VERSION;
+  h.protocol = in.hook_protocol;
   h.fields_version = FIELDS_VERSION;
   h.fields_digest = FieldsDigest();
   h.delay = static_cast<u32>(std::max(0, delay));

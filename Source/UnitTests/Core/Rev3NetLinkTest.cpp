@@ -768,6 +768,24 @@ TEST(Rev3NetLink, EachSettingThatCouldDivergeMakesTheHellosDisagree)
   EXPECT_FALSE(HelloMismatches(host, BuildHello(other_game, Role::Guest, 2)).empty());
 }
 
+TEST(Rev3NetLink, HelloCarriesTheHookProtocolAndAMismatchRefuses)
+{
+  HelloInputs v2 = SampleInputs();
+  v2.hook_protocol = 2;
+  HelloInputs v3 = SampleInputs();
+  v3.hook_protocol = 3;
+  const Hello host = BuildHello(v3, Role::Host, 2);
+  EXPECT_EQ(host.protocol, 3u);
+  EXPECT_EQ(BuildHello(v2, Role::Guest, 2).protocol, 2u);
+  EXPECT_TRUE(HelloMismatches(host, BuildHello(v3, Role::Guest, 2)).empty());
+  const std::vector<std::string> diffs = HelloMismatches(host, BuildHello(v2, Role::Guest, 2));
+  ASSERT_EQ(diffs.size(), 1u);
+  EXPECT_EQ(diffs[0], "protocol: own=3 peer=2");
+  Hello back;
+  ASSERT_TRUE(ParseHello(SerializeHello(host), &back));
+  EXPECT_EQ(back.protocol, 3u);
+}
+
 TEST(Rev3NetLink, HelloSurvivesTheWire)
 {
   const Hello h = BuildHello(SampleInputs(), Role::Guest, 3);

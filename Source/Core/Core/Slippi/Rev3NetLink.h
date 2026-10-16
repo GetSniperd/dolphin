@@ -197,6 +197,7 @@ struct HelloInputs
   bool cheats = false;
   bool bluetooth_passthrough = false;
   std::array<int, 5> wiimote_sources{};  // Wii Remote 1..4 and the balance board: 0 none, 1 emulated, 2 real
+  u32 hook_protocol = 2;    // the version byte of the hook's commands (2, or 3 = with the resimulation hiding patches); HELLO carries it, a mismatch refuses
   bool hook_crc_valid = false;
   u32 hook_crc = 0;         // CRC-32 of the hook code region 0x800024A0-0x8000291F once the game has booted
   bool rollback = false;    // REV3_NET_ROLLBACK

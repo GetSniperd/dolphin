@@ -148,6 +148,7 @@ public:
   void Clear() override;
   bool Relayout() override;
   bool RangeCrcs(s32 frame, bool live, std::vector<RangeCrc>* out) override;
+  std::string SummaryNote() override;
 
   // Adds the live fighters' fields to the trace without a snapshot (lockstep calls: a desync dump then has every frame).
   void RecordLive(s32 frame);
