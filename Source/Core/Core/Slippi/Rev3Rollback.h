@@ -368,7 +368,8 @@ public:
   // CPU thread, every 0xA0 command (any mode: plain play, SyncTest armed or not, netplay): the latest frame and the time; ends a stall.
   void Tick(u32 frame);
   // The netplay session is deliberately waiting for the peer (Rev3::Net wait loops): no command arrives, which is not a freeze.
-  void SetBlocked(bool blocked) { m_blocked.store(blocked); }
+  // Leaving the blocked state restarts the stall timer (the wait itself must not count as silence).
+  void SetBlocked(bool blocked);
   bool Blocked() const { return m_blocked.load(); }
   // Watchdog thread: true once per stall (no command for stall_ms since the last Tick and the session is not blocked in its wait);
   // Tick starts the next stall.

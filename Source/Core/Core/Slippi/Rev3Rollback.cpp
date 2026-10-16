@@ -2312,6 +2312,13 @@ void FreezeDump::Tick(u32 frame)
   m_reported.store(false);
 }
 
+void FreezeDump::SetBlocked(bool blocked)
+{
+  if (!blocked && m_blocked.load())
+    m_last_ms.store(m_now_ms());
+  m_blocked.store(blocked);
+}
+
 u64 FreezeDump::LastAgeMs() const
 {
   if (!m_seen.load())

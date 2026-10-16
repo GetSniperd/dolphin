@@ -3136,7 +3136,11 @@ TEST(Rev3Rollback, StallIsReportedOncePerStallInAnyModeButNotWhileTheSessionWait
   *ms.now += 60000;
   EXPECT_FALSE(dump.StallDue());
   dump.SetBlocked(false);
-  EXPECT_TRUE(dump.StallDue());  // the wait ended and the game still did not come back
+  EXPECT_FALSE(dump.StallDue());  // the wait itself is not silence: the timer restarts when it ends
+  *ms.now += 1999;
+  EXPECT_FALSE(dump.StallDue());
+  *ms.now += 1;
+  EXPECT_TRUE(dump.StallDue());  // ... and a game that still does not come back is a stall
 }
 
 TEST(Rev3Rollback, SyncTestDumpsAtArmAndLogsTheHardwareAroundTheFirstRestores)
