@@ -196,6 +196,45 @@ u32 FieldsDigest()
   return Common::ComputeCRC32(reinterpret_cast<const u8*>(text.data()), text.size());
 }
 
+FieldSet FieldsFromRaw(const std::array<std::array<u8, FIELD_BYTES>, 2>& raw, u8 present)
+{
+  FieldSet out;
+  out.present = static_cast<u8>(present & 3u);
+  for (size_t p = 0; p < 2; ++p)
+  {
+    if ((out.present & (1u << p)) == 0)
+      continue;
+    for (size_t i = 0; i < FIELD_COUNT; ++i)
+    {
+      const u8* b = raw[p].data() + 4 * i;
+      out.value[p][i] = (static_cast<u32>(b[0]) << 24) | (static_cast<u32>(b[1]) << 16) | (static_cast<u32>(b[2]) << 8) | b[3];
+    }
+  }
+  return out;
+}
+
+u32 ChecksumOfFields(s32 frame, const FieldSet& fields)
+{
+  std::vector<u8> stream;
+  stream.reserve(4 + 2 * (4 + FIELD_BYTES));
+  const auto append = [&stream](u32 v) {
+    stream.push_back(static_cast<u8>(v >> 24));
+    stream.push_back(static_cast<u8>(v >> 16));
+    stream.push_back(static_cast<u8>(v >> 8));
+    stream.push_back(static_cast<u8>(v));
+  };
+  append(static_cast<u32>(frame));
+  for (size_t p = 0; p < 2; ++p)
+  {
+    if ((fields.present & (1u << p)) == 0)
+      continue;
+    append(static_cast<u32>(p + 1));
+    for (u32 v : fields.value[p])
+      append(v);
+  }
+  return Common::ComputeCRC32(stream.data(), stream.size());
+}
+
 const char* ModeName(Mode mode)
 {
   switch (mode)
@@ -543,6 +582,10 @@ bool RollbackSession::BlockSatisfied()
   case Block::None:
     return true;
   case Block::Barrier:
+    // The connection may come up while the CPU thread waits here, and the wait only calls Step() again once this is true: our HELLO has
+    // to go out from here, or the two sides would wait for each other's HELLO until the barrier times out.
+    if (!m_hello_sent && m_mode == Mode::CONNECTING && m_net.State() == ConnState::Connected)
+      SendHello();
     return m_net.State() == ConnState::Connected && m_peer_hello_ok;
   case Block::Lockstep:
     return Confirmed() >= n;
@@ -558,8 +601,15 @@ bool RollbackSession::BlockSatisfied()
   return true;
 }
 
+void RollbackSession::Abort(const std::string& why)
+{
+  LeaveSession(why, true);
+}
+
 void RollbackSession::BlockTimedOut()
 {
+  if (m_mode == Mode::OFFLINE)
+    return;  // the wait was ended by Abort() (emulator stopping) or a LeaveSession inside it: nothing timed out
   switch (m_block)
   {
   case Block::Barrier:

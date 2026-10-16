@@ -233,3 +233,101 @@ no-fighter streams against numbers computed with the Python module. Change the t
 
 Tests: `Rev3Rollback.*` in `Source/UnitTests/Core/Rev3RollbackTest.cpp` (checksum, memory CRC, record / script / trace formats and parsing,
 the kit driven alongside SyncTest, and a record -> script round trip giving the same trace).
+
+## Netplay (M3): direct connect, lockstep, rollback behind a gate
+
+Milestone M3 of the netplay plan: two emulators talk to each other and nobody else. Set `REV3_NET_ROLE` on both machines and the 0xA0 hook
+answers come from a `Rev3::Net::RollbackSession` (`Rev3Session.{h,cpp}`, the pure state machine of M2) instead of the echo / SyncTest
+path. Files: `Slippi/Rev3NetLink.{h,cpp}` (pure: wire, options, HELLO, arm gate; unit tests in `Rev3NetLinkTest.cpp`),
+`Slippi/Rev3Net.{h,cpp}` (ENet transport, snapshot store on SyncTest's network mode, the per-command module),
+`Rev3Rollback.cpp` (HandleCommand branch, options glue), `EXI_DeviceSlippi.cpp` (skips Slippi's online stack).
+
+**Default is lockstep.** Without `REV3_NET_ROLLBACK=1` the game is held until the remote pad of the frame has arrived (with input delay
+D); no snapshots are taken, nothing is scanned, the only extra work is a fighter checksum read every 30th frame. Rollback code is
+present and unit/loopback tested, but the gate is off until you ask for it.
+
+### Variables (read once, at the first hook command)
+
+| variable | default | meaning |
+|---|---|---|
+| `REV3_NET_ROLE=host\|guest` | unset = no netplay | turns everything below on. The host is game port 0 (P1), the guest port 1 (P2). The local pad is always command port 0 on both machines; the reply carries both ports. Anything else is an `ERROR` on screen and in the Rev3 log and the game plays offline |
+| `REV3_NET_PEER=<ip>:<port>` | required | the other machine (IPv4 or host name, port 1..65535). Only this IP is accepted; a connection from anywhere else is refused (`NET refused a connection from ...`) |
+| `REV3_NET_PORT=n` | 2626 | UDP port this emulator listens on and sends from. Both sides connect to each other at the same moment from these fixed ports (hole punching style), so use one pair like host 2626 / guest 2627 and open or forward them; two connections result, both are used, duplicates are dropped by sequence number |
+| `REV3_NET_DELAY=n` | 2 | input delay D in frames, 0..15. The host's value wins (a difference is logged, not a mismatch) |
+| `REV3_NET_ROLLBACK=0\|1` | 0 | 1 lets the arm gate open (prediction, rollback). 0 = pure lockstep. Part of HELLO: both sides must agree |
+| `REV3_NET_ROLLBACK_MAX=n` | 5 | MAXR, the most frames ever predicted = deepest rollback, 1..7. Snapshot slots = MAXR + 2 |
+| `REV3_NET_ARM=n` | 600 | hook calls in a row with both fighters found before the gate may open (SyncTest's number, 10 s) |
+| `REV3_NET_QUIET=n` | 60 | hook calls in a row without a disc read in flight before the gate may open |
+| `REV3_NET_TIMEOUT_S=n` | 120 | connect + HELLO (the frame-0 barrier). D starts the two emulators by hand |
+| `REV3_NET_WAIT_MS=n` | 10000 | no remote pad this long in lockstep = the peer is gone, play on offline |
+| `REV3_NET_LOG=file` | `<User>\Logs\rev3_net_<role>.log` | the net log (below). The Rev3 log (`rev3_synctest.log`) only gets a pointer line |
+| `REV3_NET_STABLE=file` | none | `{"ranges":[...]}`: memory whose CRC both sides compare at arm time (START_CHECK); the file's CRC is part of HELLO so both must use the same file |
+| `REV3_PAD_SCRIPT` / `REV3_PAD_RECORD` / `REV3_TRACE` | | as in the determinism kit, with the netplay meaning below |
+| `REV3_SYNCTEST` | | ignored in a netplay run (noted in the net log) |
+
+With `REV3_NET_ROLE` set: no Slippi Rust extensions, user manager / login, matchmaking, spectator server, replay writing or game reports
+start (a packet capture shows only the peer); `EXI_DeviceSlippi` keeps its Melee-side objects but never calls into Rust and answers
+nothing except 0xA0. `REV3_PAD_SCRIPT` replaces the LOCAL pad (command port 0) before the session sees it, so a scripted guest plays
+a recorded game. `REV3_PAD_RECORD` records the pads the game actually got (the reply's two ports) once per frame: not for resimulated
+frames and not for the call a rollback answers, so a record of a rollback session replays as the same game. `REV3_TRACE` is plain play.
+
+### Wire
+
+Frame numbers on the wire are the hook's frame counter + 1 (Slippi's first frame is 1; one constant, `WIRE_FRAME_OFFSET`). The hook
+counter is the session clock; the first command must be frame 0 or the run leaves the session (`ERROR NET the first command is frame N`).
+
+| message | channel | content |
+|---|---|---|
+| PAD `0x80` | 1, unsequenced | `u8 id, s32 newest wire frame, u8 sender port, s32 checksum frame, u32 checksum`, then the unacked local pads, 8 bytes each, newest first (Slippi's `SendSlippiPad` layout, big endian) |
+| PAD_ACK `0x81` | 2, unsequenced | `u8 id, s32 acked wire frame, u8 sender port` |
+| HELLO `0x90`, START_CHECK `0x91`, DESYNC_DUMP `0x92`, BYE `0x93` | 0, reliable | `u8 id, u32 sequence, payload` (payloads: `Rev3Session.h`) |
+
+The receiver stores every pad of a packet by its own frame and acks R, the highest frame with all pads up to it present, so a lost packet
+never makes an ack lie; the first 64 or more remote pads are contiguous from frame 0. A sender re-sends its unacked pads after about
+one round trip (at least 15 ms) without an ack, from the same wait loop that blocks the game (Slippi only re-sends on the next queued
+pad). Every PAD packet carries the checksum of the latest final frame (every 30th frame).
+
+### HELLO (both machines must match, else the session is refused with an OSD line and a log entry, and the game plays offline)
+
+Game id (`RNEEDA`), hook protocol (2), fields version and digest (0xD4076EF2), fork build (`Common::GetScmRevGitStr`), CPU core, CPU thread
+(single / dual), SyncGPU, DSP engine (HLE / LLE / LLE thread), custom RTC (enabled + value), overclock, MMU, FastDiscSpeed, cheats,
+Bluetooth passthrough, Wii Remote sources 1..4 + balance board, the CRC-32 of the hook code region 0x800024A0-0x8000291F (read when the
+first command arrives; the data block 0x80002400-0x8000249F changes every frame and is not included), `REV3_NET_ROLLBACK`, the gate
+numbers, and the `REV3_NET_STABLE` file CRC. Two equal roles are a mismatch. The input delay is the host's.
+
+### The arm gate (only with `REV3_NET_ROLLBACK=1`)
+
+Opens after: both fighters found for `REV3_NET_ARM` normal calls in a row, no disc read in flight for `REV3_NET_QUIET` calls, nobody at
+health 0 (fighter + 0x28), the adaptive snapshot set learned, the session in lockstep. Then the snapshot set is installed and both
+machines exchange START_CHECK (the exact state at the same frame) before prediction starts. Once open it closes again when the fighters
+are lost, a fighter reaches health 0, or the snapshot set would change (a newly learned page, a new hardware region): the session
+drains to lockstep, `NetClear` installs the new set, and the gate may open again. The set never changes while snapshot slots are in
+use. A disc read in flight only postpones rollbacks.
+
+### The net log (`REV3_NET_LOG`)
+
+One file per run, appended, flushed per line, no timestamps, so rev3-mod `tools/rollback/phase4.py` reads it: lines start with
+`ROLLBACK`, `STALL`, `DESYNC`, `ERROR`, `CHK`, `GATE`, `SUMMARY` (and `NET`, `HELLO`, `SESSION`, `LEAVE`, `RESTORE`, `RESIM`, `NOTE`,
+`ARM`). `CHK frame=<N> value=0x<8 hex>` is the checksum of final frame N (every 30th); both machines log the same numbers in a clean game.
+On screen (OSD): `connected to <peer>`, HELLO mismatch (with the first differing item), desync, `the peer left`.
+
+Typical clean start: `NET start ...`, `HELLO sent`, `NET connected to ...`, `HELLO ok peer=...`, `SESSION lockstep from frame 0`, `CHK frame=0 ...`.
+`NET connect timeout ...` and `LEAVE ... reason=...` explain every exit; `SUMMARY` and `NET closing: rtt_us=..` are written at shutdown.
+
+### Verification so far
+
+- Unit tests (`Rev3NetLinkTest.cpp`, additions to `Rev3SessionTest.cpp` and `Rev3RollbackTest.cpp`): PAD / ACK layout and loss, reordering,
+  resend timing, reliable envelope and dedupe, option parsing, HELLO mismatches, the arm gate, SyncTest network mode (ring, restore,
+  deferred layout changes), checksum-from-fields equals `FighterChecksum`, record of the reply pads.
+- A Linux loopback run of the real `Rev3Net.cpp` over real UDP (ENet), two sessions in one process with a deterministic game: 600-3000
+  frames, lockstep and rollback (with random delay on one side, hundreds of rollbacks), identical final states, matching `CHK` lines,
+  no `DESYNC`/`ERROR`; a HELLO mismatch refuses cleanly. That run found and fixed a barrier deadlock in the session (the HELLO was only
+  sent from `Step`, not from the wait that blocks it).
+- Not yet run: two real Dolphin processes with Rev3 (D does that; see the report in the commit / PR).
+
+### Known gaps (M4)
+
+Matchmaking-free direct connect only (no NAT traversal beyond simultaneous open, no relay); `REV3_NETSIM` (loss / delay injection) is
+read and ignored; no spectators, no replay file; rollback depth is capped at 7; the first command must be frame 0 (a game already in
+progress cannot join); a window closed while the peer waits ends the peer's wait through the BYE (or the wait timeout), not instantly if
+the machine crashes.

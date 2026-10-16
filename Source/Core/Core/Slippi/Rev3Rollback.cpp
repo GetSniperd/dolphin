@@ -28,20 +28,27 @@
 #include "Common/FileUtil.h"
 #include "Common/Hash.h"
 #include "Common/Logging/Log.h"
+#include "Common/Version.h"
+#include "Core/Config/MainSettings.h"
+#include "Core/Config/WiimoteSettings.h"
+#include "Core/ConfigManager.h"
 #include "Core/Core.h"
 #include "Core/CoreTiming.h"
 #include "Core/DSPEmulator.h"
 #include "Core/HW/AudioInterface.h"
+#include "Core/HW/CPU.h"
 #include "Core/HW/DSP.h"
 #include "Core/HW/MMIO.h"
 #include "Core/HW/Memmap.h"
 #include "Core/HW/ProcessorInterface.h"
 #include "Core/HW/SystemTimers.h"
 #include "Core/HW/VideoInterface.h"
+#include "Core/HW/Wiimote.h"
 #include "Core/IOS/DI/DI.h"
 #include "Core/IOS/IOS.h"
 #include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/PowerPC.h"
+#include "Core/Slippi/Rev3Net.h"
 #include "Core/System.h"
 #include "VideoCommon/CommandProcessor.h"
 #include "VideoCommon/OnScreenDisplay.h"
@@ -741,10 +748,10 @@ void SyncTest::ResolvePtrExclusions(std::vector<Exclusion>* out)
   }
 }
 
-void SyncTest::RefreshExclusions(bool at_arm)
+bool SyncTest::CollectExclusions()
 {
   if (m_hardware == nullptr && m_ptr_exclusions.empty())
-    return;
+    return false;
   std::vector<Exclusion> found;
   if (m_hardware != nullptr)
     m_hardware->Query(&found);
@@ -772,7 +779,12 @@ void SyncTest::RefreshExclusions(bool at_arm)
         m_sink.Line("NOTE further exclusions are not logged");
     }
   }
-  if (!layout_changed)
+  return layout_changed;
+}
+
+void SyncTest::RefreshExclusions(bool at_arm)
+{
+  if (!CollectExclusions())
     return;
   m_ranges = ComputeRanges();  // the new cuts are part of m_exclusions_logged now
   RebuildLayout();
@@ -1432,6 +1444,28 @@ bool SyncTest::Arm(const Command& command, const std::array<u32, 2>& fighters)
   return true;
 }
 
+// One page-tracker slice per normal hook call (SyncTest::OnCommand and NetObserve): timed for the HB / SUMMARY lines; logs once when the
+// LEARN scan cycles are done. Returns the pages that just became dynamic.
+u32 SyncTest::ScanSlice(u32 frame)
+{
+  const u64 t0 = m_micros();
+  const u32 added = m_tracker.Scan();
+  const u64 us = m_micros() - t0;
+  ++m_stats.scans;
+  m_stats.scan_us_total += us;
+  m_stats.scan_us_max = std::max(m_stats.scan_us_max, us);
+  m_scan_iv_total += us;
+  m_scan_iv_max = std::max(m_scan_iv_max, us);
+  ++m_scan_iv_n;
+  if (!m_learn_done && m_tracker.Cycles() >= m_options.learn_cycles)
+  {
+    m_learn_done = true;
+    m_sink.Line(Format("NOTE learning complete: %u scan cycles (slices=%u) dynamic_pages=%zu (%zu bytes) at frame %u", m_tracker.Cycles(),
+                       m_tracker.Slices(), m_tracker.DynamicPages(), m_tracker.DynamicPages() * PAGE_SIZE, frame));
+  }
+  return added;
+}
+
 Reply SyncTest::OnCommand(const Command& command)
 {
   std::array<u32, 2> fighters{};
@@ -1484,21 +1518,7 @@ Reply SyncTest::OnCommand(const Command& command)
   // run's frames are the reference). Starts as soon as both fighters are found, long before arming.
   if (m_options.adaptive && !m_resim)
   {
-    const u64 t0 = m_micros();
-    const u32 added = m_tracker.Scan();
-    const u64 us = m_micros() - t0;
-    ++m_stats.scans;
-    m_stats.scan_us_total += us;
-    m_stats.scan_us_max = std::max(m_stats.scan_us_max, us);
-    m_scan_iv_total += us;
-    m_scan_iv_max = std::max(m_scan_iv_max, us);
-    ++m_scan_iv_n;
-    if (!m_learn_done && m_tracker.Cycles() >= m_options.learn_cycles)
-    {
-      m_learn_done = true;
-      m_sink.Line(Format("NOTE learning complete: %u scan cycles (slices=%u) dynamic_pages=%zu (%zu bytes) at frame %u", m_tracker.Cycles(),
-                         m_tracker.Slices(), m_tracker.DynamicPages(), m_tracker.DynamicPages() * PAGE_SIZE, command.frame));
-    }
+    const u32 added = ScanSlice(command.frame);
     if (added != 0 && m_armed)
       LearnWhileArmed(added);
   }
@@ -1582,6 +1602,161 @@ Reply SyncTest::OnCommand(const Command& command)
   return Normal(command, fighters);
 }
 
+// ---- network mode (milestone M3) -----------------------------------------------------------------------------------------
+// The snapshot machinery of SyncTest for Rev3::Net::RollbackSession (see the NetObserve block in Rev3Rollback.h). Capture / Restore /
+// RestoreAudio / the hardware cuts are the functions above, unchanged; what is new is only when the set (m_ranges) may change: never
+// while slots are in use.
+
+void SyncTest::NetObserve(const Command& command, bool resimulating)
+{
+  m_net_cmd = command;
+  m_last_sp = command.sp;
+  m_last_frame = command.frame;
+  std::array<u32, 2> fighters{};
+  m_net_found = FindFighters(&fighters);
+  if (!m_net_found)
+  {
+    // Loading or a menu: a new match starts from scratch (loading rewrites most of memory), like SyncTest::OnCommand.
+    m_streak = 0;
+    m_set_sp = 0;
+    if (m_options.adaptive)
+    {
+      m_tracker.Reset();
+      m_learn_done = false;
+    }
+    return;
+  }
+  m_fighters = fighters;
+  if (m_streak < 0xFFFFFFFFu)
+    ++m_streak;
+  if (resimulating)
+    return;  // replayed frames are never scanned (the first run's frames are the reference)
+
+  if (m_options.adaptive)
+  {
+    const u32 added = ScanSlice(command.frame);
+    if (added != 0 && m_net_active)
+    {
+      m_stats.pages_learned_armed += added;
+      if (!m_net_pending && !SameRanges(ComputeRanges(), m_ranges))
+      {
+        m_net_pending = true;
+        m_sink.Line(Format("NOTE learned +%u pages while slots are in use (frame %u): the snapshot set grows at the next arm", added,
+                           command.frame));
+      }
+    }
+  }
+  // Same pace as SyncTest (every hardware_check_every calls while armed); a cut that takes something from the set is noted, installed later.
+  if (m_net_active && ++m_net_calls % m_options.hardware_check_every == 0 && !m_net_pending && CollectExclusions())
+  {
+    m_net_pending = true;
+    m_sink.Line(Format("NOTE hardware cut changes the snapshot set (frame %u): installed at the next arm", command.frame));
+  }
+}
+
+bool SyncTest::NetPrepareArm()
+{
+  if (!m_net_found)
+    return false;
+  m_set_sp = RegionEnd(m_net_cmd.sp) != 0 ? m_net_cmd.sp : 0;
+  CollectExclusions();  // new cuts join m_exclusions_logged; the set is rebuilt with all of them right below
+  m_ranges = ComputeRanges();
+  RebuildLayout();
+  ClearHistory();
+  m_net_pending = false;
+  m_net_active = false;
+  m_net_calls = 0;
+
+  size_t worst = FIELD_COUNT;
+  for (size_t p = 0; p < 2; ++p)
+  {
+    size_t inside = 0;
+    for (const FieldDef& f : FIELDS)
+      inside += !RangeContaining(m_fighters[p] + f.offset).empty();
+    worst = std::min(worst, inside);
+  }
+  m_sink.Line(Format("NOTE net snapshot set: ranges=%zu bytes=%zu snapshot_bytes=%zu slots=%zu dynamic_pages=%zu scan_cycles=%u", m_ranges.size(),
+                     m_ranges_bytes, m_snapshot_bytes, m_ring.size(), m_tracker.DynamicPages(), m_tracker.Cycles()));
+  m_sink.Line(Format("NOTE fighters p1=0x%08X p2=0x%08X", m_fighters[0], m_fighters[1]));
+  LogFieldCoverage(m_fighters, nullptr);
+  if (worst != FIELD_COUNT)
+  {
+    Error(Format("frame %u: not all fighter fields are inside the snapshot set (an exclusion cuts a fighter struct); not arming",
+                 m_net_cmd.frame));
+    return false;
+  }
+  if (m_dsp_state)
+    m_sink.Line("NOTE dsp at arm: " + m_dsp_state());
+  return true;
+}
+
+void SyncTest::NetClear()
+{
+  std::vector<Range> due = ComputeRanges();
+  if (!SameRanges(due, m_ranges))
+  {
+    m_ranges = std::move(due);
+    RebuildLayout();
+    m_sink.Line(Format("NOTE net snapshot set now ranges=%zu bytes=%zu snapshot_bytes=%zu slots=%zu", m_ranges.size(), m_ranges_bytes,
+                       m_snapshot_bytes, m_ring.size()));
+  }
+  ClearHistory();
+  m_net_pending = false;
+  m_net_active = false;
+  m_net_calls = 0;
+}
+
+bool SyncTest::NetCapture(u32 frame, u32 sp, NetSnapshotInfo* info)
+{
+  if (!m_net_found)
+  {
+    Error(Format("frame %u: capture without both fighters", frame));
+    return false;
+  }
+  Command command = m_net_cmd;
+  command.frame = frame;
+  command.sp = sp;
+  Slot& slot = SlotFor(frame);
+  if (!Capture(slot, command, m_fighters))
+  {
+    slot.valid = false;
+    return false;
+  }
+  m_net_active = true;
+  info->fields = slot.fields;
+  return true;
+}
+
+bool SyncTest::NetHas(u32 frame) const
+{
+  const Slot& s = m_ring[frame % m_ring.size()];
+  return s.valid && s.frame == frame;
+}
+
+u32 SyncTest::NetSlotSp(u32 frame) const
+{
+  return NetHas(frame) ? m_ring[frame % m_ring.size()].sp : 0;
+}
+
+bool SyncTest::NetRestore(u32 frame)
+{
+  return Restore(SlotFor(frame), m_net_cmd, frame);
+}
+
+std::string SyncTest::NetStatsLine() const
+{
+  const auto mean = [](u64 total, u64 n) { return n != 0 ? static_cast<double>(total) / static_cast<double>(n) : 0.0; };
+  return Format("NOTE snapshot stats restores=%u restore_us_mean=%.1f restore_us_max=%llu icache_us_mean=%.1f icache_us_max=%llu "
+                "audio_restores=%u audio_us_mean=%.1f audio_us_max=%llu io_postponed=%u pages_learned_while_in_use=%u sp_mismatches=%u "
+                "scans=%llu scan_us_mean=%.1f scan_us_max=%llu",
+                m_stats.restores, mean(m_stats.restore_us_total, m_stats.restores), static_cast<unsigned long long>(m_stats.restore_us_max),
+                mean(m_stats.icache_us_total, m_stats.restores), static_cast<unsigned long long>(m_stats.icache_us_max),
+                m_stats.audio_restores, mean(m_stats.audio_us_total, m_stats.audio_restores),
+                static_cast<unsigned long long>(m_stats.audio_us_max), m_stats.io_postponed, m_stats.pages_learned_armed,
+                m_stats.sp_mismatches, static_cast<unsigned long long>(m_stats.scans), mean(m_stats.scan_us_total, m_stats.scans),
+                static_cast<unsigned long long>(m_stats.scan_us_max));
+}
+
 // ---- (4b) determinism kit (milestone M1) -------------------------------------------------------------------------------------
 
 size_t FindFighterStructs(const GuestMemory& memory, std::array<u32, 2>* addrs)
@@ -1639,6 +1814,26 @@ size_t FighterChecksum(const GuestMemory& memory, u32 frame, u32* checksum)
     ++found;
   }
   *checksum = Common::ComputeCRC32(stream.data(), stream.size());
+  return found;
+}
+
+size_t ReadFighterFields(const GuestMemory& memory, std::array<std::array<u8, FIELD_BYTES>, 2>* raw, u8* present)
+{
+  std::array<u32, 2> fighters{};
+  FindFighterStructs(memory, &fighters);
+  std::vector<u8> span(FIELD_SPAN_HI - FIELD_SPAN_LO);
+  size_t found = 0;
+  *present = 0;
+  for (size_t p = 0; p < 2; ++p)
+  {
+    (*raw)[p].fill(0);
+    if (fighters[p] == 0 || !memory.Read(fighters[p] + FIELD_SPAN_LO, span.data(), span.size()))
+      continue;
+    for (size_t f = 0; f < FIELD_COUNT; ++f)
+      std::copy_n(span.data() + (FIELDS[f].offset - FIELD_SPAN_LO), 4, (*raw)[p].data() + 4 * f);
+    *present = static_cast<u8>(*present | (1u << p));
+    ++found;
+  }
   return found;
 }
 
@@ -1858,7 +2053,7 @@ void DeterminismKit::OnCommand(Command* command, bool resimulating)
     }
   }
 
-  if (m_record != nullptr)
+  if (m_record != nullptr && !m_options.record_reply)
   {
     m_record->Line(FormatPadRecordLine(frame, command->pads, command->pad_return));
     ++m_record_lines;
@@ -1886,6 +2081,19 @@ void DeterminismKit::OnCommand(Command* command, bool resimulating)
     m_trace->Line(FormatTraceLine(frame, both ? 2 : 0, both ? checksum : 0, mem));
     m_trace->Flush();
     ++m_trace_lines;
+  }
+}
+
+void DeterminismKit::OnReply(const Command& command, const Reply& reply, bool resimulating)
+{
+  if (m_record == nullptr || !m_options.record_reply || resimulating || (reply.flags & REPLY_FLAG_RESTORED) != 0)
+    return;
+  m_record->Line(FormatPadRecordLine(command.frame, reply.pads, command.pad_return));
+  ++m_record_lines;
+  if (++m_record_pending >= PAD_RECORD_FLUSH_EVERY)
+  {
+    m_record->Flush();
+    m_record_pending = 0;
   }
 }
 
@@ -2251,14 +2459,15 @@ std::string DescribeDsp(Core::System& system)
 class FileSink final : public Sink
 {
 public:
-  explicit FileSink(const std::string& path)
+  // `title` names the log in its first line ("=== <title> log opened <time> UTC ===", which starts with '=' so line counters skip it).
+  explicit FileSink(const std::string& path, const char* title = "Rev3 SyncTest")
   {
     File::CreateFullPath(path);
     File::OpenFStream(m_file, path, std::ios_base::out | std::ios_base::app);
     const std::time_t now = std::time(nullptr);
     char stamp[64] = {};
     std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", std::gmtime(&now));
-    Line(Format("=== Rev3 SyncTest log opened %s UTC ===", stamp));
+    Line(Format("=== %s log opened %s UTC ===", title, stamp));
   }
 
   void Line(const std::string& text) override
@@ -2269,6 +2478,7 @@ public:
   }
 
   void Osd(const std::string& text) override { OSD::AddMessage(text, OSD::Duration::VERY_LONG, OSD::Color::RED); }
+  void OsdInfo(const std::string& text) override { OSD::AddMessage(text, OSD::Duration::NORMAL, OSD::Color::GREEN); }
 
 private:
   std::ofstream m_file;
@@ -2311,6 +2521,8 @@ struct Module
   std::unique_ptr<FileLineWriter> pad_record;
   std::unique_ptr<FileLineWriter> trace;
   std::unique_ptr<DeterminismKit> kit;  // null = none of REV3_PAD_RECORD / REV3_PAD_SCRIPT / REV3_TRACE is usable
+  std::unique_ptr<FileSink> net_sink;    // the net log (REV3_NET_LOG), netplay runs only
+  std::unique_ptr<Net::NetModule> net;   // null = not a netplay run (or netplay unusable: the game then runs offline)
 };
 
 Module& GetModule()
@@ -2385,6 +2597,7 @@ void InitializeKit(Module& module)
   };
 
   DeterminismOptions options;
+  options.record_reply = NetplayRequested();  // netplay: the record holds what the game got (the reply), local and remote
   if (!script_path.empty())
   {
     std::string text;
@@ -2449,27 +2662,10 @@ void InitializeKit(Module& module)
   module.kit = std::make_unique<DeterminismKit>(std::move(options), *module.memory, sink, module.pad_record.get(), module.trace.get());
 }
 
-void Initialize(Module& module, Core::System& system)
+// Builds module.synctest from the REV3_SYNCTEST_* variables (K frames; in netplay K = MAXR + 1 so the ring has MAXR + 2 slots) and the
+// REV3_WHITELIST seed. False (logged): not usable; module.synctest stays null.
+bool BuildSyncTest(Module& module, Core::System& system, long k, bool net)
 {
-  module.initialized = true;
-
-  // The determinism kit (pad record / script, trace) is independent of SyncTest and works with it off.
-  module.memory = std::make_unique<DolphinMemory>(system);
-  InitializeKit(module);
-
-  const std::string k_text = GetEnv("REV3_SYNCTEST");
-  if (k_text.empty())
-    return;
-  long k = 0;
-  if (!ParseInt(k_text, &k) || k < 0 || k > 8)
-  {
-    ERROR_LOG_FMT(SLIPPI, "Rev3 SyncTest: REV3_SYNCTEST={} is not 0..8; SyncTest is off", k_text);
-    OSD::AddMessage("Rev3 SyncTest: REV3_SYNCTEST must be 1..8; SyncTest is off", OSD::Duration::VERY_LONG, OSD::Color::RED);
-    return;
-  }
-  if (k == 0)
-    return;
-
   SyncTestOptions options;
   options.k = static_cast<int>(k);
   long value = 0;
@@ -2559,7 +2755,7 @@ void Initialize(Module& module, Core::System& system)
     module.sink->Line("ERROR " + message);
     ERROR_LOG_FMT(SLIPPI, "{}", message);
     module.sink->Osd(message);
-    return;
+    return false;
   }
 
   std::vector<Range> user_exclusions;
@@ -2579,7 +2775,7 @@ void Initialize(Module& module, Core::System& system)
       module.sink->Line("ERROR " + message);
       ERROR_LOG_FMT(SLIPPI, "{}", message);
       module.sink->Osd(message);
-      return;
+      return false;
     }
   }
 
@@ -2609,7 +2805,145 @@ void Initialize(Module& module, Core::System& system)
   }
   Core::System* const sys = &system;
   module.synctest->SetDspState([sys]() { return DescribeDsp(*sys); });
-  module.sink->Osd(Format("Rev3 SyncTest on: K=%d, every %d frame(s), log %s", options.k, options.every, log_path.c_str()));
+  if (!net)
+    module.sink->Osd(Format("Rev3 SyncTest on: K=%d, every %d frame(s), log %s", options.k, options.every, log_path.c_str()));
+  return true;
+}
+
+// Collects what HELLO compares from Dolphin's configuration (Rev3NetLink.h HelloInputs). Read on the CPU thread at the first command.
+Net::HelloInputs CollectHelloInputs(u32 stable_crc)
+{
+  Net::HelloInputs in;
+  in.build = Common::GetScmRevGitStr();
+  in.game_id = SConfig::GetInstance().GetGameID();
+  switch (Config::Get(Config::MAIN_CPU_CORE))
+  {
+  case PowerPC::CPUCore::Interpreter:
+    in.cpu_core = "Interpreter";
+    break;
+  case PowerPC::CPUCore::JIT64:
+    in.cpu_core = "JIT64";
+    break;
+  case PowerPC::CPUCore::JITARM64:
+    in.cpu_core = "JITARM64";
+    break;
+  case PowerPC::CPUCore::CachedInterpreter:
+    in.cpu_core = "CachedInterpreter";
+    break;
+  default:
+    in.cpu_core = Format("core%d", static_cast<int>(Config::Get(Config::MAIN_CPU_CORE)));
+    break;
+  }
+  in.cpu_thread = Config::Get(Config::MAIN_CPU_THREAD);
+  in.sync_gpu = Config::Get(Config::MAIN_SYNC_GPU);
+  in.dsp_hle = Config::Get(Config::MAIN_DSP_HLE);
+  in.dsp_thread = Config::Get(Config::MAIN_DSP_THREAD);
+  in.rtc_enabled = Config::Get(Config::MAIN_CUSTOM_RTC_ENABLE);
+  in.rtc_value = Config::Get(Config::MAIN_CUSTOM_RTC_VALUE);
+  in.overclock_enabled = Config::Get(Config::MAIN_OVERCLOCK_ENABLE);
+  in.overclock = Config::Get(Config::MAIN_OVERCLOCK);
+  in.mmu = Config::Get(Config::MAIN_MMU);
+  in.fast_disc_speed = Config::Get(Config::MAIN_FAST_DISC_SPEED);
+  in.cheats = Config::Get(Config::MAIN_ENABLE_CHEATS);
+  in.bluetooth_passthrough = Config::Get(Config::MAIN_BLUETOOTH_PASSTHROUGH_ENABLED);
+  for (int i = 0; i < 4; ++i)
+    in.wiimote_sources[static_cast<size_t>(i)] = static_cast<int>(Config::Get(Config::GetInfoForWiimoteSource(i)));
+  in.wiimote_sources[4] = static_cast<int>(Config::Get(Config::WIIMOTE_BB_SOURCE));
+  in.stable_crc = stable_crc;
+  return in;
+}
+
+// REV3_NET_ROLE is set: a netplay run (REV3.md "Netplay (M3)"). SyncTest is off in this mode; the snapshot machinery (SyncTest's network
+// mode) is only built when REV3_NET_ROLLBACK=1. Everything that goes wrong is logged to the Rev3 log and the net log and the game then
+// runs offline (the reply echoes the pads).
+void InitializeNet(Module& module, Core::System& system)
+{
+  FileSink& rev3_log = EnsureSink(module);
+  const Net::NetOptions options = Net::ParseNetOptions([](const char* name) { return GetEnv(name); });
+  if (!options.ok)
+  {
+    const std::string message = "Rev3 netplay: " + options.error + "; playing offline";
+    rev3_log.Line("ERROR " + message);
+    ERROR_LOG_FMT(SLIPPI, "{}", message);
+    rev3_log.Osd(message);
+    return;
+  }
+  const std::string net_path = options.log_path.empty() ? File::GetUserPath(D_LOGS_IDX) + "rev3_net_" + Net::RoleText(options.role) + ".log" :
+                                                          options.log_path;
+  module.net_sink = std::make_unique<FileSink>(net_path, "Rev3 netplay");
+  FileSink& log = *module.net_sink;
+  rev3_log.Line("NOTE netplay: net log " + net_path);
+  for (const std::string& warning : options.warnings)
+  {
+    log.Line("NOTE " + warning);
+    rev3_log.Line("NOTE " + warning);
+  }
+  if (!GetEnv("REV3_SYNCTEST").empty() && GetEnv("REV3_SYNCTEST") != "0")
+    log.Line("NOTE REV3_SYNCTEST is ignored in a netplay run (REV3_NET_ROLE is set)");
+  if (!options.netsim.empty())
+    log.Line("NOTE REV3_NETSIM=" + options.netsim + " is not implemented before M4; ignored");
+
+  // The ranges START_CHECK compares (optional); their file's CRC goes into HELLO so both sides use the same file.
+  std::vector<Range> stable_ranges;
+  u32 stable_crc = 0;
+  if (!options.stable_path.empty())
+  {
+    std::string text;
+    std::string error;
+    if (!ReadTextFile(options.stable_path, &text))
+      error = "cannot read " + options.stable_path;
+    else if (ParseWhitelist(text, &stable_ranges, &error))
+      stable_crc = Common::ComputeCRC32(text);
+    if (!error.empty())
+    {
+      log.Line("ERROR REV3_NET_STABLE: " + error + "; no stable-range check");
+      stable_ranges.clear();
+    }
+  }
+
+  if (options.rollback && !BuildSyncTest(module, system, options.max_rollback + 1, true))
+  {
+    log.Line("ERROR the snapshot machinery could not be built (see the Rev3 log); REV3_NET_ROLLBACK is treated as 0 (lockstep only)");
+    module.synctest.reset();
+  }
+
+  Net::NetEnvironment env;
+  Core::System* const sys = &system;
+  env.stopping = [sys]() {
+    return Core::GetState(*sys) == Core::State::Stopping || sys->GetCPU().GetState() == CPU::State::PowerDown;
+  };
+  env.hello = CollectHelloInputs(stable_crc);
+  module.net = std::make_unique<Net::NetModule>(options, env, *module.memory, module.hardware.get(), module.synctest.get(),
+                                                std::move(stable_ranges), log);
+}
+
+void Initialize(Module& module, Core::System& system)
+{
+  module.initialized = true;
+
+  // The determinism kit (pad record / script, trace) is independent of SyncTest and works with it off.
+  module.memory = std::make_unique<DolphinMemory>(system);
+  InitializeKit(module);
+
+  if (NetplayRequested())
+  {
+    InitializeNet(module, system);
+    return;
+  }
+
+  const std::string k_text = GetEnv("REV3_SYNCTEST");
+  if (k_text.empty())
+    return;
+  long k = 0;
+  if (!ParseInt(k_text, &k) || k < 0 || k > 8)
+  {
+    ERROR_LOG_FMT(SLIPPI, "Rev3 SyncTest: REV3_SYNCTEST={} is not 0..8; SyncTest is off", k_text);
+    OSD::AddMessage("Rev3 SyncTest: REV3_SYNCTEST must be 1..8; SyncTest is off", OSD::Duration::VERY_LONG, OSD::Color::RED);
+    return;
+  }
+  if (k == 0)
+    return;
+  BuildSyncTest(module, system, k, false);
 }
 }  // namespace
 
@@ -2629,10 +2963,26 @@ void HandleCommand(Core::System& system, const u8* command, size_t size, std::ve
     return;
   }
 
+  // Netplay (REV3_NET_ROLE set): the session answers every command. The kit still goes first and substitutes the LOCAL pad (command port 0)
+  // before the session sees it (REV3_PAD_SCRIPT on the guest window); the record then takes what the game got from the reply.
+  if (module.net != nullptr && Core::IsCPUThread())
+  {
+    const bool resimulating = module.net->Resimulating();
+    if (module.kit != nullptr)
+      module.kit->OnCommand(&parsed, resimulating);
+    reply = module.net->OnCommand(parsed);
+    if (module.kit != nullptr)
+      module.kit->OnReply(parsed, reply, resimulating);
+    read_queue->assign(REPLY_SIZE, 0);
+    EncodeReply(reply, read_queue->data());
+    return;
+  }
+
   // The determinism kit sees every hook call first: it may replace the pads (REV3_PAD_SCRIPT), then SyncTest (if on) works with
   // those pads, and the reply carries them.
+  const bool resimulating = module.synctest != nullptr && module.synctest->Resimulating();
   if (module.kit != nullptr && Core::IsCPUThread())
-    module.kit->OnCommand(&parsed, module.synctest != nullptr && module.synctest->Resimulating());
+    module.kit->OnCommand(&parsed, resimulating);
 
   if (module.synctest != nullptr && Core::IsCPUThread())
     reply = module.synctest->OnCommand(parsed);
@@ -2642,14 +2992,28 @@ void HandleCommand(Core::System& system, const u8* command, size_t size, std::ve
     reply.frame = parsed.frame;
     reply.pads = parsed.pads;
   }
+  if (module.kit != nullptr && Core::IsCPUThread())
+    module.kit->OnReply(parsed, reply, resimulating);  // only acts in a netplay run that fell back to offline (record_reply)
 
   read_queue->assign(REPLY_SIZE, 0);
   EncodeReply(reply, read_queue->data());
 }
 
+bool NetplayRequested()
+{
+  const char* role = std::getenv("REV3_NET_ROLE");
+  return role != nullptr && role[0] != '\0';
+}
+
 void Shutdown()
 {
   Module& module = GetModule();
+  if (module.net != nullptr)
+  {
+    module.net->Shutdown();  // BYE to the peer, SUMMARY, stats, network thread joined
+    module.net.reset();
+  }
+  module.net_sink.reset();
   if (module.kit != nullptr)
     module.kit->Finish();
   module.kit.reset();  // before the memory it reads

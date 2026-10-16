@@ -269,7 +269,8 @@ class Sink
 public:
   virtual ~Sink() = default;
   virtual void Line(const std::string& text) = 0;  // one log line (no newline); the real sink appends and flushes
-  virtual void Osd(const std::string& text) = 0;   // an on-screen message
+  virtual void Osd(const std::string& text) = 0;   // an on-screen message (a problem: the real sink draws it red)
+  virtual void OsdInfo(const std::string& text) { Osd(text); }  // an on-screen message that is good news (green in the real sink)
 };
 
 // ---- SyncTest -------------------------------------------------------------------------------------------------------------
@@ -387,6 +388,38 @@ public:
   size_t DynamicPages() const { return m_tracker.DynamicPages(); }
   u32 LearnCycles() const { return m_tracker.Cycles(); }
 
+  // ---- network mode (milestone M3) -------------------------------------------------------------------------------------------
+  // Rev3::Net::RollbackSession (Rev3Session.h) drives the snapshots in a netplay session; it needs the very same capture / restore /
+  // adaptive set / hardware cuts / audio rewind as SyncTest, so this class offers them without SyncTest's own state machine
+  // (OnCommand is NOT called in this mode; options.k = MAXR + 1 gives MAXR + 2 slots, slot of frame n = ring[n % slots]).
+  // Per hook call, in this order: NetObserve(), then (session decides) NetCapture / NetRestore / NetClear. All on the CPU thread.
+  //   - The set (m_ranges) only changes in NetPrepareArm() and NetClear(), i.e. while no slot is in use: slots of an armed stretch all
+  //     share one layout. Pages learned and hardware regions found while a stretch is running are only noted (NetLayoutPending()); the
+  //     caller closes the gate, the session drains, and its Clear() installs the new set.
+  struct NetSnapshotInfo
+  {
+    std::array<std::array<u8, FIELD_BYTES>, 2> fields{};  // raw big-endian field bytes (FIELDS order) of both fighters at the capture
+  };
+  // First thing of a hook call: remembers the command (restores use its sp), finds the fighters, runs one page-tracker slice (not on a
+  // resimulated call), and notes whether the set would change (learned pages, new hardware regions every hardware_check_every calls
+  // while slots are in use).
+  void NetObserve(const Command& command, bool resimulating);
+  bool NetFightersFound() const { return m_net_found; }
+  const std::array<u32, 2>& NetFighters() const { return m_fighters; }
+  bool NetLayoutPending() const { return m_net_pending; }
+  // The arm gate is about to open (session in lockstep, no slot in use): re-checks the hardware cuts, installs the current set (stack
+  // window of this call's sp included) and verifies that all 61 fields of both fighters are inside it. False (logged): do not arm.
+  bool NetPrepareArm();
+  // Forgets every slot and installs the set that is due (pending changes). Called by the session whenever the armed stretch ends / begins.
+  void NetClear();
+  bool NetCapture(u32 frame, u32 sp, NetSnapshotInfo* info);
+  bool NetHas(u32 frame) const;
+  u32 NetSlotSp(u32 frame) const;
+  bool NetRestore(u32 frame);
+  size_t NetSlotCount() const { return m_ring.size(); }
+  // "NOTE snapshot stats ..." (restores, restore / icache / audio times, postponed reads); written at shutdown.
+  std::string NetStatsLine() const;
+
 private:
   struct Slot
   {
@@ -424,6 +457,11 @@ private:
   Reply Noop(const Command& command);
   bool DiscReadPostpones(u32 frame);
   void RebuildLayout();
+  // One page-tracker slice (timed, with the "learning complete" note); returns the pages that just became dynamic.
+  u32 ScanSlice(u32 frame);
+  // Queries the hardware / pointer exclusions and records the new ones (with their NOTE lines) in m_exclusions_logged; true when a new
+  // cut takes something away from the current set. Does not touch m_ranges.
+  bool CollectExclusions();
   void RefreshExclusions(bool at_arm = false);
   void ResolvePtrExclusions(std::vector<Exclusion>* out);
   void ClearHistory();
@@ -491,6 +529,13 @@ private:
   std::array<u32, 2> m_fighters{};            // the fighter addresses of the latest command (valid while both were found)
   std::vector<std::string> m_fields_annotated;  // field names already logged with their address / snapshot range
 
+  // network mode
+  Command m_net_cmd;               // the command of the latest NetObserve
+  bool m_net_found = false;        // both fighters were found by it
+  bool m_net_pending = false;      // the set would change (learned pages / new hardware cuts) but slots are in use
+  bool m_net_active = false;       // slots have been captured since the latest NetClear
+  u32 m_net_calls = 0;             // NetObserve calls with slots in use (paces the hardware re-check)
+
   u32 m_streak = 0;          // consecutive commands with both fighters found
   bool m_armed = false;
   bool m_have_history = false;
@@ -521,6 +566,10 @@ size_t FindFighterStructs(const GuestMemory& memory, std::array<u32, 2>* addrs);
 // 1 and 2 (a player not found is skipped) u32 BE player id and the FIELD_COUNT fields' raw big-endian bytes in FIELDS order.
 // Returns how many fighters went into it (0..2); with 0 the checksum is that of the frame alone.
 size_t FighterChecksum(const GuestMemory& memory, u32 frame, u32* checksum);
+
+// The raw big-endian bytes of the FIELDS of both fighters (FIELD_BYTES each, FIELDS order), as FighterChecksum reads them; a fighter that
+// is not found leaves its array zero. *present gets bit 0 = player 1 found, bit 1 = player 2. Returns how many were found.
+size_t ReadFighterFields(const GuestMemory& memory, std::array<std::array<u8, FIELD_BYTES>, 2>* raw, u8* present);
 
 // CRC-32 (zlib, init 0) over the bytes of all `ranges` in the given order. A range that cannot be read is skipped and counted in
 // *unreadable (optional).
@@ -569,6 +618,7 @@ struct DeterminismOptions
   std::string ranges_path;        // REV3_TRACE_RANGES ("" = none: mem is 0)
   std::vector<Range> ranges;      // the parsed trace ranges
   bool record_header = true;      // write PAD_RECORD_HEADER first (false when the record file already has content)
+  bool record_reply = false;      // netplay: record the pads the game actually got (the reply's ports, via OnReply) instead of the command's
 };
 
 // Called for every hook call before SyncTest sees it. Substitutes the scripted pads, records the pads, writes the trace line.
@@ -582,6 +632,10 @@ public:
   // `resimulating` = SyncTest is replaying a rolled-back frame: pads are still substituted (SyncTest ignores them there), but nothing
   // is recorded or traced and the script cannot end. May change command->pads and pad_return.
   void OnCommand(Command* command, bool resimulating);
+
+  // Netplay (options.record_reply): called after the session answered; writes the record line of the call from the reply's pads
+  // (game port order: what the game really got, local and remote). Nothing for a resimulated call or a RESTORED reply.
+  void OnReply(const Command& command, const Reply& reply, bool resimulating);
 
   void Finish();  // flushes the record and the trace
 
@@ -607,6 +661,11 @@ private:
 // Called by CEXISlippi::DMAWrite when IsCommand(). `command` points at the DMA'd bytes (>= CMD_SIZE). Fills *read_queue with
 // the 64-byte reply (clearing it first). On the CPU thread.
 void HandleCommand(Core::System& system, const u8* command, size_t size, std::vector<u8>* read_queue);
+
+// True when REV3_NET_ROLE is set (netplay is wanted, whether or not its other variables turn out usable). The EXI device uses it to skip
+// everything of Slippi's online stack (Rust extensions, login, matchmaking, spectator, replays, reporting): a Rev3 session talks only to
+// its peer.
+bool NetplayRequested();
 
 // Writes the final summary and closes the log; the next command starts a fresh session. Safe to call any time.
 void Shutdown();

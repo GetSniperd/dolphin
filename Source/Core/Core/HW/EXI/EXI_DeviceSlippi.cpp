@@ -141,15 +141,27 @@ CEXISlippi::CEXISlippi(Core::System& system, const std::string current_file_name
 {
   INFO_LOG_FMT(SLIPPI, "EXI SLIPPI Constructor called.");
 
-  std::string user_config_folder = File::GetUserPath(D_SLIPPI_IDX);
+  // Rev3 netplay run (REV3_NET_ROLE set): none of Slippi's online stack may start. The Rust extensions (user manager, reporter, jukebox,
+  // update check ...), the login listener, matchmaking, the spectator server and replay writing are skipped; a Rev3 session talks to its
+  // peer only (Rev3Net.h). The Melee-side objects below are still constructed (they only keep the null pointer) so nothing else changes.
+  const bool rev3_netplay = Rev3::NetplayRequested();
+  if (rev3_netplay)
+  {
+    slprs_exi_device_ptr = 0;
+    NOTICE_LOG_FMT(SLIPPI, "Rev3 netplay run: Slippi Rust extensions, login, matchmaking and spectator are not started");
+  }
+  else
+  {
+    std::string user_config_folder = File::GetUserPath(D_SLIPPI_IDX);
 
-  SlippiRustEXIConfig slprs_exi_config;
-  slprs_exi_config.iso_path = current_file_name.c_str();
-  slprs_exi_config.user_config_folder = user_config_folder.c_str();
-  slprs_exi_config.scm_slippi_semver_str = Common::GetSemVerStr().c_str();
-  slprs_exi_config.osd_add_msg_fn = OSDMessageHandler;
+    SlippiRustEXIConfig slprs_exi_config;
+    slprs_exi_config.iso_path = current_file_name.c_str();
+    slprs_exi_config.user_config_folder = user_config_folder.c_str();
+    slprs_exi_config.scm_slippi_semver_str = Common::GetSemVerStr().c_str();
+    slprs_exi_config.osd_add_msg_fn = OSDMessageHandler;
 
-  slprs_exi_device_ptr = slprs_exi_device_create(slprs_exi_config);
+    slprs_exi_device_ptr = slprs_exi_device_create(slprs_exi_config);
+  }
 
   user = std::make_unique<SlippiUser>(slprs_exi_device_ptr);
   g_playback_status = std::make_unique<SlippiPlaybackStatus>();
@@ -173,7 +185,8 @@ CEXISlippi::CEXISlippi(Core::System& system, const std::string current_file_name
 
   // Update user file and then listen for User
 #ifndef IS_PLAYBACK
-  user->ListenForLogIn();
+  if (!rev3_netplay)
+    user->ListenForLogIn();
 #endif
 
   // Use sane stage defaults (should get overwritten)
@@ -191,7 +204,8 @@ CEXISlippi::~CEXISlippi()
 {
   u8 empty[1];
 
-  Rev3::Shutdown();  // Rev3 SyncTest: final summary line (no-op when it never ran)
+  Rev3::Shutdown();  // Rev3 SyncTest / netplay: final summary lines, BYE to the peer (no-op when it never ran)
+  const bool rev3_netplay = slprs_exi_device_ptr == 0;
 
   // Closes file gracefully to prevent file corruption when emulation
   // suddenly stops. This would happen often on netplay when the opponent
@@ -203,7 +217,8 @@ CEXISlippi::~CEXISlippi()
     m_file_write_thread.join();
   }
 
-  SlippiSpectateServer::getInstance().endGame(true);
+  if (!rev3_netplay)
+    SlippiSpectateServer::getInstance().endGame(true);  // (the first call creates the spectator server: never in a Rev3 run)
 
   // Try to determine whether we were playing an in-progress ranked match, if so
   // indicate to server that this client has abandoned. Anyone trying to modify
@@ -222,7 +237,8 @@ CEXISlippi::~CEXISlippi()
   g_playback_status->resetPlayback();
 
   // Instruct the Rust EXI device to shut down/drop everything.
-  slprs_exi_device_destroy(slprs_exi_device_ptr);
+  if (!rev3_netplay)
+    slprs_exi_device_destroy(slprs_exi_device_ptr);
 
   // TODO: ENET shutdown should maybe be done at app shutdown instead.
   // Right now this might be problematic in the case where someone starts a netplay client
@@ -3354,6 +3370,12 @@ void CEXISlippi::DMAWrite(u32 _uAddr, u32 _uSize)
     Rev3::HandleCommand(system, mem_ptr, _uSize, &m_read_queue);
     return;
   }
+  if (slprs_exi_device_ptr == 0)
+  {
+    // Rev3 netplay run: there is no Slippi online stack behind this device; whatever else the game sends is not answered.
+    m_read_queue.clear();
+    return;
+  }
 
   u8 byte = mem_ptr[0];
   if (byte == CMD_RECEIVE_COMMANDS)
@@ -3590,6 +3612,8 @@ void CEXISlippi::DMARead(u32 addr, u32 size)
 // This method can also be called, indirectly, from the Settings panel.
 void CEXISlippi::ConfigureJukebox()
 {
+  if (slprs_exi_device_ptr == 0)
+    return;  // Rev3 netplay run: no Rust extensions
 #ifndef IS_PLAYBACK
   // Exclusive WASAPI will prevent Jukebox from running on the main device, relegating it to another
   // device at random, so we will simply prevent Jukebox from running if the user is using WASAPI on
@@ -3623,11 +3647,15 @@ void CEXISlippi::ConfigureJukebox()
 
 void CEXISlippi::UpdateJukeboxDolphinSystemVolume(int volume)
 {
+  if (slprs_exi_device_ptr == 0)
+    return;
   slprs_jukebox_set_dolphin_system_volume(slprs_exi_device_ptr, volume);
 }
 
 void CEXISlippi::UpdateJukeboxDolphinMusicVolume(int volume)
 {
+  if (slprs_exi_device_ptr == 0)
+    return;
   slprs_jukebox_set_dolphin_music_volume(slprs_exi_device_ptr, volume);
 }
 

@@ -1,4 +1,4 @@
-// Unit tests for Core/Slippi/Rev3Rollback: the wire codec, the whitelist parser and the SyncTest state machine, driven by a fake
+// Unit tests for Core/Slippi/Rev3Rollback: the wire codec, the whitelist parser, the SyncTest state machine and its network mode (M3), driven by a fake
 // guest memory and a tiny deterministic "game" (no Dolphin core, no game data). Run: build target `tests`, then `tests --gtest_filter=Rev3*`.
 
 #include <algorithm>
@@ -15,6 +15,7 @@
 
 #include "Common/Hash.h"
 #include "Core/Slippi/Rev3Rollback.h"
+#include "Core/Slippi/Rev3Session.h"
 
 namespace
 {
@@ -2690,4 +2691,280 @@ TEST(Rev3Rollback, ReplayingARecordGivesTheRecordRunsTrace)
   EXPECT_EQ(trace_a.lines, trace_b.lines);
   EXPECT_EQ(record_a.lines, record_b.lines);  // re-recording a replay gives back the pads
   EXPECT_TRUE(trace_a.lines != trace_c.lines);
+}
+
+// ---- network mode (M3): the snapshot machinery without SyncTest's own state machine ---------------------------------------------------
+
+namespace
+{
+// The fixed (non-adaptive) seed of a net test: the classic game ranges plus both fighter structs (NetPrepareArm refuses a set that does not
+// hold all 61 fields; the adaptive set always does).
+std::vector<Range> NetSeed()
+{
+  std::vector<Range> seed = FakeGame(false).Ranges();
+  seed.push_back({FIGHTER[0], FIGHTER[0] + 0x1700});
+  seed.push_back({FIGHTER[1], FIGHTER[1] + 0x1700});
+  return seed;
+}
+
+// Drives SyncTest::Net* the way Rev3::Net::SyncTestStore does: one NetObserve per hook call, captures when the session says so, and the
+// game's own frame (FakeGame::Step with the pads of that frame) in between.
+struct NetRig
+{
+  explicit NetRig(const SyncTestOptions& options, const std::vector<Range>& seed = {}) : game(false), test(options, seed, game.Mem(), sink, FakeClock())
+  {
+  }
+  Command Cmd(u32 frame) const
+  {
+    Command c;
+    c.frame = frame;
+    c.pads = FakeGame::PadsFor(frame);
+    c.sp = SP;
+    return c;
+  }
+  void Observe(u32 frame, bool resimulating = false)
+  {
+    game.Mem().SetU32(SP, frame);  // the hook's stack frame holds its frame counter, as in FakeGame::Frame
+    test.NetObserve(Cmd(frame), resimulating);
+  }
+  bool Capture(u32 frame)
+  {
+    SyncTest::NetSnapshotInfo info;
+    const bool ok = test.NetCapture(frame, SP, &info);
+    if (ok)
+      infos[frame] = info;
+    return ok;
+  }
+  void Advance(u32 frame, bool late = false)
+  {
+    game.Step(FakeGame::PadsFor(frame));
+    if (late)  // from now on a counter in a page nothing seeds feeds p1's combo_count (FakeGame::SetLatePage does this inside Frame)
+    {
+      const u32 v = game.Mem().U32(LATE_PAGE);
+      game.Mem().SetU32(LATE_PAGE, v + 1);
+      game.Mem().SetU32(FIGHTER[0] + FIELD_COMBO_COUNT, v);
+    }
+  }
+  FakeGame game;
+  FakeSink sink;
+  SyncTest test;
+  std::map<u32, SyncTest::NetSnapshotInfo> infos;
+};
+}  // namespace
+
+TEST(Rev3Rollback, NetModeCapturesAndRestoresFramesInARing)
+{
+  NetRig rig(Options(6), NetSeed());  // k = MAXR + 1 = 6: MAXR + 2 = 7 slots
+  EXPECT_EQ(rig.test.NetSlotCount(), 7u);
+  EXPECT_FALSE(rig.test.NetPrepareArm());  // no NetObserve yet: no fighters known
+  EXPECT_FALSE(rig.Capture(1000));
+  EXPECT_TRUE(rig.sink.Contains("ERROR"));
+
+  for (u32 f = 1000; f < 1010; ++f)
+  {
+    rig.Observe(f);
+    rig.Advance(f);
+  }
+  rig.Observe(1010);
+  EXPECT_TRUE(rig.test.NetFightersFound());
+  EXPECT_EQ(rig.test.NetFighters()[0], FIGHTER[0]);
+  EXPECT_EQ(rig.test.NetFighters()[1], FIGHTER[1]);
+  ASSERT_TRUE(rig.test.NetPrepareArm());
+  EXPECT_TRUE(rig.sink.Contains("NOTE net snapshot set: ranges="));
+  EXPECT_TRUE(rig.sink.Contains("in_snapshot=61/61"));
+
+  std::map<u32, std::array<u32, 3>> state;  // the game words at the moment of each capture
+  std::map<u32, u32> checksum;
+  for (u32 f = 1010; f <= 1020; ++f)
+  {
+    if (f != 1010)
+      rig.Observe(f);
+    ASSERT_TRUE(rig.Capture(f)) << f;
+    state[f] = {rig.game.Mem().U32(STATE_A), rig.game.Mem().U32(STATE_A + 0x80), rig.game.Mem().U32(STATE_B + 4)};
+    u32 chk = 0;
+    ASSERT_EQ(FighterChecksum(rig.game.Mem(), f, &chk), 2u);
+    checksum[f] = chk;
+    rig.Advance(f);
+  }
+
+  // The capture reports the fighters' fields: the same numbers the live checksum is made of.
+  for (u32 f = 1010; f <= 1020; ++f)
+    EXPECT_EQ(Net::ChecksumOfFields(static_cast<s32>(f), Net::FieldsFromRaw(rig.infos[f].fields, 3)), checksum[f]) << f;
+
+  // 7 slots: the newest 7 frames are there, older ones were overwritten.
+  for (u32 f = 1010; f <= 1013; ++f)
+    EXPECT_FALSE(rig.test.NetHas(f)) << f;
+  for (u32 f = 1014; f <= 1020; ++f)
+  {
+    EXPECT_TRUE(rig.test.NetHas(f)) << f;
+    EXPECT_EQ(rig.test.NetSlotSp(f), SP);
+  }
+  EXPECT_EQ(rig.test.NetSlotSp(1013), 0u);
+  EXPECT_FALSE(rig.test.NetHas(1021));
+
+  // Restore: the game words and the stack frame of that call come back.
+  ASSERT_TRUE(rig.test.NetRestore(1016));
+  EXPECT_EQ(rig.game.Mem().U32(STATE_A), state[1016][0]);
+  EXPECT_EQ(rig.game.Mem().U32(STATE_A + 0x80), state[1016][1]);
+  EXPECT_EQ(rig.game.Mem().U32(STATE_B + 4), state[1016][2]);
+  EXPECT_EQ(rig.game.Mem().U32(SP), 1016u);
+  u32 chk = 0;
+  FighterChecksum(rig.game.Mem(), 1016, &chk);
+  EXPECT_EQ(chk, checksum[1016]);
+  EXPECT_NE(rig.game.Mem().U32(STATE_A), state[1020][0]);
+
+  rig.test.NetClear();
+  for (u32 f = 1010; f <= 1020; ++f)
+    EXPECT_FALSE(rig.test.NetHas(f)) << f;
+  EXPECT_EQ(rig.test.NetSlotSp(1016), 0u);
+  EXPECT_FALSE(rig.test.NetLayoutPending());
+}
+
+TEST(Rev3Rollback, NetModeLosingTheFightersForgetsTheSet)
+{
+  NetRig rig(AdaptiveOptions(6));
+  rig.Observe(1000);
+  EXPECT_TRUE(rig.test.NetFightersFound());
+  rig.game.Mem().SetU32(0x8038FE50, 0);  // team 0 gone: a menu / loading
+  rig.Observe(1001);
+  EXPECT_FALSE(rig.test.NetFightersFound());
+  EXPECT_FALSE(rig.test.NetPrepareArm());
+  EXPECT_FALSE(rig.Capture(1001));
+  EXPECT_FALSE(rig.test.LearningDone());  // the tracker starts again when the fighters come back
+}
+
+TEST(Rev3Rollback, NetModeLearnedPagesAreDeferredUntilTheNextClear)
+{
+  NetRig rig(AdaptiveOptions(6));
+  u32 f = 1000;
+  for (; f < 3000 && !rig.test.LearningDone(); ++f)
+  {
+    rig.Observe(f);
+    rig.Advance(f);
+  }
+  ASSERT_TRUE(rig.test.LearningDone());
+  rig.Observe(f);
+  ASSERT_TRUE(rig.test.NetPrepareArm());
+  const std::vector<Range> installed = rig.test.Ranges();
+  EXPECT_FALSE(SetContains(installed, LATE_PAGE));
+
+  // Slots are in use; from now on the game changes a page nobody seeded. The tracker finds it, the set must NOT change under the slots.
+  bool pending = false;
+  for (int i = 0; i < 600 && !pending; ++i, ++f)
+  {
+    if (i != 0)
+      rig.Observe(f);
+    ASSERT_TRUE(rig.Capture(f));
+    rig.Advance(f, true);
+    pending = rig.test.NetLayoutPending();
+  }
+  ASSERT_TRUE(pending);
+  EXPECT_TRUE(rig.sink.Contains("while slots are in use"));
+  EXPECT_FALSE(SetContains(rig.test.Ranges(), LATE_PAGE));
+  EXPECT_EQ(rig.test.Ranges().size(), installed.size());
+  EXPECT_GE(rig.test.Stats().pages_learned_armed, 1u);
+  rig.Observe(f);
+  EXPECT_TRUE(rig.Capture(f));  // still working with the old layout
+  EXPECT_TRUE(rig.test.NetRestore(f));
+
+  rig.test.NetClear();  // the session drained: the new set is installed with the slots empty
+  EXPECT_TRUE(SetContains(rig.test.Ranges(), LATE_PAGE));
+  EXPECT_FALSE(rig.test.NetLayoutPending());
+  EXPECT_FALSE(rig.test.NetHas(f));
+  EXPECT_TRUE(rig.sink.Contains("NOTE net snapshot set now ranges="));
+  rig.Observe(f + 1);
+  EXPECT_TRUE(rig.Capture(f + 1));
+  EXPECT_TRUE(rig.test.NetRestore(f + 1));
+}
+
+TEST(Rev3Rollback, NetModeResimulatedCallsAreNotScanned)
+{
+  NetRig rig(AdaptiveOptions(6));
+  for (u32 f = 1000; f < 1100; ++f)
+  {
+    rig.Observe(f, true);  // every call a replay: nothing may be hashed
+    rig.Advance(f);
+  }
+  EXPECT_EQ(rig.test.Stats().scans, 0u);
+  EXPECT_EQ(rig.test.LearnCycles(), 0u);
+  rig.Observe(1100);
+  EXPECT_GT(rig.test.Stats().scans, 0u);
+}
+
+TEST(Rev3Rollback, NetModeStatsLineIsOneNoteLine)
+{
+  NetRig rig(Options(6), NetSeed());
+  for (u32 f = 1000; f < 1003; ++f)
+  {
+    rig.Observe(f);
+    rig.Advance(f);
+  }
+  ASSERT_TRUE(rig.test.NetPrepareArm());
+  rig.Capture(1003);
+  rig.Advance(1003);
+  rig.Observe(1004);
+  rig.Capture(1004);
+  ASSERT_TRUE(rig.test.NetRestore(1003));
+  const std::string line = rig.test.NetStatsLine();
+  EXPECT_EQ(line.rfind("NOTE snapshot stats restores=1 ", 0), 0u) << line;
+  EXPECT_EQ(line.find('\n'), std::string::npos);
+}
+
+TEST(Rev3Rollback, ReadFighterFieldsIsWhatTheChecksumIsMadeOf)
+{
+  FakeMemory mem;
+  CsWorld(&mem);
+  std::array<std::array<u8, FIELD_BYTES>, 2> raw{};
+  u8 present = 0;
+  EXPECT_EQ(ReadFighterFields(mem, &raw, &present), 2u);
+  EXPECT_EQ(present, 3);
+  EXPECT_EQ(Net::ChecksumOfFields(static_cast<s32>(CS_GOLDEN_FRAME), Net::FieldsFromRaw(raw, present)), CS_GOLDEN);
+  // The raw bytes are the big-endian words at the table's offsets.
+  const std::vector<u8> pattern = CsPattern(1);
+  for (size_t i = 0; i < FIELDS.size(); ++i)
+    EXPECT_EQ(0, std::memcmp(raw[0].data() + 4 * i, pattern.data() + FIELDS[i].offset, 4)) << FIELDS[i].name;
+
+  mem.SetU32(0x8038FE50, 0);  // player 1 gone: its array stays zero, only bit 1 is set
+  EXPECT_EQ(ReadFighterFields(mem, &raw, &present), 1u);
+  EXPECT_EQ(present, 2);
+  EXPECT_EQ(raw[0], (std::array<u8, FIELD_BYTES>{}));
+  u32 chk = 0;
+  FighterChecksum(mem, 9, &chk);
+  EXPECT_EQ(Net::ChecksumOfFields(9, Net::FieldsFromRaw(raw, present)), chk);
+
+  FakeMemory empty;
+  EXPECT_EQ(ReadFighterFields(empty, &raw, &present), 0u);
+  EXPECT_EQ(present, 0);
+}
+
+TEST(Rev3Rollback, PadRecordCanRecordWhatTheGameActuallyGot)
+{
+  // Netplay: the pads in the command are the local pad (port 0) and junk; the pads the game gets are in the REPLY. With record_reply the kit
+  // writes the reply's pads (and the command's pad_return), once per frame, not for restored replies or replayed frames.
+  KitRig rig;
+  rig.options.record_path = "pads.txt";
+  rig.options.record_reply = true;
+  auto kit = rig.Make();
+  Reply normal;
+  normal.pads = {Pad(7), Pad(9)};
+  for (u32 f = 10; f < 14; ++f)
+  {
+    Command c = rig.Cmd(f);
+    kit->OnCommand(&c, false);
+    kit->OnReply(c, normal, false);
+  }
+  Command c = rig.Cmd(14);
+  kit->OnCommand(&c, false);
+  Reply restored;
+  restored.flags = REPLY_FLAG_RESTORED;
+  restored.frame = 12;
+  restored.pads = {Pad(1), Pad(2)};
+  kit->OnReply(c, restored, false);  // not recorded: the hook continues from frame 12
+  Command replay = rig.Cmd(12);
+  kit->OnCommand(&replay, true);
+  kit->OnReply(replay, normal, true);  // not recorded: a replayed frame
+  ASSERT_EQ(rig.record.lines.size(), 5u);  // header + frames 10..13
+  EXPECT_STREQ(rig.record.lines[1].c_str(), FormatPadRecordLine(10, normal.pads, 1).c_str());
+  EXPECT_STREQ(rig.record.lines[4].c_str(), FormatPadRecordLine(13, normal.pads, 1).c_str());
+  EXPECT_EQ(kit->RecordedLines(), 4u);
 }

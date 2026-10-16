@@ -26,6 +26,7 @@
 
 #include <gtest/gtest.h>
 
+#include "Common/Hash.h"
 #include "Core/Slippi/Rev3Session.h"
 
 namespace
@@ -861,6 +862,83 @@ TEST(Rev3Session, PeerByeAndLostConnectionLeave)
   EXPECT_TRUE(b.session->Step(b.Cmd(2, LocalPad(2)), Closed(), &r));
   EXPECT_TRUE(b.session->mode() == Mode::OFFLINE);
   EXPECT_TRUE(b.sink.Has("connection lost"));
+}
+
+TEST(Rev3Session, AbortLeavesWithTheGivenReasonAndTheLateTimeoutIsSilent)
+{
+  // The glue calls Abort() when the emulator is stopping while a wait runs; the wait then ends and BlockTimedOut() must not log a timeout.
+  Rig rig(Role::Host, 0);
+  rig.Handshake();
+  rig.Lockstep(2);
+  Reply r;
+  EXPECT_FALSE(rig.session->Step(rig.Cmd(2, LocalPad(2)), Closed(), &r));  // no remote pad yet: the session waits
+  rig.session->Abort("emulator stopping");
+  EXPECT_TRUE(rig.session->mode() == Mode::OFFLINE);
+  EXPECT_TRUE(rig.sink.Has("emulator stopping"));
+  EXPECT_EQ(rig.net.CountOut(MsgType::Bye), 1u);
+  const size_t lines = rig.sink.lines.size();
+  rig.session->BlockTimedOut();
+  EXPECT_EQ(rig.sink.lines.size(), lines);
+  EXPECT_TRUE(rig.session->Step(rig.Cmd(2, LocalPad(2)), Closed(), &r));  // offline: plain pass-through
+}
+
+TEST(Rev3Session, HelloGoesOutWhenTheConnectionComesUpDuringTheWait)
+{
+  // Found by the loopback run over real UDP: the CPU thread waits at the frame-0 barrier and calls Step() again only once the wait is
+  // satisfied, so the HELLO must be sent from the wait itself when the connection comes up there, or both sides wait for each other.
+  Rig rig(Role::Host, 0);
+  rig.net.state = ConnState::Connecting;
+  Reply r;
+  EXPECT_FALSE(rig.session->Step(rig.Cmd(0, LocalPad(0)), Closed(), &r));  // not connected yet
+  EXPECT_EQ(rig.net.CountOut(MsgType::Hello), 0u);
+  EXPECT_FALSE(rig.session->BlockSatisfied());
+  rig.net.state = ConnState::Connected;
+  EXPECT_FALSE(rig.session->BlockSatisfied());  // our HELLO goes out here; the peer's has not arrived
+  EXPECT_EQ(rig.net.CountOut(MsgType::Hello), 1u);
+  EXPECT_FALSE(rig.session->BlockSatisfied());
+  EXPECT_EQ(rig.net.CountOut(MsgType::Hello), 1u);  // only once
+  rig.net.inbox.push_back({MsgType::Hello, SerializeHello(rig.PeerHello())});
+  EXPECT_TRUE(rig.session->BlockSatisfied());
+  rig.net.Deliver(0, RemotePadScript(0));
+  EXPECT_TRUE(rig.session->Step(rig.Cmd(0, LocalPad(0)), Closed(), &r));
+  EXPECT_TRUE(rig.session->mode() == Mode::LOCKSTEP);
+  EXPECT_EQ(rig.net.CountOut(MsgType::Hello), 1u);
+}
+
+TEST(Rev3Session, FieldsFromRawAndChecksumOfFields)
+{
+  // Raw big-endian bytes -> FieldSet -> rbchecksum.py's CRC stream (u32 BE frame, per present player u32 BE id then the words).
+  std::array<std::array<u8, FIELD_BYTES>, 2> raw{};
+  for (size_t p = 0; p < 2; ++p)
+    for (size_t i = 0; i < FIELD_BYTES; ++i)
+      raw[p][i] = static_cast<u8>(i * 3 + p * 100 + 1);
+  const FieldSet both = FieldsFromRaw(raw, 3);
+  EXPECT_EQ(both.present, 3);
+  EXPECT_EQ(both.value[0][0], 0x0104070Au);
+  EXPECT_EQ(both.value[1][0], 0x65686B6Eu);
+  const FieldSet one = FieldsFromRaw(raw, 2 | 4);  // bits above 1 are ignored; player 1 absent
+  EXPECT_EQ(one.present, 2);
+  EXPECT_EQ(one.value[0][0], 0u);
+  EXPECT_EQ(one.value[1][5], both.value[1][5]);
+
+  std::vector<u8> stream;
+  const auto put = [&stream](u32 v) {
+    stream.insert(stream.end(), {static_cast<u8>(v >> 24), static_cast<u8>(v >> 16), static_cast<u8>(v >> 8), static_cast<u8>(v)});
+  };
+  put(77);
+  put(1);
+  for (u32 v : both.value[0])
+    put(v);
+  put(2);
+  for (u32 v : both.value[1])
+    put(v);
+  EXPECT_EQ(ChecksumOfFields(77, both), Common::ComputeCRC32(stream.data(), stream.size()));
+  EXPECT_NE(ChecksumOfFields(78, both), ChecksumOfFields(77, both));
+  EXPECT_NE(ChecksumOfFields(77, one), ChecksumOfFields(77, both));
+  FieldSet none;
+  std::vector<u8> frame_only;
+  frame_only.insert(frame_only.end(), {0, 0, 0, 7});
+  EXPECT_EQ(ChecksumOfFields(7, none), Common::ComputeCRC32(frame_only.data(), frame_only.size()));
 }
 
 // ---- arming ----------------------------------------------------------------------------------------------------------------------

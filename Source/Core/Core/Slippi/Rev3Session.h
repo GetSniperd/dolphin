@@ -188,6 +188,12 @@ public:
   virtual void Clear() = 0;  // forget every slot (the gate closed)
 };
 
+// The FieldSet of raw big-endian field bytes (Rev3::ReadFighterFields / SyncTest::NetSnapshotInfo), `present` as in FieldSet.
+FieldSet FieldsFromRaw(const std::array<std::array<u8, FIELD_BYTES>, 2>& raw, u8 present);
+// rbchecksum.py checksum(frame, fighters): CRC-32 (zlib, init 0) over u32 BE frame, then for each present player u32 BE id (1, 2) and the 61
+// words big-endian. Equals Rev3::FighterChecksum on the memory the fields were read from.
+u32 ChecksumOfFields(s32 frame, const FieldSet& fields);
+
 // ---- HELLO, START_CHECK, DESYNC_DUMP ---------------------------------------------------------------------------------------
 // Sent once after connecting. Everything that makes two machines play differently goes in; a mismatch names the items.
 struct Hello
@@ -291,6 +297,10 @@ public:
 
   // Writes SUMMARY (once; also written when the session is left).
   void Finish();
+
+  // Leaves the session now with this reason (BYE to the peer, SUMMARY, OFFLINE): the glue calls it when the emulator is stopping while a
+  // wait is running, so the log says why instead of "timed out".
+  void Abort(const std::string& why);
 
   Mode mode() const { return m_mode; }
   bool Resimulating() const { return m_resim; }  // the game is re-running frames after a RESTORED reply (v1 hiding: throttle off + mute)
