@@ -1100,6 +1100,134 @@ VerifyResult RestoreVerifier::Check(const VerifyInput& in)
   return res;
 }
 
+// ---- (3d) memory hash check ---------------------------------------------------------------------------------------------------
+// MemoryHasher / DiffHashes / RegionHashes (declared in Rev3Rollback.h, "memory hash check"): the page-hash comparison of ALL guest memory
+// behind REV3_RB_HASHCHECK and the first level of the netplay desync diff.
+
+namespace
+{
+// Sets mark[i] = 1 for every tracked page that overlaps one of `ranges` (a range is clipped to MEM1 and MEM2; a byte takes its whole page).
+void MarkPages(const std::vector<Range>& ranges, std::vector<u8>* mark)
+{
+  mark->assign(TRACKED_PAGES, 0);
+  for (const Range& r : ranges)
+  {
+    if (r.end <= r.start)
+      continue;
+    const std::pair<u32, u32> regions[2] = {{MEM1_BASE, MEM1_END}, {MEM2_BASE, MEM2_END}};
+    for (const auto& region : regions)
+    {
+      const u32 lo = std::max(r.start, region.first);
+      const u32 hi = std::min(r.end, region.second);
+      if (hi <= lo)
+        continue;
+      const size_t first = PageIndex(lo);
+      const size_t last = PageIndex(hi - 1);
+      for (size_t i = first; i <= last && i < TRACKED_PAGES; ++i)
+        (*mark)[i] = 1;
+    }
+  }
+}
+}  // namespace
+
+MemoryHasher::MemoryHasher(GuestMemory& memory, std::function<u64()> micros)
+    : m_memory(memory), m_micros(std::move(micros)), m_buf(PAGE_SIZE)
+{
+  if (!m_micros)
+    m_micros = SteadyMicros;
+}
+
+void MemoryHasher::Hash(const std::vector<Range>& skip, MemoryHashes* out)
+{
+  const u64 start = m_micros();
+  out->page.resize(TRACKED_PAGES);
+  out->valid.assign(TRACKED_PAGES, 0);
+  std::vector<u8> skipped;
+  MarkPages(skip, &skipped);
+  out->hashed = 0;
+  out->skipped = 0;
+  for (size_t i = 0; i < TRACKED_PAGES; ++i)
+  {
+    if (skipped[i] != 0)
+    {
+      ++out->skipped;
+      continue;
+    }
+    const u32 addr = PageAddress(i);
+    const u8* page = m_memory.Peek(addr, PAGE_SIZE);
+    if (page == nullptr)
+    {
+      if (!m_memory.Read(addr, m_buf.data(), PAGE_SIZE))
+        continue;  // not backed by memory (e.g. MEM2 of a GameCube): neither hashed nor counted as skipped
+      page = m_buf.data();
+    }
+    out->page[i] = HashPage(page);
+    out->valid[i] = 1;
+    ++out->hashed;
+  }
+  out->us = m_micros() - start;
+}
+
+std::vector<u32> DiffHashes(const MemoryHashes& a, const MemoryHashes& b, u32* compared)
+{
+  std::vector<u32> differing;
+  u32 both = 0;
+  if (!a.Empty() && !b.Empty() && a.page.size() == TRACKED_PAGES && b.page.size() == TRACKED_PAGES)
+  {
+    for (size_t i = 0; i < TRACKED_PAGES; ++i)
+    {
+      if (a.valid[i] == 0 || b.valid[i] == 0)
+        continue;
+      ++both;
+      if (a.page[i] != b.page[i])
+        differing.push_back(PageAddress(i));
+    }
+  }
+  if (compared != nullptr)
+    *compared = both;
+  return differing;
+}
+
+std::vector<u64> RegionHashes(const MemoryHashes& hashes)
+{
+  std::vector<u64> regions(HASHCHECK_REGIONS, 0);
+  if (hashes.Empty() || hashes.page.size() != TRACKED_PAGES)
+    return regions;
+  constexpr size_t PAGES_PER_REGION = HASHCHECK_REGION_BYTES / PAGE_SIZE;
+  for (size_t r = 0; r < HASHCHECK_REGIONS; ++r)
+  {
+    u64 h = 0x9E3779B97F4A7C15ull;
+    bool any = false;
+    for (size_t k = 0; k < PAGES_PER_REGION; ++k)
+    {
+      const size_t i = r * PAGES_PER_REGION + k;
+      if (hashes.valid[i] == 0)
+        continue;  // the position is mixed in below, so a skipped page does not shift the others
+      any = true;
+      h = (Rotl64(h, 23) ^ hashes.page[i] ^ (static_cast<u64>(k) << 56)) * 0xC2B2AE3D27D4EB4Full;
+    }
+    regions[r] = any ? (h | 1) : 0;  // 0 is reserved for "no page hashed"
+  }
+  return regions;
+}
+
+std::vector<u32> DiffRegions(const std::vector<u64>& a, const std::vector<u64>& b)
+{
+  std::vector<u32> differing;
+  const size_t n = std::min(a.size(), b.size());
+  for (size_t r = 0; r < n; ++r)
+  {
+    if (a[r] != 0 && b[r] != 0 && a[r] != b[r])
+      differing.push_back(static_cast<u32>(r));
+  }
+  return differing;
+}
+
+u32 RegionBase(size_t index)
+{
+  return PageAddress(index * (HASHCHECK_REGION_BYTES / PAGE_SIZE));
+}
+
 // ---- (4) SyncTest -------------------------------------------------------------------------------------------------------
 
 SyncTest::SyncTest(const SyncTestOptions& options, std::vector<Range> ranges, GuestMemory& memory, Sink& sink,
@@ -1141,6 +1269,15 @@ SyncTest::SyncTest(const SyncTestOptions& options, std::vector<Range> ranges, Gu
                          "== 0); no restore will be verified. Pick another REV3_RB_VERIFY_EVERY",
                          v.every, m_options.k, sync_every));
     }
+  }
+
+  // Memory hash check (REV3_RB_HASHCHECK): page hashes of all of guest memory every Nth frame, first run against resimulation.
+  if (m_options.hash_check_every != 0)
+  {
+    m_hasher = std::make_unique<MemoryHasher>(memory, m_micros);
+    m_sink.Line(Format("NOTE hash check on: every %u frames, all of MEM1 + MEM2 in %zu pages of 4 KB (about 9 ms per hashed frame); frames that "
+                       "differ are named in HASHCHECK lines",
+                       m_options.hash_check_every, static_cast<size_t>(TRACKED_PAGES)));
   }
 
   m_sink.Line(Format("SYNCTEST start K=%d EVERY=%d window=0x%X whitelist=%s ranges=%zu bytes=%zu snapshot_bytes=%zu slots=%zu "
@@ -1525,6 +1662,7 @@ bool SyncTest::Capture(Slot& slot, const Command& command, const std::array<u32,
   // verifier and only means this frame is not verified).
   if (m_verify != nullptr && m_verify->WantsShadow(command.frame))
     m_verify->TakeShadow(command.frame);
+  HashMemory(slot, command);
 
   // The audio hardware at the same moment as the memory (a failure only switches the audio rewind off, see DisableAudio).
   if (m_audio != nullptr)
@@ -1888,6 +2026,7 @@ Reply SyncTest::Resim(const Command& command, const std::array<u32, 2>& fighters
 
   m_scratch.inputs = reference.inputs;  // the recorded inputs, not the live ones, drive the replay
   Compare(reference, m_scratch, m);
+  HashCheck(reference, m_scratch, m);
   std::swap(reference, m_scratch);      // the resimulated state becomes the record (and snapshot) of frame m
   ++m_stats.frames_compared;
   m_last_frame = m;
@@ -2030,7 +2169,7 @@ void SyncTest::SummaryLine(const char* tag)
                      m_stats.audio_restores != 0 ? static_cast<double>(m_stats.audio_us_total) / m_stats.audio_restores : 0.0,
                      static_cast<unsigned long long>(m_stats.audio_us_max), m_stats.ef_checks, m_stats.ef_bad, m_stats.ef_bad_before,
                      m_stats.layout_refused, m_stats.late_learn_rollbacks) +
-              VerifyStatsFields());
+              VerifyStatsFields() + HashCheckStatsFields());
   m_sink.Line(SnapshotLine());
 }
 
@@ -2544,6 +2683,122 @@ std::string WordsText(const std::array<u32, VERIFY_FIRST_WORDS>& words)
   return text;
 }
 }  // namespace
+
+// ---- memory hash check: the SyncTest side ----
+
+// Hashes all of guest memory into slot.hashes when this frame is one of the every-Nth. Skipped (never compared, because the restore or the
+// hardware deliberately leaves them alone, or they are known to differ between two visits of the same frame): the hook region, the
+// REV3_SYNCTEST_EXCLUDE ranges, the hardware cuts, REV3_RB_VERIFY_IGNORE and the dead part of the hook thread's stack (VerifyDeadStack).
+void SyncTest::HashMemory(Slot& slot, const Command& command)
+{
+  if (m_hasher == nullptr)
+    return;
+  if (command.frame % m_options.hash_check_every != 0)
+  {
+    slot.hashes.hashed = 0;  // a slot of the ring is reused: whatever it held is not this frame's
+    return;
+  }
+  std::vector<Range> skip;
+  skip.push_back({HOOK_REGION_START, HOOK_REGION_END});
+  skip.insert(skip.end(), m_user_exclusions.begin(), m_user_exclusions.end());
+  for (const Exclusion& e : m_exclusions_logged)
+    skip.push_back({e.start, e.end});
+  skip.insert(skip.end(), m_verify_ignore.begin(), m_verify_ignore.end());
+  const Range dead = VerifyDeadStack(m_memory, command.sp, m_options.verify.stack_below != 0 ? m_options.verify.stack_below : 0x4000);
+  if (dead.end > dead.start)
+    skip.push_back(dead);
+  m_hasher->Hash(skip, &slot.hashes);
+  slot.hashes.frame = command.frame;
+  m_stats.hc_us_total += slot.hashes.us;
+}
+
+// Frame m was resimulated: compare the page hashes of the first run (`reference`) with those of the resimulation (`live`).
+void SyncTest::HashCheck(const Slot& reference, const Slot& live, u32 frame)
+{
+  if (m_hasher == nullptr || reference.hashes.Empty() || live.hashes.Empty() || reference.hashes.frame != frame || live.hashes.frame != frame)
+    return;
+  u32 compared = 0;
+  const std::vector<u32> differing = DiffHashes(reference.hashes, live.hashes, &compared);
+  ++m_stats.hc_compared;
+  if (differing.empty())
+  {
+    m_stats.hc_last_equal_frame = frame;
+    if (m_hc_ok_logs < HASHCHECK_MAX_OK_LOGS)
+    {
+      ++m_hc_ok_logs;
+      m_sink.Line(Format("HASHCHECK frame=%u ok compared=%u skipped=%u us=%llu", frame, compared, live.hashes.skipped,
+                         static_cast<unsigned long long>(live.hashes.us)));
+    }
+    return;
+  }
+
+  ++m_stats.hc_differ;
+  m_stats.hc_pages_total += differing.size();
+  if (m_stats.hc_first_diff_frame == 0)
+  {
+    m_stats.hc_first_diff_frame = frame;
+    m_sink.Osd(Format("Rev3 hash check: memory differs at frame %u (%zu pages), see the log", frame, differing.size()));
+  }
+  if (m_hc_diff_logs >= HASHCHECK_MAX_DIFF_LOGS)
+    return;
+  ++m_hc_diff_logs;
+
+  // in_set: the page overlaps the snapshot set or the stack window (it was rewound, so a difference is nondeterminism inside the set);
+  // outside_set: nothing rewound it (a page the set misses, or memory the game does not reproduce by itself).
+  std::vector<Range> set = m_ranges;
+  if (live.stack_len != 0)
+    set.push_back({live.sp, live.sp + live.stack_len});
+  std::vector<u8> in_set_mark;
+  MarkPages(set, &in_set_mark);
+  size_t in_set = 0;
+  std::vector<std::pair<u32, u32>> regions;  // region base, differing pages in it
+  std::string pages;
+  size_t listed = 0;
+  size_t i = 0;
+  while (i < differing.size())
+  {
+    size_t j = i;
+    while (j + 1 < differing.size() && differing[j + 1] == differing[j] + PAGE_SIZE)
+      ++j;
+    if (listed++ < HASHCHECK_MAX_RANGES_LISTED)
+      pages += Format("%s0x%08X-0x%08X", pages.empty() ? "" : ",", differing[i], differing[j] + PAGE_SIZE);
+    i = j + 1;
+  }
+  if (listed > HASHCHECK_MAX_RANGES_LISTED)
+    pages += Format(",+%zu more", listed - HASHCHECK_MAX_RANGES_LISTED);
+  for (const u32 addr : differing)
+  {
+    in_set += in_set_mark[PageIndex(addr)] != 0 ? 1 : 0;
+    const u32 base = addr & ~(HASHCHECK_REGION_BYTES - 1);
+    if (regions.empty() || regions.back().first != base)
+      regions.push_back({base, 0});
+    ++regions.back().second;
+  }
+  std::string region_text;
+  for (size_t r = 0; r < regions.size(); ++r)
+  {
+    if (r == HASHCHECK_MAX_REGIONS_LISTED)
+    {
+      region_text += Format(",+%zu more", regions.size() - HASHCHECK_MAX_REGIONS_LISTED);
+      break;
+    }
+    region_text += Format("%s0x%08X:%u", r == 0 ? "" : ",", regions[r].first, regions[r].second);
+  }
+  m_sink.Line(Format("HASHCHECK frame=%u DIFF pages=%zu (in_set=%zu outside_set=%zu) compared=%u regions64k=%zu [%s] ranges=[%s] "
+                     "last_equal_frame=%u",
+                     frame, differing.size(), in_set, differing.size() - in_set, compared, regions.size(), region_text.c_str(), pages.c_str(),
+                     m_stats.hc_last_equal_frame));
+}
+
+std::string SyncTest::HashCheckStatsFields() const
+{
+  if (m_hasher == nullptr)
+    return {};
+  return Format(" hashcheck_compared=%u hashcheck_differ=%u hashcheck_last_equal_frame=%u hashcheck_first_diff_frame=%u hashcheck_pages=%llu "
+                "hashcheck_ms=%.1f",
+                m_stats.hc_compared, m_stats.hc_differ, m_stats.hc_last_equal_frame, m_stats.hc_first_diff_frame,
+                static_cast<unsigned long long>(m_stats.hc_pages_total), static_cast<double>(m_stats.hc_us_total) / 1000.0);
+}
 
 std::string SyncTest::VerifyStatsFields() const
 {
@@ -5067,6 +5322,7 @@ void Initialize(Module& module, Core::System& system)
   std::vector<Range> verify_ignore;
   ParseVerifyEnv(&options, &verify_ignore, *module.sink);  // REV3_RB_VERIFY*: restore verify (off unless REV3_RB_VERIFY is set)
   ParseWriteTrackEnv(&options, *module.sink);               // REV3_RB_WRITE_TRACK*: host write tracking (off unless REV3_RB_WRITE_TRACK is 1 / 2)
+  ParseHashCheckEnv(&options, *module.sink);                // REV3_RB_HASHCHECK: all-memory page hash comparison (off unless set)
 
   const std::string whitelist_path = GetEnv("REV3_WHITELIST");
   options.whitelist_path = whitelist_path.empty() ? "(none)" : whitelist_path;
@@ -5247,6 +5503,22 @@ void ParseVerifyEnv(SyncTestOptions* options, std::vector<Range>* ignore, Sink& 
       fail("REV3_RB_VERIFY_IGNORE " + ignore_path + ": " + error + "; nothing is ignored");
     else
       sink.Line(Format("NOTE verify ignores %zu range(s) from %s", ignore->size(), ignore_path.c_str()));
+  }
+}
+
+// REV3_RB_HASHCHECK=N (frames, default 0 = off): hash all of guest memory every Nth frame in the first run and in the resimulation (HASHCHECK lines).
+void ParseHashCheckEnv(SyncTestOptions* options, Sink& sink)
+{
+  const std::string text = GetEnv("REV3_RB_HASHCHECK");
+  if (text.empty())
+    return;
+  long value = 0;
+  if (ParseInt(text, &value) && value >= 0 && value <= 100000)
+    options->hash_check_every = static_cast<u32>(value);
+  else
+  {
+    sink.Line("ERROR REV3_RB_HASHCHECK=" + text + " is not 0..100000; the hash check is off");
+    ERROR_LOG_FMT(SLIPPI, "Rev3: REV3_RB_HASHCHECK={} is not 0..100000; the hash check is off", text);
   }
 }
 

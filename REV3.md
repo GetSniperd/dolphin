@@ -498,6 +498,50 @@ window), `GrowKeepingHistory` extends every valid slot and bumps the layout gene
 the growth almost always happens with history; a page first written during a resimulation is learned at the next `PollWrites` (deferred only when it cannot be extended); (f) netplay
 restores write the set pages only, and the set is page aligned, so they cause no faults of their own.
 
+## Desync region diff (`REV3_RB_HASHCHECK`, off by default)
+
+**What it answers.** Restore verify says whether a restore put memory back. This says whether the *resimulation* ended in the same memory as the
+first run, for ALL of guest memory and not only the snapshot set and the fighter fields (`Compare`). When a replay differs, the question
+that matters is where; the answer is a list of 4 KB pages, grouped by 64 KB region.
+
+**How it works.** `MemoryHasher` hashes every readable page of MEM1 + MEM2 (22528 pages, the same `HashPage` the page tracker uses; about 9 ms for
+the 88 MB, estimated from the measured 5-10 GB/s of `HashPage` on the sandbox VM; D's `hashcheck_ms=` in SUMMARY has the real cost) except the pages that overlap a skip range. With `REV3_RB_HASHCHECK=N` SyncTest
+hashes at capture when `frame % N == 0`, in the first run and again in the resimulation, and `HashCheck` compares the two page by page.
+Skipped, because the restore or the hardware deliberately leaves them alone or they differ between two visits of a frame: the hook region,
+`REV3_SYNCTEST_EXCLUDE`, the hardware cuts, `REV3_RB_VERIFY_IGNORE` and the dead stack below the hook's sp (the same `VerifyDeadStack` as
+restore verify). A page overlapping a skip range is skipped whole. Cost is one hash pass per hashed frame, twice per rollback; pick N so that
+it is not every frame (`N=30` is half a second apart).
+
+**Log lines**
+
+| Line | Meaning |
+|---|---|
+| `NOTE hash check on: every N frames ...` | at start |
+| `HASHCHECK frame=m ok compared=C skipped=S us=U` | the first 3 equal frames |
+| `HASHCHECK frame=m DIFF pages=p (in_set=a outside_set=b) compared=C regions64k=R [0xBASE:p,..] ranges=[0xS-0xE,..] last_equal_frame=L` | the first 30 differing frames. `in_set`: the page was rewound by the snapshot (nondeterminism inside the set, or a host thread); `outside_set`: nothing rewound it (a page the set misses, or memory the game does not reproduce by itself). At most 16 regions and 16 ranges are listed |
+| SUMMARY `hashcheck_compared= hashcheck_differ= hashcheck_last_equal_frame= hashcheck_first_diff_frame= hashcheck_pages= hashcheck_ms=` | only when on |
+
+**What D runs.** `set REV3_RB_HASHCHECK=30`, then `phase3.bat synctest --k 4` on a stage as for the other checks. Read it like this:
+`hashcheck_differ=0` means that every hashed frame ended in the same memory in the replay. Otherwise the `DIFF` lines name the pages;
+`outside_set` pages that recur in every line are either missing from the set (add them with `REV3_SNAPSHOT_INCLUDE`, or read them in
+the `VERIFY ... missing_pages` list) or are memory the game never reproduces by itself (timers, uninitialised scratch): those must be on the
+exclusion list of any hash two peers compare, and this run is how that list is found.
+
+**Netplay design (not built; merge notes for rev3-net).** On a desync (the existing checksum of the fighter fields disagrees) both peers
+send, at the desync frame f, the same three levels, each level only for what the previous one found different:
+1. `RegionHashes` of the frame: 1408 x 8 bytes = 11 KB. `DiffRegions` names the regions that differ (typically 1-5).
+2. The page hashes of those regions: 16 x 8 bytes per region. `DiffHashes` on the two vectors names the pages.
+3. The 32-byte block hashes of the differing pages (128 x 4 bytes per page), which needs the bytes of frame f on both peers: a per-frame
+   shadow (restore verify's `TakeShadow`) or the snapshot slot. Only worth it for the first desync of a session.
+Both peers must use the *same skip set*: a skip range that exists on one side only makes a region hash differ although nothing is wrong.
+Apply the exclusion list learned with `REV3_RB_HASHCHECK` to both. The three functions are pure (no Dolphin), so rev3-net can use them as
+they are; the parts to bring over are `MemoryHasher`, `MemoryHashes`, `DiffHashes`, `RegionHashes`, `DiffRegions`, `RegionBase` and the
+`HashMemory` / `HashCheck` pair in SyncTest (its `Capture` calls `HashMemory`; `Resim` calls `HashCheck` after `Compare`).
+
+**Tests.** `MemoryHasher*` (exact pages in MEM1 and MEM2, skip ranges, with and without a direct pointer, no MEM2, empty hashes, 64 KB regions) and
+`HashCheck*` (equal run, a page the whitelist misses is named as `outside_set`, a page in the set as `in_set`, exclusions / hardware cuts /
+ignore list / dead stack are left out, off by default).
+
 ## Freeze dump (`REV3_SYNCTEST_DUMP`, default on)
 
 Why: SyncTest replays gameplay exactly (`fields=0` on every resimulated frame) but the game freezes after about 40-60 rollbacks and the

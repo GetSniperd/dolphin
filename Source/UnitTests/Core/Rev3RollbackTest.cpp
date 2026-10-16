@@ -5325,3 +5325,195 @@ TEST(Rev3Rollback, RealWriteTrackingFallsBackWhenThereIsNoHandler)
   EXPECT_TRUE(LinesContain(sink, "NOTE write tracking not possible (no fault handler installed)", "hash scan"));
   EXPECT_GT(test.Stats().scans, 0u);
 }
+
+// ---- memory hash check (REV3_RB_HASHCHECK) ---------------------------------------------------------------------------------------
+
+TEST(Rev3Rollback, MemoryHasherHashesEveryPageAndNamesTheDifferingOnes)
+{
+  for (const bool peek : {true, false})  // with and without a direct host pointer (the Read() fallback)
+  {
+    FakeMemory mem(true);
+    mem.peek_enabled = peek;
+    MemoryHasher hasher(mem, FakeClock());
+    MemoryHashes a;
+    MemoryHashes b;
+    // A page is a whole 4 KB or nothing: a skip range of one byte takes page 0x80010000 out; a MEM2 range takes two pages.
+    const std::vector<Range> skip = {{0x80010800, 0x80010801}, {0x90004F00, 0x90005001}};
+    hasher.Hash(skip, &a);
+    EXPECT_EQ(a.hashed, 22528u - 3u) << "peek=" << peek;
+    EXPECT_EQ(a.skipped, 3u);
+    EXPECT_FALSE(a.Empty());
+    mem.SetU32(0x80020010, 1);     // MEM1
+    mem.SetU32(0x90001FFC, 2);     // MEM2, last word of a page
+    mem.SetU32(0x80010800, 3);     // inside the skipped page: not seen
+    mem.SetU32(0x90005000, 4);     // inside the skipped MEM2 page: not seen
+    hasher.Hash(skip, &b);
+    u32 compared = 0;
+    const std::vector<u32> differing = DiffHashes(a, b, &compared);
+    ASSERT_EQ(differing.size(), 2u);
+    EXPECT_EQ(differing[0], 0x80020000u);
+    EXPECT_EQ(differing[1], 0x90001000u);
+    EXPECT_EQ(compared, 22528u - 3u);
+    // The same bytes hash the same, whatever the page.
+    MemoryHashes c;
+    hasher.Hash(skip, &c);
+    EXPECT_TRUE(DiffHashes(b, c, nullptr).empty());
+    // 64 KB regions: region 2 of MEM1 (0x80020000) and region 384 (the first of MEM2).
+    const std::vector<u32> regions = DiffRegions(RegionHashes(a), RegionHashes(b));
+    ASSERT_EQ(regions.size(), 2u);
+    EXPECT_EQ(regions[0], 2u);
+    EXPECT_EQ(regions[1], 384u);
+    EXPECT_EQ(RegionBase(2), 0x80020000u);
+    EXPECT_EQ(RegionBase(384), 0x90000000u);
+    EXPECT_EQ(RegionHashes(a).size(), HASHCHECK_REGIONS);
+    EXPECT_TRUE(DiffRegions(RegionHashes(b), RegionHashes(c)).empty());
+  }
+}
+
+TEST(Rev3Rollback, MemoryHasherWithoutMem2AndEmptyHashes)
+{
+  FakeMemory mem(false);  // a GameCube: MEM2 is not readable
+  MemoryHasher hasher(mem, FakeClock());
+  MemoryHashes a;
+  hasher.Hash({}, &a);
+  EXPECT_EQ(a.hashed, 6144u);
+  EXPECT_EQ(a.skipped, 0u);
+  MemoryHashes none;
+  EXPECT_TRUE(none.Empty());
+  u32 compared = 99;
+  EXPECT_TRUE(DiffHashes(a, none, &compared).empty());
+  EXPECT_EQ(compared, 0u);
+  // A region with no hashed page has hash 0 and is never reported.
+  const std::vector<u64> r = RegionHashes(a);
+  EXPECT_NE(r[0], 0u);
+  EXPECT_EQ(r[384], 0u);
+  EXPECT_TRUE(DiffRegions(r, RegionHashes(none)).empty());
+}
+
+namespace
+{
+SyncTestOptions HashCheckOptions(SyncTestOptions o, u32 every)
+{
+  o.hash_check_every = every;
+  return o;
+}
+}  // namespace
+
+TEST(Rev3Rollback, HashCheckOfADeterministicGameIsEqual)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTest test(HashCheckOptions(AdaptiveOptions(2), 3), {}, game.Mem(), sink, FakeClock());
+  EXPECT_TRUE(sink.Contains("NOTE hash check on: every 3 frames"));
+  while (game.Counter() < 1500)
+    game.Frame(test);
+  while (test.Resimulating())
+    game.Frame(test);
+  ASSERT_TRUE(test.Active());
+  EXPECT_GT(test.Stats().hc_compared, 10u);
+  EXPECT_EQ(test.Stats().hc_differ, 0u);
+  EXPECT_GT(test.Stats().hc_last_equal_frame, 0u);
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u);
+  EXPECT_TRUE(sink.Contains("HASHCHECK frame="));
+  EXPECT_TRUE(sink.Contains(" ok compared="));
+  EXPECT_FALSE(sink.Contains("DIFF"));
+  // Only the first few equal frames are logged.
+  size_t ok_lines = 0;
+  for (const std::string& l : sink.lines)
+    ok_lines += l.find("HASHCHECK frame=") != std::string::npos ? 1 : 0;
+  EXPECT_EQ(ok_lines, static_cast<size_t>(HASHCHECK_MAX_OK_LOGS));
+  test.Finish();
+  EXPECT_TRUE(sink.Contains(" hashcheck_compared="));
+  EXPECT_TRUE(sink.Contains(" hashcheck_differ=0 "));
+  EXPECT_TRUE(sink.Contains(" hashcheck_first_diff_frame=0 "));
+}
+
+TEST(Rev3Rollback, HashCheckNamesThePageTheWhitelistMisses)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTest test(HashCheckOptions(Options(2), 2), WithFighters(game), game.Mem(), sink, FakeClock());
+  RunFrames(game, test, 150);
+  while (test.Resimulating())
+    game.Frame(test);
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u) << "the hidden counter does not feed the state in this game";
+  EXPECT_GT(test.Stats().hc_differ, 5u) << "the hidden counter outside the whitelist is not rewound, so every replay differs there";
+  EXPECT_EQ(test.Stats().hc_pages_total, test.Stats().hc_differ);
+  EXPECT_NE(test.Stats().hc_first_diff_frame, 0u);
+  EXPECT_TRUE(LinesContain(sink, "DIFF pages=1 (in_set=0 outside_set=1)", "regions64k=1 [0x80700000:1] ranges=[0x80700000-0x80701000]"));
+  EXPECT_EQ(sink.osd.size(), 1u) << "one on-screen message for the first differing frame";
+  test.Finish();
+  EXPECT_TRUE(sink.Contains(" hashcheck_first_diff_frame="));
+}
+
+TEST(Rev3Rollback, HashCheckCallsAPageInTheSetInSet)
+{
+  // The hidden counter is whitelisted this time, and a host thread "bumps" a word of it behind the game's back during every replayed frame.
+  FakeGame game(false);
+  FakeSink sink;
+  std::vector<Range> ranges = WithFighters(game);
+  ranges.push_back({HIDDEN, HIDDEN + 0x100});
+  SyncTest test(HashCheckOptions(Options(2), 1), ranges, game.Mem(), sink, FakeClock());
+  game.SetStepHook([&test](FakeMemory& mem, u32 frame) {
+    if (test.Resimulating())
+      mem.SetU32(HIDDEN + 0x80, frame);  // differs from the first run's value (0) in every replayed frame
+  });
+  RunFrames(game, test, 150);
+  EXPECT_GT(test.Stats().hc_differ, 5u);
+  EXPECT_TRUE(LinesContain(sink, "DIFF pages=1 (in_set=1 outside_set=0)", "ranges=[0x80700000-0x80701000]"));
+}
+
+TEST(Rev3Rollback, HashCheckLeavesOutExclusionsHardwareAndTheIgnoreList)
+{
+  for (int variant = 0; variant < 3; ++variant)
+  {
+    FakeGame game(false);
+    FakeSink sink;
+    FakeHardware hw;
+    SyncTest test(HashCheckOptions(Options(2), 1), WithFighters(game), game.Mem(), sink, FakeClock(), &hw);
+    if (variant == 0)
+      hw.list.push_back({"audio_dma", HIDDEN, HIDDEN + 0x1000});
+    else if (variant == 1)
+      test.SetUserExclusions({{HIDDEN, HIDDEN + 0x1000}}, {});
+    else
+      test.SetVerifyIgnore({{HIDDEN + 0x10, HIDDEN + 0x20}});
+    RunFrames(game, test, 150);
+    while (test.Resimulating())
+      game.Frame(test);
+    EXPECT_GT(test.Stats().hc_compared, 20u) << "variant " << variant;
+    EXPECT_EQ(test.Stats().hc_differ, 0u) << "variant " << variant << ": the page is not hashed";
+    EXPECT_FALSE(sink.Contains("DIFF")) << "variant " << variant;
+  }
+}
+
+TEST(Rev3Rollback, HashCheckLeavesOutTheDeadStack)
+{
+  // Garbage below the hook's sp (the dead part of the stack) changes between two visits of a frame: not a difference.
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTest test(HashCheckOptions(Options(2), 1), WithFighters(game), game.Mem(), sink, FakeClock());
+  game.SetStepHook([](FakeMemory& mem, u32) {
+    constexpr u32 DEAD = SP - 0x2000 - 0x800;  // a page below the sp window, within the default 0x4000 bytes below sp
+    mem.SetU32(DEAD, mem.U32(DEAD) + 1);       // counts on in every visit, rewound or not
+  });
+  game.Mem().SetU32(HIDDEN, 0);
+  RunFrames(game, test, 150);
+  while (test.Resimulating())
+    game.Frame(test);
+  // The hidden counter's page still differs (2 pages never, 1 page here), the dead stack pages do not.
+  EXPECT_TRUE(LinesContain(sink, "DIFF pages=1 (in_set=0 outside_set=1)", "ranges=[0x80700000-0x80701000]"));
+  EXPECT_FALSE(LinesContain(sink, "DIFF pages=2", ""));
+}
+
+TEST(Rev3Rollback, HashCheckIsOffByDefault)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTest test(Options(2), WithFighters(game), game.Mem(), sink, FakeClock());
+  RunFrames(game, test, 100);
+  test.Finish();
+  EXPECT_EQ(test.Stats().hc_compared, 0u);
+  EXPECT_FALSE(sink.Contains("HASHCHECK"));
+  EXPECT_FALSE(sink.Contains("hashcheck_"));
+  EXPECT_FALSE(sink.Contains("hash check on"));
+}

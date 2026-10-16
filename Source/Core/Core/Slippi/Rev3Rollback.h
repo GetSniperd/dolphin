@@ -52,6 +52,8 @@
 //                            snapshot history; 2 = also keep the hash scan and report every page it finds that no fault announced
 //                            ("WRITE TRACK MISS"). Also REV3_RB_DIRTY_LOG=N (name the first N dirty pages with the pc / lr of the store) and
 //                            REV3_RB_WRITE_TRACK_REARM=N (equal rewrites before a page is learned anyway, default 4). REV3.md "Host write tracking"
+//   REV3_RB_HASHCHECK=N      every Nth frame hash ALL of guest memory (4 KB pages) in the first run and again in the resimulation and name the pages that
+//                            differ (HASHCHECK lines; REV3.md "Desync region diff"): state the set misses, or memory the game does not reproduce by itself
 //   SyncTest only runs once armed (both fighters found through the TEAMS pointers); menus and loading screens are never
 //   rolled back. See REV3.md for what a clean run looks like.
 //
@@ -667,6 +669,55 @@ bool VerifyEveryCanHit(u32 every_p, u32 k, u32 sync_every);
 // frames later).
 u32 AutoVerifyEvery(u32 k, u32 sync_every);
 
+// ---- memory hash check (REV3_RB_HASHCHECK) -----------------------------------------------------------------------------------
+// "Is ALL of guest memory at frame m the same in the resimulation as in the first run?" Compare() only looks at the snapshot set and the
+// fighter fields; this looks at every page. MemoryHashes is one 64-bit hash per 4 KB page of MEM1 + MEM2 (22528 pages; ~9 ms for 88 MB), minus
+// the pages that overlap a skip range. SyncTest hashes every `every`-th frame at capture time, in the first run and again in the resimulation,
+// and names the pages whose hashes differ (HASHCHECK lines). Pages outside the set that differ are state the snapshot misses or memory the game
+// does not reproduce by itself (timers, uninitialised scratch): the second kind must be left out of any hash two peers compare. The same
+// structure is the first level of the netplay desync diff (REV3.md "Desync region diff"): RegionHashes() folds the page hashes into one hash
+// per 64 KB region (1408 of them, 11 KB on the wire); DiffHashes() on two page-hash vectors names the pages.
+constexpr u32 HASHCHECK_REGION_BYTES = 0x10000;                              // a region is 64 KB = 16 pages
+constexpr size_t HASHCHECK_REGIONS = (0x1800000u + 0x4000000u) / HASHCHECK_REGION_BYTES;  // 384 + 1024 = 1408
+constexpr u32 HASHCHECK_MAX_OK_LOGS = 3;      // equal frames that get a line
+constexpr u32 HASHCHECK_MAX_DIFF_LOGS = 30;   // differing frames that get the full HASHCHECK lines
+constexpr u32 HASHCHECK_MAX_REGIONS_LISTED = 16;
+constexpr u32 HASHCHECK_MAX_RANGES_LISTED = 16;
+
+struct MemoryHashes
+{
+  std::vector<u64> page;   // TRACKED_PAGES entries, MEM1 pages first; meaningful where valid[i] != 0
+  std::vector<u8> valid;   // 1 = hashed, 0 = skipped (overlaps a skip range) or not readable
+  u32 frame = 0;           // the frame the hashes were taken at
+  u32 hashed = 0;          // pages hashed (0: these hashes are not valid)
+  u32 skipped = 0;         // pages left out
+  u64 us = 0;              // time to hash (microseconds)
+  bool Empty() const { return hashed == 0; }
+};
+
+class MemoryHasher
+{
+public:
+  explicit MemoryHasher(GuestMemory& memory, std::function<u64()> micros = {});
+  // Hashes every readable page that does not overlap `skip` into *out (allocated on first use). A page is a whole 4 KB or nothing: a skip range
+  // of one byte takes its whole page out of the comparison.
+  void Hash(const std::vector<Range>& skip, MemoryHashes* out);
+
+private:
+  GuestMemory& m_memory;
+  std::function<u64()> m_micros;
+  std::vector<u8> m_buf;
+};
+
+// Addresses of the pages (ascending) that were hashed in both and differ; *compared = pages hashed in both.
+std::vector<u32> DiffHashes(const MemoryHashes& a, const MemoryHashes& b, u32* compared);
+// One hash per 64 KB region: the page hashes of its valid pages folded in order (a region without a valid page gets 0).
+std::vector<u64> RegionHashes(const MemoryHashes& hashes);
+// Regions (indexes into RegionHashes) in which `a` and `b` differ, ascending; regions where either side has no valid page are not listed.
+std::vector<u32> DiffRegions(const std::vector<u64>& a, const std::vector<u64>& b);
+// Address of the first byte of region `index` (MEM1 regions first).
+u32 RegionBase(size_t index);
+
 // ---- host write tracking (REV3_RB_WRITE_TRACK) ----------------------------------------------------------------------------------
 // The adaptive snapshot set finds the pages that change by hashing (a page is noticed up to one scan cycle after its first change). A
 // WriteWatch knows it at the moment of the first write: every guest page that is not (fully) in the snapshot set is write-protected in every
@@ -758,6 +809,8 @@ struct SyncTestOptions
   u32 write_track = 0;            // REV3_RB_WRITE_TRACK: 0 = off, 1 = learn pages from write faults (SetWriteWatch) instead of hashing, 2 = faults
                                   // AND the hash scan (every page the scan finds that the faults missed is a "WRITE TRACK MISS"); needs adaptive
   u32 dirty_log = 0;              // REV3_RB_DIRTY_LOG=N: log the first N dirty pages of each hook call with the guest pc / lr of the store (pages)
+  u32 hash_check_every = 0;       // REV3_RB_HASHCHECK=N: hash all of guest memory (MemoryHasher) when frame % N == 0, in the first run and in the resimulation,
+                                  // and name the pages that differ (frames, 0 = off; about 9 ms per hashed frame)
   u32 write_track_rearm_max = 4;  // REV3_RB_WRITE_TRACK_REARM=N: a page found unchanged after a write this many times is learned anyway (count);
                                   // it is rewritten with identical bytes every frame and each re-arm costs a fault, so its 4 KB are cheaper
 };
@@ -840,6 +893,13 @@ struct SyncTestStats
   u64 wt_poll_us_total = 0;       // time in PollWrites (microseconds)
   u64 wt_poll_us_max = 0;
   size_t snapshot_bytes_max = 0;  // largest snapshot (bytes)
+  // memory hash check (REV3_RB_HASHCHECK)
+  u32 hc_compared = 0;            // frames whose resimulated memory was compared with the first run
+  u32 hc_differ = 0;              // ... of which with at least one differing page
+  u32 hc_last_equal_frame = 0;    // latest frame that compared equal (0: none yet)
+  u32 hc_first_diff_frame = 0;    // first frame that differed (0: none yet)
+  u64 hc_pages_total = 0;         // differing pages summed over the frames
+  u64 hc_us_total = 0;            // time spent hashing (microseconds)
 };
 
 class SyncTest
@@ -888,6 +948,9 @@ public:
   // "VERIFY summary ..." (the end-of-run line); only call with verify on.
   std::string VerifySummaryText() const;
   const std::vector<Range>& VerifyExtraRanges() const { return m_verify_extra; }
+
+  // " hashcheck_compared=.. hashcheck_differ=.. hashcheck_last_equal_frame=.. hashcheck_first_diff_frame=.." appended to SUMMARY lines; empty when off.
+  std::string HashCheckStatsFields() const;
 
   // Host write tracking (REV3_RB_WRITE_TRACK; REV3.md "Host write tracking"). `watch` is not owned and must outlive this object; null (the
   // default) or options.write_track == 0 leaves the hash scan in charge. Call before the first command.
@@ -940,6 +1003,7 @@ private:
     std::array<PadBytes, 2> inputs{};
     bool timebase_valid = false;
     u64 timebase = 0;                                       // emulated time base at capture (only with restore_timebase)
+    MemoryHashes hashes;                                    // REV3_RB_HASHCHECK: all-memory page hashes of this frame (Empty() when not hashed)
     struct Audio
     {
       bool valid = false;
@@ -996,6 +1060,9 @@ private:
   // the live memory of pages that were not written since they were armed. False when a page has neither (the caller clears the history).
   bool GrowKeepingHistory(const std::vector<Range>& ranges, const std::vector<DirtyPage>& dirty);
   void LogLearnedGrowth(const char* history, bool late);
+  // REV3_RB_HASHCHECK: hash all memory into the slot at capture, and compare the reference with the resimulated frame's hashes.
+  void HashMemory(Slot& slot, const Command& command);
+  void HashCheck(const Slot& reference, const Slot& live, u32 frame);
   // "0xSTART-0xEND" of the current snapshot range that holds [addr, addr + 4); empty when none does.
   std::string RangeContaining(u32 addr) const;
   // Same, plus the slot's stack window ("stack_window 0x..-0x.."); empty when none holds it.
@@ -1015,6 +1082,9 @@ private:
   bool m_watch_failed = false;                  // "not possible" was logged: the hash scan does the learning
   std::vector<u8> m_page_buf;                   // one page of live memory (PollWrites)
   u32 m_dirty_logged = 0;                       // DIRTY lines written (limit options.dirty_log)
+  std::unique_ptr<MemoryHasher> m_hasher;       // null = hash check off
+  u32 m_hc_diff_logs = 0;
+  u32 m_hc_ok_logs = 0;
   std::vector<Range> m_verify_ignore;           // REV3_RB_VERIFY_IGNORE: never compared
   std::vector<Range> m_verify_extra;            // pages the heal found missing: part of every ComputeRanges() from then on
   bool m_verify_dirty = false;                  // m_verify_extra has pages the current layout (m_ranges) lacks
@@ -1205,6 +1275,9 @@ void ParseVerifyEnv(SyncTestOptions* options, std::vector<Range>* ignore, Sink& 
 // write_track_rearm_max; problems are logged to `sink` as ERROR lines and tracking stays off. Needs options->adaptive already set. The caller
 // then gives SyncTest a DolphinWriteWatch (SetWriteWatch). Defined in the Dolphin glue.
 void ParseWriteTrackEnv(SyncTestOptions* options, Sink& sink);
+
+// Reads REV3_RB_HASHCHECK (frames, 0 = off) into options->hash_check_every. Defined in the Dolphin glue.
+void ParseHashCheckEnv(SyncTestOptions* options, Sink& sink);
 
 // Writes the final summary and closes the log; the next command starts a fresh session. Safe to call any time.
 void Shutdown();
