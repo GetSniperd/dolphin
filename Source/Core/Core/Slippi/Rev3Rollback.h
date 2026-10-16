@@ -662,6 +662,71 @@ bool VerifyEveryCanHit(u32 every_p, u32 k, u32 sync_every);
 // frames later).
 u32 AutoVerifyEvery(u32 k, u32 sync_every);
 
+// ---- host write tracking (REV3_RB_WRITE_TRACK) ----------------------------------------------------------------------------------
+// The adaptive snapshot set finds the pages that change by hashing (a page is noticed up to one scan cycle after its first change). A
+// WriteWatch knows it at the moment of the first write: every guest page that is not (fully) in the snapshot set is write-protected in every
+// host view of guest RAM, the first write to it faults, the fault handler copies the page's contents as they were BEFORE the write (the
+// "preimage") and lets the write go on. Because a watched page was not written since it was armed, its contents in every snapshot slot
+// taken since then equal the preimage, so the page can join the snapshot set WITHOUT dropping the history (SyncTest::GrowSetKeepingHistory
+// back-fills the slots from the preimages). Implementations: Rev3::WriteTracker (Rev3WriteTrack.h, protects host memory pages) and the fakes
+// of the unit tests. All calls but the fault handler run on the CPU thread.
+struct DirtyPage
+{
+  u32 addr = 0;                    // guest address of the 4 KB page
+  const u8* preimage = nullptr;    // the page as it was when it was last clean (PAGE_SIZE bytes), valid until Rearm / Release of this page
+  u32 pc = 0;                      // guest pc / lr at the first write, when the CPU thread wrote it (pc = start of the JIT block that holds the
+  u32 lr = 0;                      // store, within a few dozen instructions; lr is exact), else 0
+  bool cpu_thread = false;         // the CPU thread did the first write (false: GPU / DSP / IOS / a savestate load)
+  u32 equal_rearms = 0;            // how often this page was found unchanged after a write and armed again
+};
+
+struct WriteWatchStats
+{
+  u64 faults = 0;            // first writes to watched pages (each costs one signal + a 4 KB copy + one protection change per host view)
+  u64 stale_faults = 0;      // faults on pages already released (a second thread racing the first, or a view that was remapped)
+  u64 protect_calls = 0;     // VirtualProtect / mprotect calls
+  u64 pages_protected = 0;   // pages made read-only (arming and re-arming)
+  u64 protect_us = 0;        // time in those calls (microseconds): the arm time
+  u64 rearms = 0;            // pages found unchanged after a write and armed again
+  u64 rearm_changed = 0;     // re-arms that found the page changed meanwhile (a write that raced the check)
+  u64 polls = 0;
+  u64 poll_us = 0;           // time in Poll (microseconds)
+  u32 watched_pages = 0;     // pages armed or dirty right now
+  u32 views = 0;             // host views registered
+  u32 restarts = 0;          // times the view list changed while watching (everything was dropped and made writable)
+  u64 protect_errors = 0;    // protection calls that failed (an address range that is no longer mapped, or out of kernel memory areas)
+};
+
+class WriteWatch
+{
+public:
+  virtual ~WriteWatch() = default;
+  // One line saying what is watching (logged at start), e.g. "host page protection, 7 views".
+  virtual std::string Describe() const { return {}; }
+  // Watch every page that has a host view and is not FULLY inside `keep` (sorted, merged ranges). Pages already watched stay as they are
+  // (a page that is dirty stays dirty until the caller re-arms or releases it); pages that became fully inside `keep` are released. False
+  // (and *why) when watching is not possible; nothing stays protected then.
+  virtual bool SetWatched(const std::vector<Range>& keep, std::string* why) = 0;
+  // Stops watching: every page writable again, all dirty marks dropped.
+  virtual void Stop() = 0;
+  // The pages written since they were armed and not yet re-armed or released, ascending. Not re-armed by this call.
+  virtual void Poll(std::vector<DirtyPage>* out) = 0;
+  // The caller found these pages unchanged (equal to their preimage): protect them again. Returns the pages that turned out changed after
+  // all (a write raced the check); those stay dirty.
+  virtual std::vector<u32> Rearm(const std::vector<u32>& pages) = 0;
+  // These pages joined the snapshot set (or were cut by a hardware exclusion): no longer watched, writable.
+  virtual void Release(const std::vector<u32>& pages) = 0;
+  // The page is watched and was not written since it was armed: its current contents are its contents at every time since then.
+  virtual bool IsClean(u32 page_addr) const = 0;
+  // True while watching. False after Stop(), and when the host views changed under a running watch (everything was made writable and
+  // forgotten; the caller starts again with SetWatched and treats the history as unproven).
+  virtual bool Active() const = 0;
+  virtual WriteWatchStats Stats() const = 0;
+  // Writes a byte back to a watched page and checks that the write faulted; call right after SetWatched succeeded. False (and *why): write
+  // tracking does not work here.
+  virtual bool SelfTest(std::string* why) { (void)why; return true; }
+};
+
 // ---- SyncTest -------------------------------------------------------------------------------------------------------------
 struct SyncTestOptions
 {
@@ -685,6 +750,11 @@ struct SyncTestOptions
   u32 ef_check_restores = 200;    // REV3_EFCHECK: restores (count, not frames) that get the ef list check before / after the write-back;
                                   // 0 = off, EF_CHECK_ALL = every restore. 200 restores = 200 checks of a few thousand reads each (microseconds)
   VerifyOptions verify;           // REV3_RB_VERIFY*: shadow copy of guest memory and a full comparison after restores (see "restore verify" above)
+  u32 write_track = 0;            // REV3_RB_WRITE_TRACK: 0 = off, 1 = learn pages from write faults (SetWriteWatch) instead of hashing, 2 = faults
+                                  // AND the hash scan (every page the scan finds that the faults missed is a "WRITE TRACK MISS"); needs adaptive
+  u32 dirty_log = 0;              // REV3_RB_DIRTY_LOG=N: log the first N dirty pages of each hook call with the guest pc / lr of the store (pages)
+  u32 write_track_rearm_max = 4;  // REV3_RB_WRITE_TRACK_REARM=N: a page found unchanged after a write this many times is learned anyway (count);
+                                  // it is rewritten with identical bytes every frame and each re-arm costs a fault, so its 4 KB are cheaper
 };
 
 constexpr u32 EF_CHECK_ALL = 0xFFFFFFFFu;  // SyncTestOptions::ef_check_restores: check every restore
@@ -703,6 +773,8 @@ public:
   PageTracker(GuestMemory& memory, u32 slices);
   void Reset();                                   // forget every hash, dynamic mark and cycle (fighters lost: a new match)
   u32 Scan();                                     // hash the next slice; returns how many pages just became dynamic
+  void SkipSlice();                               // advance the slice / cycle counters without hashing (write tracking found the pages)
+  bool MarkDynamic(u32 addr);                     // the page holding addr changed (write tracking saw it); true when it was not dynamic yet
   void InvalidateBaseline(const std::vector<Range>& ranges);  // a restore rewrote these: their old hashes mean nothing
   void AppendDynamicRanges(std::vector<Range>* out) const;    // dynamic pages, adjacent ones merged
   u32 Cycles() const { return m_cycles; }         // completed scan cycles (a cycle = `slices` Scan() calls)
@@ -750,6 +822,19 @@ struct SyncTestStats
   u32 layout_refused = 0;         // restores refused because the snapshot was taken under another snapshot layout
   u32 late_learn_rollbacks = 0;   // rollbacks done within one scan cycle before pages were learned (those pages were not rewound)
   u32 verify_pages_added = 0;     // pages the restore verify (heal) added to the snapshot set
+  // host write tracking (SetWriteWatch)
+  u32 wt_arms = 0;                // times tracking was started (a match, or a restart after the views changed)
+  u32 wt_pages_learned = 0;       // pages learned from write faults (changed, or rewritten equal wt_rearm_max times)
+  u32 wt_equal_rearms = 0;        // dirty pages found unchanged and armed again
+  u32 wt_promoted_equal = 0;      // pages learned only because they were rewritten with equal bytes too often
+  u32 wt_grown_kept = 0;          // growths that kept the snapshot history (the slots were extended from the preimages)
+  u32 wt_grown_cleared = 0;       // growths that had to clear the history (a baseline was missing)
+  u32 wt_restarts = 0;            // tracking restarted because the host views changed
+  u32 wt_misses = 0;              // REV3_RB_WRITE_TRACK=2: pages the hash scan found that no fault announced
+  u32 wt_deferred = 0;            // growths postponed until the end of a resimulation
+  u64 wt_poll_us_total = 0;       // time in PollWrites (microseconds)
+  u64 wt_poll_us_max = 0;
+  size_t snapshot_bytes_max = 0;  // largest snapshot (bytes)
 };
 
 class SyncTest
@@ -798,6 +883,14 @@ public:
   // "VERIFY summary ..." (the end-of-run line); only call with verify on.
   std::string VerifySummaryText() const;
   const std::vector<Range>& VerifyExtraRanges() const { return m_verify_extra; }
+
+  // Host write tracking (REV3_RB_WRITE_TRACK; REV3.md "Host write tracking"). `watch` is not owned and must outlive this object; null (the
+  // default) or options.write_track == 0 leaves the hash scan in charge. Call before the first command.
+  void SetWriteWatch(WriteWatch* watch) { m_watch = watch; }
+  bool WriteTrackingOn() const { return m_watching; }
+  // "SNAPSHOT kind=write_track|adaptive|classic last=.. MB max=.. MB pages=.. of watched=.. faults=.. arms=.. | restores checked=.. wrong=..
+  // blocks=.. first_wrong_frame=.. shadow_ms=.." (also written after every SUMMARY line).
+  std::string SnapshotLine() const;
 
   // Writes the final summary line (once). The destructor does not.
   void Finish();
@@ -887,6 +980,17 @@ private:
   // Installs the pages the heal added (m_verify_extra) into the layout: new set, relayout, history cleared. SyncTest only, never mid-resim.
   void ApplyVerifyPages();
   bool Arm(const Command& command, const std::array<u32, 2>& fighters);
+  // ---- host write tracking, SyncTest side ----
+  // Everything the watch must not guard: the snapshot set plus every cut (hook region, user and hardware exclusions), merged.
+  std::vector<Range> KeepRanges() const;
+  void WatchStart(const char* why);
+  void WatchStop(const char* why);
+  void WatchRefresh();                               // the set or the cuts grew: release the pages that became fully covered
+  void PollWrites();                                 // dirty pages -> learn (growing the set) or arm again; once per hook call, before captures
+  // The set grew to `ranges` (a superset of m_ranges): extend every valid slot, filling the new bytes from the preimages in `dirty` or from
+  // the live memory of pages that were not written since they were armed. False when a page has neither (the caller clears the history).
+  bool GrowKeepingHistory(const std::vector<Range>& ranges, const std::vector<DirtyPage>& dirty);
+  void LogLearnedGrowth(const char* history, bool late);
   // "0xSTART-0xEND" of the current snapshot range that holds [addr, addr + 4); empty when none does.
   std::string RangeContaining(u32 addr) const;
   // Same, plus the slot's stack window ("stack_window 0x..-0x.."); empty when none holds it.
@@ -901,6 +1005,11 @@ private:
   std::vector<PtrExclusion> m_include_ptrs;     // REV3_SNAPSHOT_INCLUDE pointer entries (resolved at arm)
   std::vector<Range> m_forced;                  // resolved at the latest arm: ef pool + the user entries, merged
   std::unique_ptr<RestoreVerifier> m_verify;    // null = restore verify off (options.verify.restores == 0)
+  WriteWatch* m_watch = nullptr;                // null = no write tracking
+  bool m_watching = false;                      // tracking is on (SetWatched succeeded and Stop() has not been called)
+  bool m_watch_failed = false;                  // "not possible" was logged: the hash scan does the learning
+  std::vector<u8> m_page_buf;                   // one page of live memory (PollWrites)
+  u32 m_dirty_logged = 0;                       // DIRTY lines written (limit options.dirty_log)
   std::vector<Range> m_verify_ignore;           // REV3_RB_VERIFY_IGNORE: never compared
   std::vector<Range> m_verify_extra;            // pages the heal found missing: part of every ComputeRanges() from then on
   bool m_verify_dirty = false;                  // m_verify_extra has pages the current layout (m_ranges) lacks

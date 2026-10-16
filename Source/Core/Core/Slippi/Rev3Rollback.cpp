@@ -550,6 +550,21 @@ std::vector<Range> PadRanges(std::vector<Range> ranges, u32 pad_bytes)
   return MergeRanges(std::move(ranges));
 }
 
+// Every range grown to whole 4 KB pages (start rounded down, end rounded up, merged). Used for the snapshot set when write tracking is on:
+// a page is then either wholly in the set or wholly out of it, so no watched page needs a partial comparison.
+static std::vector<Range> PageAlignRanges(std::vector<Range> ranges)
+{
+  for (Range& r : ranges)
+  {
+    if (r.end <= r.start)
+      continue;
+    r.start &= ~(PAGE_SIZE - 1);
+    r.end = static_cast<u32>(std::min<u64>((static_cast<u64>(r.end) + PAGE_SIZE - 1) & ~static_cast<u64>(PAGE_SIZE - 1),
+                                           InMem2(r.start) ? MEM2_END : MEM1_END));
+  }
+  return MergeRanges(std::move(ranges));
+}
+
 // ---- (3) the fighter field table ------------------------------------------------------------------------------------------
 
 // rev3-mod rbchecksum.py FIELDS (FIELDS_VERSION 1, fields_digest 0xD4076EF2), same order.
@@ -692,6 +707,27 @@ u32 PageTracker::Scan()
     ++m_cycles;
   }
   return added;
+}
+
+void PageTracker::SkipSlice()
+{
+  m_has_state = true;
+  if (++m_slice >= m_slices)
+  {
+    m_slice = 0;
+    ++m_cycles;
+  }
+}
+
+bool PageTracker::MarkDynamic(u32 addr)
+{
+  const size_t i = PageIndex(addr);
+  if (i >= TRACKED_PAGES || (m_state[i] & PAGE_DYNAMIC) != 0)
+    return false;
+  m_has_state = true;
+  m_state[i] |= PAGE_DYNAMIC;
+  ++m_dynamic;
+  return true;
 }
 
 void PageTracker::InvalidateBaseline(const std::vector<Range>& ranges)
@@ -1074,6 +1110,9 @@ SyncTest::SyncTest(const SyncTestOptions& options, std::vector<Range> ranges, Gu
   m_options.k = std::clamp(m_options.k, 1, 8);
   m_options.every = std::max(m_options.every, 1);
   m_options.hardware_check_every = std::max<u32>(m_options.hardware_check_every, 1);
+  if (!m_options.adaptive)
+    m_options.write_track = 0;  // the tracking feeds the page tracker; the classic whitelist mode has none
+  m_options.write_track_rearm_max = std::clamp<u32>(m_options.write_track_rearm_max, 1, 200);
   m_span.resize(FIELD_SPAN_HI - FIELD_SPAN_LO);
 
   // k + 1 slots plus the scratch slot used while comparing a resimulated frame. RebuildLayout sizes them for the current ranges
@@ -1157,6 +1196,8 @@ std::vector<Range> SyncTest::ComputeRanges(const std::vector<Range>& forced) con
         all.push_back({m_set_sp, std::min<u32>(m_set_sp + m_options.stack_window, region_end)});
     }
     all = MergeRanges(std::move(all));
+    if (m_options.write_track != 0 && m_watch != nullptr)
+      all = PageAlignRanges(std::move(all));  // fighter tails, the stack window and forced ranges grow to whole pages (a few pages in all)
   }
   SubtractRange(&all, HOOK_REGION_START, HOOK_REGION_END);
   for (const Range& r : m_user_exclusions)
@@ -1272,6 +1313,7 @@ void SyncTest::RebuildLayout()
     m_ranges_bytes += r.end - r.start;
   }
   m_snapshot_bytes = m_ranges_bytes + m_options.stack_window;
+  m_stats.snapshot_bytes_max = std::max(m_stats.snapshot_bytes_max, m_snapshot_bytes);
   for (Slot& s : m_ring)
   {
     s.valid = false;
@@ -1322,6 +1364,7 @@ void SyncTest::RefreshExclusions(bool at_arm)
     m_hardware->Query(&found);
   ResolvePtrExclusions(&found);
   bool layout_changed = false;
+  bool cuts_added = false;
   for (const Exclusion& e : found)
   {
     if (e.end <= e.start)
@@ -1332,6 +1375,7 @@ void SyncTest::RefreshExclusions(bool at_arm)
     if (known)
       continue;
     m_exclusions_logged.push_back(e);
+    cuts_added = true;
     std::vector<Range> probe = m_ranges;  // how much of the current set the region takes away
     const u64 removed = SubtractRange(&probe, e.start, e.end);
     layout_changed = layout_changed || removed != 0;
@@ -1345,10 +1389,15 @@ void SyncTest::RefreshExclusions(bool at_arm)
     }
   }
   if (!layout_changed)
+  {
+    if (cuts_added)
+      WatchRefresh();  // the new cuts take pages away from the watch too
     return;
+  }
   m_ranges = ComputeRanges();  // the new cuts are part of m_exclusions_logged now
   RebuildLayout();
   ClearHistory();
+  WatchRefresh();
   m_sink.Line(Format("NOTE snapshot now ranges=%zu bytes=%zu snapshot_bytes=%zu (history cleared, frame %u)", m_ranges.size(),
                      m_ranges_bytes, m_snapshot_bytes, m_last_frame));
   if (m_armed && !at_arm)
@@ -1980,6 +2029,7 @@ void SyncTest::SummaryLine(const char* tag)
                      static_cast<unsigned long long>(m_stats.audio_us_max), m_stats.ef_checks, m_stats.ef_bad, m_stats.ef_bad_before,
                      m_stats.layout_refused, m_stats.late_learn_rollbacks) +
               VerifyStatsFields());
+  m_sink.Line(SnapshotLine());
 }
 
 // Pages that entered the set after the first arm: the part of `after` that `before` lacks goes to the all-time list (merged) and to the
@@ -2044,15 +2094,21 @@ void SyncTest::LearnWhileArmed(u32 added)
   const bool late = m_last_restore_call != 0 && m_armed_calls - m_last_restore_call <= m_tracker.Slices();
   if (late)
     ++m_stats.late_learn_rollbacks;
-  // Rate limit: the first 10 growths are logged, then at most one line per 300 armed calls (with the pages learned since).
+  LogLearnedGrowth("cleared", late);
+}
+
+// The `NOTE learned` line of a growth (rate limited: the first 10 growths are logged, then at most one line per 300 armed calls, with the
+// pages learned since). history = "cleared" (the slots were dropped) or "kept" (write tracking extended them).
+void SyncTest::LogLearnedGrowth(const char* history, bool late)
+{
   if (m_learn_logs < MAX_LEARN_LOGS || m_armed_calls - m_learn_log_call >= LEARN_LOG_EVERY)
   {
     ++m_learn_logs;
     m_learn_log_call = m_armed_calls;
     // Every range learned since the previous such line (rate limiting must not hide pages), merged, at most MAX_LEARN_LIST_RANGES named.
     const std::string where = FormatRangeList(m_learned_unlogged_ranges, MAX_LEARN_LIST_RANGES);
-    m_sink.Line(Format("NOTE learned +%u pages (now ranges=%zu bytes=%zu) frame %u, history cleared; new=[%s]%s", m_learned_unlogged,
-                       m_ranges.size(), m_ranges_bytes, m_last_frame, where.c_str(),
+    m_sink.Line(Format("NOTE learned +%u pages (now ranges=%zu bytes=%zu) frame %u, history %s; new=[%s]%s", m_learned_unlogged,
+                       m_ranges.size(), m_ranges_bytes, m_last_frame, history, where.c_str(),
                        late ? " WARNING a rollback ran within the last scan cycle without these pages" : ""));
     m_sink.Line(Format("NOTE snapshot now ranges=%zu bytes=%zu snapshot_bytes=%zu slots=%zu", m_ranges.size(), m_ranges_bytes,
                        m_snapshot_bytes, m_ring.size()));
@@ -2061,6 +2117,376 @@ void SyncTest::LearnWhileArmed(u32 added)
     if (m_learn_logs == MAX_LEARN_LOGS)
       m_sink.Line(Format("NOTE further learning is logged at most every %u hook calls", LEARN_LOG_EVERY));
   }
+}
+
+// ---- host write tracking: the SyncTest side ---------------------------------------------------------------------------------
+// See Rev3Rollback.h "host write tracking" and REV3.md. The watch guards every page that is not fully inside the snapshot set or a cut; the
+// first write to such a page announces itself, and PollWrites (once per hook call, BEFORE the call's capture) either learns the page (the
+// set grows, the snapshot history stays) or arms it again when the write left it unchanged.
+
+namespace
+{
+constexpr u32 WT_PAGE_MASK = PAGE_SIZE - 1;
+
+// Pages that a range only partly covers at its start or end (they are watched although they hold set bytes).
+size_t EdgePageCount(const std::vector<Range>& keep)
+{
+  std::vector<u32> pages;
+  for (const Range& r : keep)
+  {
+    if ((r.start & WT_PAGE_MASK) != 0)
+      pages.push_back(r.start & ~WT_PAGE_MASK);
+    if ((r.end & WT_PAGE_MASK) != 0)
+      pages.push_back((r.end - 1) & ~WT_PAGE_MASK);
+  }
+  std::sort(pages.begin(), pages.end());
+  return static_cast<size_t>(std::unique(pages.begin(), pages.end()) - pages.begin());
+}
+}  // namespace
+
+std::vector<Range> SyncTest::KeepRanges() const
+{
+  std::vector<Range> all = ComputeRanges();
+  all.push_back({HOOK_REGION_START, HOOK_REGION_END});
+  for (const Range& r : m_user_exclusions)
+    all.push_back(r);
+  for (const Exclusion& e : m_exclusions_logged)
+    all.push_back({e.start, e.end});
+  return MergeRanges(std::move(all));
+}
+
+void SyncTest::WatchStart(const char* why)
+{
+  if (m_watch == nullptr || m_options.write_track == 0 || m_watching || m_watch_failed)
+    return;
+  const u64 t0 = m_micros();
+  const std::vector<Range> keep = KeepRanges();
+  std::string reason;
+  if (!m_watch->SetWatched(keep, &reason) || !m_watch->SelfTest(&reason))
+  {
+    m_watch->Stop();
+    m_watch_failed = true;
+    m_sink.Line(Format("NOTE write tracking not possible (%s): learning pages by hash scan from here", reason.c_str()));
+    return;
+  }
+  m_watching = true;
+  ++m_stats.wt_arms;
+  const WriteWatchStats st = m_watch->Stats();
+  m_sink.Line(Format("NOTE write tracking armed (%s)%s: %u pages watched, %zu edge pages (learned on their first write), rearm_max=%u, "
+                     "%.1f ms",
+                     m_watch->Describe().c_str(), why, st.watched_pages, EdgePageCount(keep), m_options.write_track_rearm_max,
+                     static_cast<double>(m_micros() - t0) / 1000.0));
+  if (m_options.write_track == 2)
+    m_sink.Line("NOTE write tracking verify mode: the hash scan keeps running; a page it finds that no fault announced is a WRITE TRACK MISS");
+}
+
+void SyncTest::WatchStop(const char* why)
+{
+  if (!m_watching)
+    return;
+  m_watching = false;
+  m_watch->Stop();
+  m_sink.Line(Format("NOTE write tracking off (%s)", why));
+}
+
+void SyncTest::WatchRefresh()
+{
+  if (!m_watching)
+    return;
+  std::string reason;
+  if (!m_watch->SetWatched(KeepRanges(), &reason))
+  {
+    m_sink.Line(Format("NOTE write tracking lost (%s): learning pages by hash scan from here", reason.c_str()));
+    m_watch->Stop();
+    m_watching = false;
+    m_watch_failed = true;
+  }
+}
+
+bool SyncTest::GrowKeepingHistory(const std::vector<Range>& ranges, const std::vector<DirtyPage>& dirty)
+{
+  // The pieces of the new layout: [new_off, new_off + len) comes from the old slot at old_off, or (old_off == NONE) from `source`.
+  constexpr size_t NONE = ~static_cast<size_t>(0);
+  struct Piece
+  {
+    size_t new_off;
+    size_t len;
+    size_t old_off;
+    const u8* source;
+  };
+  std::vector<Piece> pieces;
+  std::vector<std::vector<u8>> live_pages;  // pages read from live memory (clean pages), kept alive for the pointers in `pieces`
+  live_pages.reserve(64);
+  std::map<u32, const u8*> sources;
+  for (const DirtyPage& d : dirty)
+    sources[d.addr] = d.preimage;
+
+  size_t new_bytes = 0;
+  size_t covered_old = 0;
+  size_t j = 0;
+  for (const Range& r : ranges)
+  {
+    u32 a = r.start;
+    while (a < r.end)
+    {
+      while (j < m_ranges.size() && m_ranges[j].end <= a)
+        ++j;
+      if (j < m_ranges.size() && m_ranges[j].start <= a)
+      {
+        const u32 stop = std::min(r.end, m_ranges[j].end);
+        pieces.push_back({new_bytes + (a - r.start), stop - a, m_range_offsets[j] + (a - m_ranges[j].start), nullptr});
+        covered_old += stop - a;
+        a = stop;
+        continue;
+      }
+      // Not in the old set: take it page by page from a preimage, or from live memory when the page was never written since it was armed.
+      const u32 next_old = j < m_ranges.size() ? m_ranges[j].start : r.end;
+      const u32 stop = std::min({r.end, next_old, (a & ~WT_PAGE_MASK) + PAGE_SIZE});
+      const u32 page = a & ~WT_PAGE_MASK;
+      const u8* page_data = nullptr;
+      const auto it = sources.find(page);
+      if (it != sources.end())
+      {
+        page_data = it->second;
+      }
+      else if (m_watch != nullptr && m_watch->IsClean(page))
+      {
+        std::vector<u8> bytes(PAGE_SIZE);
+        if (!m_memory.Read(page, bytes.data(), PAGE_SIZE))
+          return false;
+        live_pages.push_back(std::move(bytes));
+        page_data = live_pages.back().data();
+        sources[page] = page_data;
+      }
+      if (page_data == nullptr)
+        return false;  // written (or unwatched) and no preimage: its contents in the old slots are unknown
+      pieces.push_back({new_bytes + (a - r.start), stop - a, NONE, page_data + (a - page)});
+      a = stop;
+    }
+    new_bytes += r.end - r.start;
+  }
+  if (covered_old != m_ranges_bytes)
+    return false;  // the new set does not contain the whole old set: not a pure growth
+
+  const size_t new_snapshot = new_bytes + m_options.stack_window;
+  std::vector<std::vector<u8>> fresh(m_ring.size());
+  for (size_t i = 0; i < m_ring.size(); ++i)
+  {
+    const Slot& slot = m_ring[i];
+    if (!slot.valid || slot.layout_gen != m_layout_gen)
+      continue;
+    std::vector<u8>& out = fresh[i];
+    out.resize(new_snapshot);
+    for (const Piece& p : pieces)
+      std::memcpy(out.data() + p.new_off, p.old_off == NONE ? p.source : slot.data.data() + p.old_off, p.len);
+    if (slot.stack_len != 0)
+      std::memcpy(out.data() + new_bytes, slot.data.data() + m_ranges_bytes, slot.stack_len);
+  }
+
+  // Commit: new layout, slots swapped over.
+  m_ranges = ranges;
+  ++m_layout_gen;
+  m_range_offsets.clear();
+  m_ranges_bytes = 0;
+  for (const Range& r : m_ranges)
+  {
+    m_range_offsets.push_back(m_ranges_bytes);
+    m_ranges_bytes += r.end - r.start;
+  }
+  m_snapshot_bytes = m_ranges_bytes + m_options.stack_window;
+  for (size_t i = 0; i < m_ring.size(); ++i)
+  {
+    Slot& slot = m_ring[i];
+    if (!fresh[i].empty())
+    {
+      slot.data = std::move(fresh[i]);
+      slot.layout_gen = m_layout_gen;
+    }
+    else
+    {
+      slot.valid = false;
+      slot.data.resize(m_snapshot_bytes);
+    }
+  }
+  m_scratch.valid = false;
+  m_scratch.data.resize(m_snapshot_bytes);
+  m_verify_dirty = false;
+  m_stats.snapshot_bytes_max = std::max(m_stats.snapshot_bytes_max, m_snapshot_bytes);
+  return true;
+}
+
+void SyncTest::PollWrites()
+{
+  if (!m_watching)
+    return;
+  const u64 t0 = m_micros();
+  if (!m_watch->Active())
+  {
+    // The host views were remapped under us (or somebody stopped the watch): whatever was marked is gone, and writes may have gone unseen.
+    // Start again; the history cannot be trusted for pages learned from now on, so it is cleared.
+    ++m_stats.wt_restarts;
+    m_watching = false;
+    m_sink.Line("NOTE Dolphin remapped its memory views, write tracking restarted");
+    if (m_armed)
+    {
+      ClearHistory();
+      m_sink.Line(Format("NOTE history cleared: write tracking restarted (frame %u)", m_last_frame));
+    }
+    WatchStart(" (restart)");
+    return;
+  }
+  std::vector<DirtyPage> dirty;
+  m_watch->Poll(&dirty);
+  if (dirty.empty())
+    return;
+
+  if (m_page_buf.size() != PAGE_SIZE)
+    m_page_buf.resize(PAGE_SIZE);
+  std::vector<u32> rearm;
+  std::vector<u32> learn;  // pages that join the set
+  enum class Verdict { Changed, Equal, Promoted, Pending };
+  std::vector<Verdict> verdicts(dirty.size(), Verdict::Changed);
+  for (size_t i = 0; i < dirty.size(); ++i)
+  {
+    const DirtyPage& d = dirty[i];
+    if (m_tracker.IsDynamic(d.addr))
+    {
+      verdicts[i] = Verdict::Pending;  // learned already, the set could not grow yet (resimulation): the preimage waits for it
+      learn.push_back(d.addr);
+      continue;
+    }
+    const u8* now = m_memory.Peek(d.addr, PAGE_SIZE);
+    if (now == nullptr)
+    {
+      if (!m_memory.Read(d.addr, m_page_buf.data(), PAGE_SIZE))
+      {
+        verdicts[i] = Verdict::Changed;  // cannot compare: treat as changed (the safe side: the page joins the set)
+        learn.push_back(d.addr);
+        continue;
+      }
+      now = m_page_buf.data();
+    }
+    if (std::memcmp(now, d.preimage, PAGE_SIZE) != 0)
+    {
+      verdicts[i] = Verdict::Changed;
+      learn.push_back(d.addr);
+    }
+    else if (d.equal_rearms >= m_options.write_track_rearm_max)
+    {
+      verdicts[i] = Verdict::Promoted;
+      ++m_stats.wt_promoted_equal;
+      learn.push_back(d.addr);
+    }
+    else
+    {
+      verdicts[i] = Verdict::Equal;
+      rearm.push_back(d.addr);
+    }
+  }
+  // The dirty log (REV3_RB_DIRTY_LOG): where the writes came from. Logged before the verdict is final for re-armed pages.
+  if (m_options.dirty_log != 0)
+  {
+    for (size_t i = 0; i < dirty.size() && m_dirty_logged < m_options.dirty_log; ++i)
+    {
+      const DirtyPage& d = dirty[i];
+      static const char* const names[] = {"changed", "equal", "promoted", "pending"};
+      m_sink.Line(Format("DIRTY f%u 0x%08X pc=0x%08X lr=0x%08X %s %s", m_last_frame, d.addr, d.pc, d.lr,
+                         d.cpu_thread ? "cpu" : "other", names[static_cast<int>(verdicts[i])]));
+      if (++m_dirty_logged == m_options.dirty_log)
+        m_sink.Line("NOTE DIRTY log limit reached (REV3_RB_DIRTY_LOG)");
+    }
+  }
+  if (!rearm.empty())
+  {
+    const std::vector<u32> raced = m_watch->Rearm(rearm);  // a write that raced the comparison: changed after all
+    m_stats.wt_equal_rearms += static_cast<u32>(rearm.size() - raced.size());
+    for (u32 addr : raced)
+      learn.push_back(addr);
+  }
+
+  if (!learn.empty())
+  {
+    u32 fresh_pages = 0;
+    for (u32 addr : learn)
+      fresh_pages += m_tracker.MarkDynamic(addr) ? 1 : 0;
+    m_stats.wt_pages_learned += fresh_pages;
+    // Does the set change at all? (A learned page may lie inside a cut, or already inside a padded neighbour.)
+    std::vector<Range> ranges = ComputeRanges();
+    if (SameRanges(ranges, m_ranges))
+    {
+      m_watch->Release(learn);
+    }
+    else if (!m_armed)
+    {
+      // Before arming there is no history: Arm() computes the set from the tracker's dynamic pages.
+      m_watch->Release(learn);
+    }
+    else
+    {
+      const bool had_history = m_have_history;
+      const std::vector<Range> before = m_ranges;
+      const bool kept = had_history && GrowKeepingHistory(ranges, dirty);
+      if (!kept && m_resim)
+      {
+        // Cannot extend the slots and must not drop them in the middle of a resimulation: try again after it (the pages stay dirty and
+        // dynamic; their preimages stay valid until released).
+        ++m_stats.wt_deferred;
+      }
+      else
+      {
+        const std::vector<Range> fresh = NoteLearned(before, ranges);
+        const u64 pages = RangesPages(fresh);
+        m_stats.pages_learned_armed += static_cast<u32>(pages);
+        m_learned_unlogged += static_cast<u32>(pages);
+        if (kept)
+        {
+          ++m_stats.wt_grown_kept;
+        }
+        else
+        {
+          m_ranges = std::move(ranges);
+          RebuildLayout();
+          ClearHistory();
+          ++m_stats.wt_grown_cleared;
+        }
+        m_stats.snapshot_bytes_max = std::max(m_stats.snapshot_bytes_max, m_snapshot_bytes);
+        LogLearnedGrowth(kept ? "kept" : "cleared", false);
+        WatchRefresh();  // releases the learned pages (and any page that became fully covered)
+      }
+    }
+  }
+  const u64 us = m_micros() - t0;
+  m_stats.wt_poll_us_total += us;
+  m_stats.wt_poll_us_max = std::max(m_stats.wt_poll_us_max, us);
+}
+
+std::string SyncTest::SnapshotLine() const
+{
+  const char* kind = m_watching ? "write_track" : (m_options.adaptive ? "adaptive" : "classic");
+  WriteWatchStats ws;
+  if (m_watch != nullptr)
+    ws = m_watch->Stats();
+  const size_t set_pages = static_cast<size_t>(RangesPages(m_ranges));
+  const double mb = 1.0 / (1024.0 * 1024.0);
+  std::string line = Format("SNAPSHOT kind=%s last=%.1f MB max=%.1f MB pages=%zu of watched=%u faults=%llu arms=%u", kind,
+                            static_cast<double>(m_snapshot_bytes) * mb, static_cast<double>(m_stats.snapshot_bytes_max) * mb, set_pages,
+                            ws.watched_pages, static_cast<unsigned long long>(ws.faults), m_stats.wt_arms);
+  if (m_options.write_track != 0)
+  {
+    line += Format(" learned=%u equal_rearms=%u promoted_equal=%u grown_kept=%u grown_cleared=%u deferred=%u restarts=%u misses=%u "
+                   "stale=%llu protect_calls=%llu protect_ms=%.1f poll_ms=%.1f",
+                   m_stats.wt_pages_learned, m_stats.wt_equal_rearms, m_stats.wt_promoted_equal, m_stats.wt_grown_kept,
+                   m_stats.wt_grown_cleared, m_stats.wt_deferred, m_stats.wt_restarts, m_stats.wt_misses,
+                   static_cast<unsigned long long>(ws.stale_faults), static_cast<unsigned long long>(ws.protect_calls),
+                   static_cast<double>(ws.protect_us) / 1000.0, static_cast<double>(m_stats.wt_poll_us_total) / 1000.0);
+  }
+  if (m_verify != nullptr)
+  {
+    line += Format(" | restores checked=%u wrong=%u blocks=%llu first_wrong_frame=%u shadow_ms=%.1f", m_verify->Checked(), m_verify->Wrong(),
+                   static_cast<unsigned long long>(m_verify->WrongBlocksTotal()), m_verify->FirstWrongFrom(),
+                   static_cast<double>(m_verify->ShadowUs()) / 1000.0);
+  }
+  return line;
 }
 
 // ---- restore verify: the SyncTest side ---------------------------------------------------------------------------------------
@@ -2268,6 +2694,7 @@ bool SyncTest::Arm(const Command& command, const std::array<u32, 2>& fighters)
   m_ranges = ComputeRanges();
   RebuildLayout();
   RefreshExclusions(true);  // may cut more and rebuild again
+  WatchRefresh();           // the set now holds the forced ranges and the stack window, and the cuts are known: release what is covered
 
   if (m_options.adaptive)
   {
@@ -2361,6 +2788,7 @@ Reply SyncTest::OnCommand(const Command& command)
     m_arm_blocked = false;
     m_defer_logged = false;
     m_set_sp = 0;
+    WatchStop("not gameplay");  // loading rewrites memory without our knowing it: nothing learned from faults carries over
     if (m_options.adaptive)
     {
       // A new match starts from scratch: loading rewrites most of memory, so nothing learned before is worth keeping.
@@ -2375,19 +2803,62 @@ Reply SyncTest::OnCommand(const Command& command)
     return Echo(command);
   }
 
+  // Host write tracking: starts as soon as both fighters are found (pages are watched from then on), and every hook call looks at the pages
+  // written since the previous one, before anything is captured. Also during a resimulation: a page must join the set before the next
+  // capture, and the slots are extended with the history kept.
+  if (m_options.write_track != 0 && m_watch != nullptr && !m_watching && !m_watch_failed && !m_resim)
+    WatchStart("");
+  PollWrites();
+
   // Page tracker: one slice per hook call, never during a resimulation (those frames replay the game after a restore; the first
-  // run's frames are the reference). Starts as soon as both fighters are found, long before arming.
+  // run's frames are the reference). Starts as soon as both fighters are found, long before arming. With write tracking on (mode 1) the
+  // slice only advances the learning clock; in mode 2 the scan runs as well and every page it finds that no fault announced is a miss.
   if (m_options.adaptive && !m_resim)
   {
+    const bool by_faults = m_watching && m_options.write_track == 1;
+    const bool check_misses = m_watching && m_options.write_track == 2;
     const u64 t0 = m_micros();
-    const u32 added = m_tracker.Scan();
-    const u64 us = m_micros() - t0;
-    ++m_stats.scans;
-    m_stats.scan_us_total += us;
-    m_stats.scan_us_max = std::max(m_stats.scan_us_max, us);
-    m_scan_iv_total += us;
-    m_scan_iv_max = std::max(m_scan_iv_max, us);
-    ++m_scan_iv_n;
+    u32 added = 0;
+    std::vector<Range> dynamic_before;
+    std::vector<Range> keep_before;
+    if (check_misses)
+    {
+      m_tracker.AppendDynamicRanges(&dynamic_before);
+      keep_before = KeepRanges();
+    }
+    if (by_faults)
+    {
+      m_tracker.SkipSlice();
+    }
+    else
+    {
+      added = m_tracker.Scan();
+      const u64 us = m_micros() - t0;
+      ++m_stats.scans;
+      m_stats.scan_us_total += us;
+      m_stats.scan_us_max = std::max(m_stats.scan_us_max, us);
+      m_scan_iv_total += us;
+      m_scan_iv_max = std::max(m_scan_iv_max, us);
+      ++m_scan_iv_n;
+    }
+    if (added != 0 && check_misses)
+    {
+      // Pages the scan found changing that the watch was guarding (not inside the set or a cut) and that no fault announced.
+      std::vector<Range> now;
+      m_tracker.AppendDynamicRanges(&now);
+      std::vector<Range> missed = NewRanges(now, dynamic_before);
+      for (const Range& k : keep_before)
+        SubtractRange(&missed, k.start, k.end);
+      const u64 pages = RangesPages(missed);
+      if (pages != 0)
+      {
+        m_stats.wt_misses += static_cast<u32>(pages);
+        if (m_stats.wt_misses <= 30)
+          m_sink.Line(Format("WRITE TRACK MISS frame %u: %llu page(s) changed without a write fault (a kernel-side write, or a view that is not "
+                             "protected): [%s]", command.frame, static_cast<unsigned long long>(pages),
+                             FormatRangeList(missed, 8).c_str()));
+      }
+    }
     if (!m_learn_done && m_tracker.Cycles() >= m_options.learn_cycles)
     {
       m_learn_done = true;
@@ -2396,6 +2867,8 @@ Reply SyncTest::OnCommand(const Command& command)
     }
     if (added != 0 && m_armed)
       LearnWhileArmed(added);
+    if (added != 0)
+      WatchRefresh();  // pages the scan found are in the set (or a cut) now: no need to guard them any longer
   }
 
   if (!m_armed)
