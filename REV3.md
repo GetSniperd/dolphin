@@ -214,14 +214,17 @@ memory or registers.
 When (all into the Rev3 log, `<User>\Logs\rev3_synctest.log`):
 
 1. **arm**: once, right after the arm notes (a baseline of a healthy game). `DUMP arm begin racy=0 ...`.
-2. **stall**: a host-side watchdog thread (wakes every 250 ms) fires when SyncTest is armed and no 0xA0 hook command arrived for
+2. **stall**: a host-side watchdog thread (wakes every 250 ms) fires in ANY mode (plain play, SyncTest armed or not, netplay in any
+   mode; the dump does not depend on SyncTest) when no 0xA0 hook command arrived for
    `REV3_SYNCTEST_DUMP_STALL_MS` (default 2000 ms), once per stall (the next command re-arms it). It first writes a racy dump at once
    (`racy=1`: the CPU thread keeps running, so values can be torn; it never blocks), then, unless `REV3_SYNCTEST_DUMP_PAUSE=0`, pauses the CPU
    with `Core::CPUThreadGuard` and writes a consistent dump (`racy=0`, includes the DSP / audio lines). If the freeze is a host-side wait that
    never lets the CPU thread pause, the second dump never appears (the first one does); closing Dolphin still works, the watchdog is
-   abandoned after 1.5 s. A paused emulator or a long load while armed also counts as a stall (harmless).
-3. **shutdown**: when the Slippi EXI device is destroyed (guest memory and the PPC state are still there; the DSP is already shut down, so
-   the DSP / audio lines say `dsp skipped`). `racy=1` only if the CPU is still running. Only if at least one hook command was seen.
+   abandoned after 1.5 s. A paused emulator or a long load also counts as a stall (harmless). A netplay session that is deliberately
+   waiting for the peer (its wait loops) marks itself blocked and is not reported. In a netplay run the DUMP lines go to the net log
+   (`REV3_NET_LOG`), otherwise to the Rev3 log.
+3. **shutdown**: always, when the Slippi EXI device is destroyed (guest memory and the PPC state are still there; the DSP is already shut
+   down, so the DSP / audio lines say `dsp skipped`). `racy=1` only if the CPU is still running.
 
 Also at every RESTORE among the first 10: `RESTOREHW n -> m pe_status=.. pe_token=.. cp_rw_dist=.. cp_rd=.. cp_wr=.. vi_count=..
 drawdone=.. sched_disable=..` right before the write-back (after `RESTORE n -> m begin`) and `RESTOREHW n -> m after ...` right after the audio
@@ -245,6 +248,8 @@ Dump format. Every line is `DUMP <reason> <line>` with `<reason>` = `arm`, `stal
 | `hw pe pe_status= pe_token=` | MMIO 0x0C00100A (PE control / interrupt status) and 0x0C00100E (token) |
 | `hw cp status=idle\|busy\|breakpoint base= end= rd= wr= rw_dist= bp= gp_read= bp_enable= link= hi_wm= lo_wm=` | `GetCommandProcessor().GetFifo()`; `idle` = rw_dist 0, `breakpoint` = the breakpoint flag |
 | `hw pi cause= mask= fifo_base= fifo_end= fifo_wptr=` | processor interface interrupt cause / mask and the CPU write-gather FIFO pointers |
+| `words dvd base=.. +0x00: w w w w w w w w` (3 rows), `words nw4r_strm ...` | 24 raw words from 0x20 bytes before the DVD queue (`0x8049D7B0`) and before the nw4r stream queue (`0x8049D238`), i.e. the neighbouring SDK state, for decoding by hand |
+| `hw di disr= cmd0= dimar= dilength= dicr= wii_dicr= ios_di_busy=0\|1\|none\|skipped(racy)` | DVD interface registers (0x0C006000 status, 0x0C006008 command word 0, DIMAR, DILENGTH, DICR with TSTART in bit 0; 0x0D00601C on a Wii) and `DIDevice::IsBusy()` of IOS `/dev/di` (not read in a racy dump: it walks the IOS device map) |
 | `hw vi line= di0=` | vertical beam position (0x0C00202C) and display interrupt 0 (0x0C002030; bit 31 = flag, bit 28 = enable) |
 | `dsp csr= to_dsp_hi= ai_dma= src= blocks= left=` and `audio dsp=HLE\|LLE irq= events=<n> [type+cycles,..]` | the existing DSP / audio DMA line and the pending audio CoreTiming events; consistent dumps only (not racy, not at shutdown) |
 

@@ -616,6 +616,23 @@ bool NetModule::Resimulating() const
 // find the CPU thread stuck here).
 bool NetModule::Wait(const std::function<bool()>& pred, u32 timeout_ms)
 {
+  // No hook command arrives while this loop waits for the peer, on purpose: the freeze dump's watchdog must not report it.
+  struct BlockedScope
+  {
+    explicit BlockedScope(FreezeDump* d) : dump(d)
+    {
+      if (dump != nullptr)
+        dump->SetBlocked(true);
+    }
+    ~BlockedScope()
+    {
+      if (dump != nullptr)
+        dump->SetBlocked(false);
+    }
+    BlockedScope(const BlockedScope&) = delete;
+    BlockedScope& operator=(const BlockedScope&) = delete;
+    FreezeDump* dump;
+  } blocked(m_env.dump);
   const u64 start = m_transport->Now();
   for (;;)
   {

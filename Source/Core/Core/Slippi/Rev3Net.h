@@ -170,6 +170,7 @@ struct NetEnvironment
   std::function<bool()> stopping;  // true once the emulator is shutting down (a blocked wait must end)
   HelloInputs hello;               // everything the Dolphin side knows; the module adds the hook CRC at the first command
   ResimHider* hider = nullptr;     // v1 hiding of resimulated frames (throttle off + mute); null = none. Not owned.
+  FreezeDump* dump = nullptr;      // freeze dump: marked blocked while a wait loop waits for the peer (not a freeze); null = none. Not owned.
 };
 
 class NetModule
