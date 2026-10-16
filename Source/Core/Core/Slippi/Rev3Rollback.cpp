@@ -27,10 +27,13 @@
 #include "Common/Hash.h"
 #include "Common/Logging/Log.h"
 #include "Core/Core.h"
+#include "Core/CoreTiming.h"
 #include "Core/HW/MMIO.h"
 #include "Core/HW/Memmap.h"
+#include "Core/HW/SystemTimers.h"
 #include "Core/HW/VideoInterface.h"
 #include "Core/PowerPC/JitInterface.h"
+#include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 #include "VideoCommon/CommandProcessor.h"
 #include "VideoCommon/OnScreenDisplay.h"
@@ -48,8 +51,11 @@ constexpr u32 MEM2_END = 0x94000000;
 // SyncTest arms after SyncTestOptions::arm_commands consecutive hook calls (one per game frame) with both fighters found (default
 // 600): the stage must be loaded and the fight running, not loading (loading fills memory by DVD DMA and runs threads, which a
 // memory snapshot knows nothing about). The first real run froze at the end of a stage load with a 60 call delay.
-constexpr u32 HEARTBEAT_EVERY = 300;              // "HB" log line every this many hook calls while armed (finds where a hang is)
-constexpr u32 MAX_RESTORE_LOGS = 10;              // the first restores log a RESTORE line (bytes, microseconds)
+constexpr u32 HEARTBEAT_EVERY = 300;              // "HB" log line every this many hook calls while armed (finds where a hang is) ...
+constexpr u32 HEARTBEAT_EARLY_EVERY = 60;         // ... but every this many hook calls for the first HEARTBEAT_EARLY_CALLS armed calls
+constexpr u32 HEARTBEAT_EARLY_CALLS = 600;        // (the first real rewinds are where the game froze)
+constexpr u32 MAX_RESTORE_LOGS = 10;              // the first restores log RESTORE begin / done lines (bytes, microseconds)
+constexpr u32 MAX_SHORT_RESTORE_LOGS = 30;        // restores 11..30 log one short line "RESTORE n -> m us=.." (places a later hang)
 constexpr u32 MAX_EXCLUSION_LINES = 64;           // "NOTE exclude" lines (buffers that alternate would otherwise flood the log)
 
 constexpr u32 MAX_DETAILED_MISMATCH_FRAMES = 20;  // full field / range detail for this many mismatching frames, then counts only
@@ -271,6 +277,33 @@ u64 SubtractRange(std::vector<Range>* ranges, u32 lo, u32 hi)
   return removed;
 }
 
+bool ApplyExclusions(const std::string& json_text, std::vector<Range>* ranges, Sink& sink, std::string* error)
+{
+  std::string scratch;
+  if (error == nullptr)
+    error = &scratch;
+  std::vector<Range> exclusions;
+  if (!ParseWhitelist(json_text, &exclusions, error))
+    return false;
+  std::vector<Range> result = *ranges;
+  std::vector<std::string> lines;
+  for (const Range& e : exclusions)
+  {
+    const u64 removed = SubtractRange(&result, e.start, e.end);
+    lines.push_back(Format("NOTE exclude user 0x%08X-0x%08X (%llu bytes were in the whitelist)", e.start, e.end,
+                           static_cast<unsigned long long>(removed)));
+  }
+  if (result.empty())
+  {
+    *error = "the exclusions remove every range of the whitelist";
+    return false;
+  }
+  for (const std::string& line : lines)
+    sink.Line(line);
+  *ranges = std::move(result);
+  return true;
+}
+
 // ---- (3) the fighter field table ------------------------------------------------------------------------------------------
 
 // rev3-mod rbchecksum.py FIELDS (FIELDS_VERSION 1, fields_digest 0xD4076EF2), same order.
@@ -313,11 +346,13 @@ SyncTest::SyncTest(const SyncTestOptions& options, std::vector<Range> ranges, Gu
   RebuildLayout();
 
   m_sink.Line(Format("SYNCTEST start K=%d EVERY=%d window=0x%X whitelist=%s ranges=%zu bytes=%zu snapshot_bytes=%zu slots=%zu "
-                     "arm=%s noop=%d hw_exclude=%d icache=%d",
+                     "arm=%s noop=%d hw_exclude=%d icache=%d tb=%d",
                      m_options.k, m_options.every, m_options.stack_window, m_options.whitelist_path.c_str(), m_ranges.size(),
                      m_ranges_bytes, m_snapshot_bytes, m_ring.size(),
                      m_options.arm_by_pad ? "pad" : Format("%u", m_options.arm_commands).c_str(), m_options.noop ? 1 : 0,
-                     m_hardware != nullptr ? 1 : 0, m_options.invalidate_code ? 1 : 0));
+                     m_hardware != nullptr ? 1 : 0, m_options.invalidate_code ? 1 : 0, m_options.restore_timebase ? 1 : 0));
+  if (m_options.restore_timebase)
+    m_sink.Line("NOTE timebase restore on");
 }
 
 // Recomputes the offsets and buffer sizes for the current m_ranges. Every slot is invalidated: its data has the old layout.
@@ -344,7 +379,7 @@ void SyncTest::RebuildLayout()
 
 // Asks the emulated hardware which memory it uses on its own and cuts it out of the snapshot ranges. The set only grows (double
 // buffers alternate; seeing both once is enough), and a change that touches the snapshot clears the history.
-void SyncTest::RefreshExclusions()
+void SyncTest::RefreshExclusions(bool at_arm)
 {
   if (m_hardware == nullptr)
     return;
@@ -378,6 +413,52 @@ void SyncTest::RefreshExclusions()
   ClearHistory();
   m_sink.Line(Format("NOTE snapshot now ranges=%zu bytes=%zu snapshot_bytes=%zu (history cleared, frame %u)", m_ranges.size(),
                      m_ranges_bytes, m_snapshot_bytes, m_last_frame));
+  if (m_armed && !at_arm)
+    LogFieldCoverage(m_fighters, "after exclusion change");
+}
+
+std::string SyncTest::RangeContaining(u32 addr) const
+{
+  for (const Range& r : m_ranges)
+  {
+    if (addr >= r.start && static_cast<u64>(addr) + 4 <= r.end)
+      return Format("0x%08X-0x%08X", r.start, r.end);
+  }
+  return {};
+}
+
+std::string SyncTest::SnapshotRangeOf(const Slot& slot, u32 addr) const
+{
+  std::string found = RangeContaining(addr);
+  if (found.empty() && slot.stack_len != 0 && addr >= slot.sp && static_cast<u64>(addr) + 4 <= static_cast<u64>(slot.sp) + slot.stack_len)
+    found = Format("stack_window 0x%08X-0x%08X", slot.sp, slot.sp + slot.stack_len);
+  return found;
+}
+
+// Which of the 61 compared fields of each fighter lie inside the current snapshot ranges. A field outside is never rewound, so its
+// value after a restore is whatever the first run left there; the list names them.
+void SyncTest::LogFieldCoverage(const std::array<u32, 2>& fighters, const char* when)
+{
+  for (size_t p = 0; p < 2; ++p)
+  {
+    size_t inside = 0;
+    std::string missing;
+    for (const FieldDef& f : FIELDS)
+    {
+      const u32 addr = fighters[p] + f.offset;
+      if (!RangeContaining(addr).empty())
+      {
+        ++inside;
+        continue;
+      }
+      missing += Format(" %s@0x%08X", f.name, addr);
+    }
+    std::string line = Format("NOTE field coverage p%zu%s%s fighter=0x%08X in_snapshot=%zu/%zu", p + 1, when != nullptr ? " " : "",
+                              when != nullptr ? when : "", fighters[p], inside, FIELD_COUNT);
+    if (inside != FIELD_COUNT)
+      line += " NOT IN SNAPSHOT:" + missing;
+    m_sink.Line(line);
+  }
 }
 
 Reply SyncTest::Echo(const Command& command) const
@@ -490,6 +571,7 @@ bool SyncTest::Capture(Slot& slot, const Command& command, const std::array<u32,
     slot.fighter_addr[p] = fighters[p];
   }
 
+  slot.timebase_valid = m_options.restore_timebase && m_memory.ReadTimeBase(&slot.timebase);
   slot.valid = true;
   slot.frame = command.frame;
   slot.sp = command.sp;
@@ -517,6 +599,7 @@ bool SyncTest::Restore(const Slot& s, const Command& command, u32 to)
   }
 
   const bool log_it = m_restore_logs < MAX_RESTORE_LOGS;
+  const bool log_short = !log_it && m_restore_logs < MAX_SHORT_RESTORE_LOGS;
   if (log_it)
     m_sink.Line(Format("RESTORE %u -> %u begin", command.frame, to));
 
@@ -547,6 +630,17 @@ bool SyncTest::Restore(const Slot& s, const Command& command, u32 to)
   const u64 us = t1 - t0;
   const u64 icache_us = t2 - t1;
 
+  // Time base: moved back to its value in the snapshot (the decrementer and CoreTiming stay as they are).
+  std::string tb_text;
+  if (m_options.restore_timebase && s.timebase_valid)
+  {
+    u64 now = 0;
+    if (m_memory.ReadTimeBase(&now) && m_memory.WriteTimeBase(s.timebase))
+      tb_text = Format(" tb_delta=%lld", static_cast<long long>(now - s.timebase));
+    else
+      Error(Format("frame %u: cannot set the time base", command.frame));
+  }
+
   ++m_stats.restores;
   m_stats.restore_us_total += us;
   m_stats.restore_us_max = std::max(m_stats.restore_us_max, us);
@@ -555,8 +649,13 @@ bool SyncTest::Restore(const Slot& s, const Command& command, u32 to)
   if (log_it)
   {
     ++m_restore_logs;
-    m_sink.Line(Format("RESTORE %u -> %u bytes=%zu us=%llu icache_us=%llu", command.frame, to, m_ranges_bytes + s.stack_len,
-                       static_cast<unsigned long long>(us), static_cast<unsigned long long>(icache_us)));
+    m_sink.Line(Format("RESTORE %u -> %u bytes=%zu us=%llu icache_us=%llu%s", command.frame, to, m_ranges_bytes + s.stack_len,
+                       static_cast<unsigned long long>(us), static_cast<unsigned long long>(icache_us), tb_text.c_str()));
+  }
+  else if (log_short)
+  {
+    ++m_restore_logs;
+    m_sink.Line(Format("RESTORE %u -> %u us=%llu%s", command.frame, to, static_cast<unsigned long long>(us), tb_text.c_str()));
   }
   return true;
 }
@@ -663,6 +762,7 @@ void SyncTest::Compare(const Slot& reference, const Slot& live, u32 frame)
     const char* name;
     u32 ref;
     u32 resim;
+    u32 offset;
   };
   std::vector<FieldDiff> field_diffs;
   for (size_t p = 0; p < 2; ++p)
@@ -672,7 +772,7 @@ void SyncTest::Compare(const Slot& reference, const Slot& live, u32 frame)
       const u8* a = reference.fields[p].data() + 4 * f;
       const u8* b = live.fields[p].data() + 4 * f;
       if (std::memcmp(a, b, 4) != 0)
-        field_diffs.push_back({p + 1, FIELDS[f].name, ReadBE32(a), ReadBE32(b)});
+        field_diffs.push_back({p + 1, FIELDS[f].name, ReadBE32(a), ReadBE32(b), FIELDS[f].offset});
     }
   }
   std::vector<size_t> range_diffs;
@@ -686,7 +786,15 @@ void SyncTest::Compare(const Slot& reference, const Slot& live, u32 frame)
     return;
 
   ++m_stats.mismatching_frames;
-  const bool detailed = m_logged_mismatch_frames < MAX_DETAILED_MISMATCH_FRAMES;
+  // Full detail for the first MAX_DETAILED_MISMATCH_FRAMES mismatching frames, and for any later frame in which a field name
+  // differs for the first time (so a late-appearing field is still named, with its address).
+  const auto is_new = [this](const char* name) {
+    return std::find(m_fields_annotated.begin(), m_fields_annotated.end(), name) == m_fields_annotated.end();
+  };
+  bool has_new_field = false;
+  for (const FieldDiff& d : field_diffs)
+    has_new_field = has_new_field || is_new(d.name);
+  const bool detailed = m_logged_mismatch_frames < MAX_DETAILED_MISMATCH_FRAMES || has_new_field;
   if (!m_osd_mismatch_shown)
   {
     m_osd_mismatch_shown = true;
@@ -712,7 +820,19 @@ void SyncTest::Compare(const Slot& reference, const Slot& live, u32 frame)
                        live.fighter_addr[0], reference.fighter_addr[1], live.fighter_addr[1]));
   }
   for (const FieldDiff& d : field_diffs)
-    m_sink.Line(Format("  p%zu %s ref=0x%08X resim=0x%08X", d.player, d.name, d.ref, d.resim));
+  {
+    // The first time a field name differs: also its guest address and the snapshot range holding it (the question is whether the
+    // field is rewound at all; "NOT IN SNAPSHOT" = the whitelist or an exclusion leaves it out).
+    std::string where;
+    if (is_new(d.name))
+    {
+      m_fields_annotated.push_back(d.name);
+      const u32 addr = reference.fighter_addr[d.player - 1] + d.offset;
+      const std::string range = SnapshotRangeOf(reference, addr);
+      where = Format(" addr=0x%08X ", addr) + (range.empty() ? std::string("NOT IN SNAPSHOT") : "in " + range);
+    }
+    m_sink.Line(Format("  p%zu %s ref=0x%08X resim=0x%08X", d.player, d.name, d.ref, d.resim) + where);
+  }
   for (size_t j = 0; j < range_diffs.size(); ++j)
   {
     if (j == MAX_RANGES_LISTED)
@@ -783,6 +903,8 @@ Reply SyncTest::OnCommand(const Command& command)
     m_prev_z = z;
   }
 
+  if (found)
+    m_fighters = fighters;
   if (!found)
   {
     m_z_pending = false;
@@ -808,7 +930,11 @@ Reply SyncTest::OnCommand(const Command& command)
       m_sink.Line(Format("NOTE armed by Z at frame %u", command.frame));
     else
       m_sink.Line(Format("NOTE armed at frame %u (%u hook calls with both fighters)", command.frame, m_streak));
-    RefreshExclusions();
+    RefreshExclusions(true);
+    m_sink.Line(Format("NOTE fighters p1=0x%08X p2=0x%08X", fighters[0], fighters[1]));
+    LogFieldCoverage(fighters, nullptr);
+    if (m_dsp_state)
+      m_sink.Line("NOTE dsp at arm: " + m_dsp_state());
   }
   else if (m_options.arm_by_pad && m_z_pending && !m_resim)
   {
@@ -820,9 +946,12 @@ Reply SyncTest::OnCommand(const Command& command)
   }
 
   ++m_armed_calls;
-  if (m_armed_calls % HEARTBEAT_EVERY == 0)
+  if (m_armed_calls % (m_armed_calls <= HEARTBEAT_EARLY_CALLS ? HEARTBEAT_EARLY_EVERY : HEARTBEAT_EVERY) == 0)
+  {
     m_sink.Line(Format("HB frame=%u calls=%u rollbacks=%u noop_restores=%u", command.frame, m_armed_calls, m_stats.rollbacks,
-                       m_stats.noop_restores));
+                       m_stats.noop_restores) +
+                (m_dsp_state ? " " + m_dsp_state() : std::string()));
+  }
   // Due every hardware_check_every calls; done on the next call that is not a resimulation (the layout must not change there).
   if (m_armed_calls % m_options.hardware_check_every == 0)
     m_hardware_due = true;
@@ -873,6 +1002,24 @@ public:
   // Forced invalidation (the code bytes are restored to what they were, not modified by the game): the JIT drops every block
   // translated from the range, so overlays / RELs in a restored heap are recompiled from the restored bytes.
   void InvalidateCode(u32 addr, size_t n) override { m_system.GetJitInterface().InvalidateICache(addr, static_cast<u32>(n), true); }
+
+  // Time base. What the game's mftb / OSGetTime returns is SystemTimers::GetFakeTimeBase() = CoreTiming fake_TB_start_value +
+  // (ticks - fake_TB_start_ticks) / TIMER_RATIO (the JIT inlines exactly this; PowerPCState's TL / TU are only a cache refreshed
+  // by each mftb). So the time base is set back by shifting fake_TB_start_value by (value - now), modulo 2^64, and the cached
+  // TL / TU are written too (PowerPCManager::WriteFullTimeBaseValue). The decrementer and the CoreTiming event queue are not touched.
+  bool ReadTimeBase(u64* out) const override
+  {
+    *out = m_system.GetSystemTimers().GetFakeTimeBase();
+    return true;
+  }
+  bool WriteTimeBase(u64 value) override
+  {
+    const u64 now = m_system.GetSystemTimers().GetFakeTimeBase();
+    auto& core_timing = m_system.GetCoreTiming();
+    core_timing.SetFakeTBStartValue(core_timing.GetFakeTBStartValue() + (value - now));
+    m_system.GetPowerPC().WriteFullTimeBaseValue(value);
+    return true;
+  }
 
 private:
   // The range must lie entirely in the emulated MEM1 or MEM2 (checked here so MemoryManager never raises a panic alert).
@@ -969,6 +1116,27 @@ private:
 
   Core::System& m_system;
 };
+
+// One-line DSP / audio DMA state, read through the MMIO mapping without side effects (the DSP mailbox "from DSP" registers are not
+// read: reading the low half pops a mail, and on LLE the high half steps the DSP):
+//   csr         0x0C00500A DSP control register
+//   to_dsp_hi   0x0C005000 mailbox to the DSP, high half (bit 15 = a mail the DSP has not taken yet)
+//   ai_dma      0x0C005036 bit 15 = audio DMA enabled; src 0x0C005030/32 = source address; blocks = low 15 bits of 0x0C005036 (32-byte
+//               blocks per transfer); left = 0x0C00503A blocks remaining. If `left` stops changing between HB lines the audio DMA stopped.
+std::string DescribeDsp(Core::System& system)
+{
+  MMIO::Mapping* mmio = system.GetMemory().GetMMIOMapping();
+  if (mmio == nullptr)
+    return "dsp=n/a";
+  const auto r16 = [&](u32 address) { return static_cast<u32>(mmio->Read<u16>(system, address)); };
+  const u32 csr = r16(0x0C00500A);
+  const u32 to_dsp_hi = r16(0x0C005000);
+  const u32 src = (r16(0x0C005030) << 16) | r16(0x0C005032);
+  const u32 control = r16(0x0C005036);
+  const u32 left = r16(0x0C00503A);
+  return Format("dsp csr=0x%04X to_dsp_hi=0x%04X ai_dma=%s src=0x%08X blocks=%u left=%u", csr, to_dsp_hi,
+                (control & 0x8000) != 0 ? "on" : "off", src, control & 0x7FFF, left);
+}
 
 class FileSink final : public Sink
 {
@@ -1093,6 +1261,7 @@ void Initialize(Module& module, Core::System& system)
   }
   options.noop = GetEnv("REV3_SYNCTEST_NOOP") == "1";
   options.invalidate_code = GetEnv("REV3_SYNCTEST_ICACHE") != "0";
+  options.restore_timebase = GetEnv("REV3_SYNCTEST_TB") == "1";
   const bool hardware_exclude = GetEnv("REV3_SYNCTEST_HW_EXCLUDE") != "0";
 
   std::string log_path = GetEnv("REV3_SYNCTEST_LOG");
@@ -1127,6 +1296,24 @@ void Initialize(Module& module, Core::System& system)
     return;
   }
 
+  const std::string exclude_path = GetEnv("REV3_SYNCTEST_EXCLUDE");
+  if (!exclude_path.empty())
+  {
+    std::string exclude_text;
+    if (!ReadTextFile(exclude_path, &exclude_text))
+      error = "cannot read REV3_SYNCTEST_EXCLUDE " + exclude_path;
+    else
+      ApplyExclusions(exclude_text, &ranges, *module.sink, &error);
+    if (!error.empty())
+    {
+      const std::string message = "Rev3 SyncTest: exclude file unusable (" + error + "); SyncTest is off";
+      module.sink->Line("ERROR " + message);
+      ERROR_LOG_FMT(SLIPPI, "{}", message);
+      module.sink->Osd(message);
+      return;
+    }
+  }
+
   if (hook_bytes != 0)
   {
     module.sink->Line(Format("NOTE removed %llu bytes of the hook region 0x%08X-0x%08X from the whitelist",
@@ -1137,6 +1324,13 @@ void Initialize(Module& module, Core::System& system)
     module.hardware = std::make_unique<DolphinHardware>(system, *module.sink);
   module.synctest = std::make_unique<SyncTest>(options, std::move(ranges), *module.memory, *module.sink, std::function<u64()>(),
                                                module.hardware.get());
+  if (options.restore_timebase)
+  {
+    module.sink->Line("NOTE timebase accessor: read SystemTimers::GetFakeTimeBase(); write CoreTiming::SetFakeTBStartValue(start + (value - now)) "
+                      "and PowerPCManager::WriteFullTimeBaseValue(value); decrementer and CoreTiming events untouched");
+  }
+  Core::System* const sys = &system;
+  module.synctest->SetDspState([sys]() { return DescribeDsp(*sys); });
   module.sink->Osd(Format("Rev3 SyncTest on: K=%d, every %d frame(s), log %s", options.k, options.every, log_path.c_str()));
 }
 }  // namespace

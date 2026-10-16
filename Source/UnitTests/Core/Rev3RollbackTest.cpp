@@ -5,6 +5,7 @@
 #include <array>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -43,6 +44,20 @@ public:
 
   void InvalidateCode(u32 addr, size_t n) override { invalidated.emplace_back(addr, n); }
   std::vector<std::pair<u32, size_t>> invalidated;  // every InvalidateCode call, in order
+
+  bool ReadTimeBase(u64* out) const override
+  {
+    *out = time_base;
+    return true;
+  }
+  bool WriteTimeBase(u64 value) override
+  {
+    time_base = value;
+    ++time_base_writes;
+    return true;
+  }
+  u64 time_base = 5000000;  // the emulated time base; FakeGame advances it by TB_PER_FRAME every frame
+  int time_base_writes = 0;
 
   u32 U32(u32 addr) const
   {
@@ -104,16 +119,20 @@ constexpr u32 HIDDEN = 0x80700000;   // NOT whitelisted
 constexpr u32 SP = 0x80800000;       // the hook's stack pointer
 constexpr u32 WINDOW = 0x400;
 
+constexpr u64 TB_PER_FRAME = 1000;
+
 constexpr u32 HW_WORD = STATE_A + 0x44;  // a word "hardware" writes by itself every frame (inside the excluded 0x40..0x80)
 constexpr u32 FIELD_X = 0x84;
 constexpr u32 FIELD_HEALTH = 0x28;
+constexpr u32 FIELD_ANGLEA0 = 0xA0;
+constexpr u32 FIELD_Y = 0x88;
 
 // A deterministic game: every step adds the pads to counters in two whitelisted ranges and mirrors them into the fighters. With
 // `leak` set, a hidden counter outside the whitelist also feeds the state (what an incomplete whitelist looks like).
 class FakeGame
 {
 public:
-  explicit FakeGame(bool leak) : m_leak(leak)
+  explicit FakeGame(bool leak, u32 late_leak_from = 0) : m_leak(leak), m_late_from(late_leak_from)
   {
     for (int p = 0; p < 2; ++p)
     {
@@ -142,6 +161,10 @@ public:
     // The hook's stack frame holds its frame counter; a RESTORED reply must bring the old value back.
     m_mem.SetU32(sp, m_counter);
     m_mem.SetU32(sp + 4, 0xC0FFEE00 + m_counter);
+    // The time base the hook call of this frame sees: a frame visited again (after a restore) must see the same value again.
+    const auto seen = m_tb_seen.emplace(m_counter, m_mem.time_base);
+    if (!seen.second && seen.first->second != m_mem.time_base)
+      m_tb_consistent = false;
     Command c;
     c.frame = m_counter;
     c.pads = PadsFor(m_counter);
@@ -163,9 +186,12 @@ public:
     Step(r.pads);
     if (m_hw_writes)
       m_mem.SetU32(HW_WORD, ++m_hw_ticks);  // the hardware's own write, after the frame
+    m_mem.time_base += TB_PER_FRAME;
     ++m_counter;
     return r;
   }
+
+  bool TimeBaseConsistent() const { return m_tb_consistent; }  // every revisited frame saw the time base it saw the first time
 
   void EnableHardwareWord() { m_hw_writes = true; }  // "hardware" starts writing HW_WORD every frame
   void SetZ(bool down) { m_z = down; }  // from now on port 0's buttons carry Z (0x0010) or nothing
@@ -183,6 +209,11 @@ public:
     m_mem.SetU32(STATE_A + 0x80, a ^ 0x5A5A5A5A);
     m_mem.SetU32(STATE_B + 4, b);
     m_mem.SetU32(FIGHTER[0] + FIELD_X, a);
+    if (m_late_from != 0 && m_counter >= m_late_from)
+    {
+      m_mem.SetU32(FIGHTER[0] + FIELD_ANGLEA0, hidden);  // a second, later leak into other fighter fields:
+      m_mem.SetU32(FIGHTER[1] + FIELD_Y, hidden);        // p1 anglea0 (in the test's snapshot) and p2 y (not in it)
+    }
     m_mem.SetU32(FIGHTER[1] + FIELD_HEALTH, b);
   }
 
@@ -192,6 +223,9 @@ public:
 private:
   FakeMemory m_mem;
   bool m_leak;
+  u32 m_late_from;
+  std::map<u32, u64> m_tb_seen;
+  bool m_tb_consistent = true;
   u32 m_counter = 1000;
   std::optional<bool> m_z;
   bool m_hw_writes = false;
@@ -589,7 +623,7 @@ TEST(Rev3Rollback, ArmsOnlyAfterTheConfiguredDelay)
   EXPECT_FALSE(test.Active());
 }
 
-TEST(Rev3Rollback, HeartbeatEvery300CallsWhileArmed)
+TEST(Rev3Rollback, HeartbeatEvery60ThenEvery300CallsWhileArmed)
 {
   FakeGame game(false);
   FakeSink sink;
@@ -599,7 +633,28 @@ TEST(Rev3Rollback, HeartbeatEvery300CallsWhileArmed)
   int hb = 0;
   for (const std::string& l : sink.lines)
     hb += l.rfind("HB frame=", 0) == 0;
-  EXPECT_EQ(hb, 3);
+  // armed calls 60, 120 .. 600 (10 lines), then 900
+  EXPECT_EQ(hb, 11);
+  EXPECT_TRUE(sink.Contains(" calls=60 rollbacks="));
+  EXPECT_TRUE(sink.Contains(" calls=600 rollbacks="));
+  EXPECT_FALSE(sink.Contains("calls=660 "));
+  EXPECT_TRUE(sink.Contains("calls=900 "));
+}
+
+TEST(Rev3Rollback, DspStateIsLoggedAtArmAndInEveryHeartbeat)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTest test(Options(2), game.Ranges(), game.Mem(), sink, FakeClock());
+  int calls = 0;
+  test.SetDspState([&calls]() { return "dsp csr=0x0804 left=" + std::to_string(++calls); });
+  for (int i = 0; i < 60 + 130; ++i)
+    game.Frame(test);
+  EXPECT_TRUE(sink.Contains("NOTE dsp at arm: dsp csr=0x0804 left=1"));
+  int hb_with_dsp = 0;
+  for (const std::string& l : sink.lines)
+    hb_with_dsp += l.rfind("HB frame=", 0) == 0 && l.find(" dsp csr=0x0804 left=") != std::string::npos;
+  EXPECT_EQ(hb_with_dsp, 2);  // armed calls 60 and 120
 }
 
 TEST(Rev3Rollback, FirstTenRestoresAreLogged)
@@ -618,6 +673,28 @@ TEST(Rev3Rollback, FirstTenRestoresAreLogged)
   EXPECT_EQ(done, 10);
   EXPECT_EQ(begin, 10);
   EXPECT_TRUE(sink.Contains("RESTORE 1061 -> 1059 bytes=" + std::to_string(320 + WINDOW) + " us=7 icache_us=7"));
+}
+
+TEST(Rev3Rollback, RestoresElevenToThirtyAreOneShortLine)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTest test(Options(2), game.Ranges(), game.Mem(), sink, FakeClock());
+  for (int i = 0; i < 400; ++i)
+    game.Frame(test);
+  ASSERT_GT(test.Stats().restores, 40u);
+  int full = 0, shortline = 0, begin = 0;
+  for (const std::string& l : sink.lines)
+  {
+    if (l.rfind("RESTORE ", 0) != 0)
+      continue;
+    begin += l.find(" begin") != std::string::npos;
+    full += l.find(" bytes=") != std::string::npos;
+    shortline += l.find(" bytes=") == std::string::npos && l.find(" begin") == std::string::npos && l.find(" us=7") != std::string::npos;
+  }
+  EXPECT_EQ(begin, 10);
+  EXPECT_EQ(full, 10);
+  EXPECT_EQ(shortline, 20);  // restores 11..30; none after
 }
 
 TEST(Rev3Rollback, NoopModeRestoresTheSameFrameEveryFrame)
@@ -809,4 +886,205 @@ TEST(Rev3Rollback, RestoredRangesAreInvalidatedInTheJit)
     game2.Frame(test2);
   EXPECT_GT(test2.Stats().rollbacks, 0u);
   EXPECT_TRUE(game2.Mem().invalidated.empty());
+}
+
+// ---- field coverage diagnostics ---------------------------------------------------------------------------------------------
+
+namespace
+{
+size_t CountInFieldRange(u32 range_bytes)  // fields of a fighter whose 4 bytes lie inside [0, range_bytes)
+{
+  size_t n = 0;
+  for (const FieldDef& f : FIELDS)
+    n += (u32(f.offset) + 4 <= range_bytes);
+  return n;
+}
+}  // namespace
+
+TEST(Rev3Rollback, ArmLogsFighterAddressesAndFieldCoverage)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  // Only the first 0x100 bytes of fighter 1 are whitelisted; fighter 2 not at all.
+  std::vector<Range> ranges = game.Ranges();
+  ranges.push_back({FIGHTER[0], FIGHTER[0] + 0x100});
+  SyncTest test(Options(2), ranges, game.Mem(), sink, FakeClock());
+  for (int i = 0; i < 61; ++i)
+    game.Frame(test);
+
+  EXPECT_TRUE(sink.Contains("NOTE fighters p1=0x80420000 p2=0x80430000"));
+  const size_t in1 = CountInFieldRange(0x100);
+  ASSERT_GT(in1, 0u);
+  ASSERT_LT(in1, FIELD_COUNT);
+  EXPECT_TRUE(sink.Contains("NOTE field coverage p1 fighter=0x80420000 in_snapshot=" + std::to_string(in1) + "/61 NOT IN SNAPSHOT:"));
+  EXPECT_TRUE(sink.Contains("NOTE field coverage p2 fighter=0x80430000 in_snapshot=0/61 NOT IN SNAPSHOT: action@0x80430140"));
+  // p1's list names a field past 0x100 (action is at 0x140) but not one inside (x at 0x84).
+  std::string p1_line;
+  for (const std::string& l : sink.lines)
+  {
+    if (l.rfind("NOTE field coverage p1", 0) == 0)
+      p1_line = l;
+  }
+  EXPECT_NE(p1_line.find(" action@0x80420140"), std::string::npos);
+  EXPECT_EQ(p1_line.find(" x@0x80420084"), std::string::npos);
+
+  // Everything in: no list.
+  FakeGame game2(false);
+  FakeSink sink2;
+  std::vector<Range> all = game2.Ranges();
+  all.push_back({FIGHTER[0], FIGHTER[0] + 0x1700});
+  all.push_back({FIGHTER[1], FIGHTER[1] + 0x1700});
+  SyncTest test2(Options(2), all, game2.Mem(), sink2, FakeClock());
+  for (int i = 0; i < 61; ++i)
+    game2.Frame(test2);
+  EXPECT_TRUE(sink2.Contains("NOTE field coverage p1 fighter=0x80420000 in_snapshot=61/61"));
+  EXPECT_FALSE(sink2.Contains("NOT IN SNAPSHOT"));
+}
+
+TEST(Rev3Rollback, MismatchNamesTheAddressAndTheSnapshotRangeOfEachNewField)
+{
+  FakeGame game(true, 1100);  // leak into p1 x from the start, into p1 anglea0 and p2 y from frame 1100
+  FakeSink sink;
+  std::vector<Range> ranges = game.Ranges();
+  ranges.push_back({FIGHTER[0], FIGHTER[0] + 0x100});  // p1 x (0x84) and anglea0 (0xA0) are inside; p2 y is not
+  SyncTest test(Options(2), ranges, game.Mem(), sink, FakeClock());
+  for (int i = 0; i < 400; ++i)
+    game.Frame(test);
+
+  EXPECT_TRUE(sink.Contains("  p1 x ref=0x"));
+  EXPECT_TRUE(sink.Contains(" addr=0x80420084 in 0x80420000-0x80420100"));
+
+  // The address is added the first time a field name differs, not on every line.
+  int x_lines = 0, x_annotated = 0, y_lines = 0, y_annotated = 0;
+  for (const std::string& l : sink.lines)
+  {
+    if (l.rfind("  p1 x ref=", 0) == 0)
+    {
+      ++x_lines;
+      x_annotated += l.find(" addr=") != std::string::npos;
+    }
+    if (l.rfind("  p2 y ref=", 0) == 0)
+    {
+      ++y_lines;
+      y_annotated += l.find(" addr=") != std::string::npos;
+    }
+  }
+  EXPECT_GT(x_lines, 5);
+  EXPECT_EQ(x_annotated, 1);
+
+  // Fields that differ for the first time after the first 20 detailed frames still get a block, with their address.
+  EXPECT_TRUE(sink.Contains("  p1 anglea0 ref=0x"));
+  EXPECT_TRUE(sink.Contains(" addr=0x804200A0 in 0x80420000-0x80420100"));
+  EXPECT_GE(y_lines, 1);
+  EXPECT_EQ(y_annotated, 1);
+  EXPECT_TRUE(sink.Contains(" addr=0x80430088 NOT IN SNAPSHOT"));
+  int detailed = 0;
+  for (const std::string& l : sink.lines)
+    detailed += l.rfind("MISMATCH frame=", 0) == 0;
+  EXPECT_GT(detailed, 20);
+  EXPECT_LT(detailed, 40);
+  EXPECT_GT(test.Stats().mismatching_frames, 40u);
+}
+
+// ---- time base ---------------------------------------------------------------------------------------------------------------
+
+TEST(Rev3Rollback, TimeBaseIsRestoredWhenEnabled)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTestOptions o = Options(2);
+  o.restore_timebase = true;
+  SyncTest test(o, game.Ranges(), game.Mem(), sink, FakeClock());
+  for (int i = 0; i < 300; ++i)
+    game.Frame(test);
+  EXPECT_GT(test.Stats().rollbacks, 20u);
+  EXPECT_TRUE(game.TimeBaseConsistent());  // a replayed frame saw the same time base as the first run
+  EXPECT_EQ(game.Mem().time_base_writes, static_cast<int>(test.Stats().rollbacks));
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u);
+  EXPECT_TRUE(sink.Contains("NOTE timebase restore on"));
+  EXPECT_TRUE(sink.Contains(" tb=1"));
+  // K = 2 frames of 1000 ticks moved back; shown in the full lines and in the short ones (restores 11..30).
+  EXPECT_TRUE(sink.Contains("RESTORE 1061 -> 1059 bytes=" + std::to_string(320 + WINDOW) + " us=7 icache_us=7 tb_delta=2000"));
+  int short_with_tb = 0;
+  for (const std::string& l : sink.lines)
+    short_with_tb += l.rfind("RESTORE ", 0) == 0 && l.find(" bytes=") == std::string::npos && l.find(" tb_delta=2000") != std::string::npos;
+  EXPECT_EQ(short_with_tb, 20);
+}
+
+TEST(Rev3Rollback, TimeBaseIsLeftAloneByDefault)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTest test(Options(2), game.Ranges(), game.Mem(), sink, FakeClock());
+  for (int i = 0; i < 300; ++i)
+    game.Frame(test);
+  EXPECT_GT(test.Stats().rollbacks, 20u);
+  EXPECT_EQ(game.Mem().time_base_writes, 0);
+  EXPECT_FALSE(game.TimeBaseConsistent());  // control: the replayed frames see a later time base
+  EXPECT_FALSE(sink.Contains("tb_delta="));
+  EXPECT_FALSE(sink.Contains("NOTE timebase"));
+  EXPECT_TRUE(sink.Contains(" tb=0"));
+}
+
+TEST(Rev3Rollback, TimeBaseRestoreWorksInNoopMode)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTestOptions o = Options(2);
+  o.noop = true;
+  o.restore_timebase = true;
+  SyncTest test(o, game.Ranges(), game.Mem(), sink, FakeClock());
+  for (int i = 0; i < 100; ++i)
+    game.Frame(test);
+  EXPECT_GT(test.Stats().noop_restores, 30u);
+  EXPECT_TRUE(game.TimeBaseConsistent());
+  EXPECT_TRUE(sink.Contains("tb_delta=0"));  // same frame: nothing moved
+}
+
+// ---- user exclusions (REV3_SYNCTEST_EXCLUDE) ---------------------------------------------------------------------------------
+
+TEST(Rev3Rollback, UserExclusionsAreSubtractedAndLogged)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  std::vector<Range> ranges = game.Ranges();
+  std::string error;
+  ASSERT_TRUE(ApplyExclusions(R"({"ranges":[{"start":"0x80500040","end":"0x80500080"},{"start":"0x80900000","end":"0x80900100"}]})",
+                              &ranges, sink, &error))
+      << error;
+  EXPECT_TRUE(sink.Contains("NOTE exclude user 0x80500040-0x80500080 (64 bytes were in the whitelist)"));
+  EXPECT_TRUE(sink.Contains("NOTE exclude user 0x80900000-0x80900100 (0 bytes were in the whitelist)"));
+  size_t bytes = 0;
+  for (const Range& r : ranges)
+    bytes += r.end - r.start;
+  EXPECT_EQ(bytes, 320u - 0x40u);
+  EXPECT_EQ(ranges.size(), 3u);
+
+  // Used for a SyncTest: the word the "hardware" writes inside the excluded part is never rewound.
+  game.EnableHardwareWord();
+  SyncTest test(Options(2), ranges, game.Mem(), sink, FakeClock());
+  for (int i = 0; i < 300; ++i)
+    game.Frame(test);
+  EXPECT_GT(game.RestoresSeen(), 20);
+  EXPECT_TRUE(game.HwWordIntact());
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u);
+  EXPECT_TRUE(sink.Contains(" bytes=256 "));  // the start line: 320 - 64 whitelisted bytes remain
+}
+
+TEST(Rev3Rollback, UserExclusionsRejectBadInput)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  const std::vector<Range> original = game.Ranges();
+  std::vector<Range> ranges = original;
+  std::string error;
+  EXPECT_FALSE(ApplyExclusions("not json", &ranges, sink, &error));
+  EXPECT_FALSE(error.empty());
+  error.clear();
+  EXPECT_FALSE(ApplyExclusions(R"({"ranges":[{"start":"0x80500000","end":"0x80600040"}]})", &ranges, sink, &error));  // removes all
+  EXPECT_NE(error.find("every range"), std::string::npos);
+  ASSERT_EQ(ranges.size(), original.size());  // untouched on failure
+  EXPECT_EQ(ranges[0].start, original[0].start);
+  EXPECT_EQ(ranges[1].end, original[1].end);
+  EXPECT_FALSE(sink.Contains("NOTE exclude user"));
 }

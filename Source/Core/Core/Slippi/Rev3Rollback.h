@@ -28,6 +28,10 @@
 //                            inputs n); exercises the game hook's register reload without any real rollback; no comparisons
 //   REV3_SYNCTEST_HW_EXCLUDE=0   do not cut hardware-DMA regions (GX FIFO, audio DMA, XFB, DVD DMA) out of the snapshot
 //   REV3_SYNCTEST_ICACHE=0       do not invalidate the JIT for restored ranges
+//   REV3_SYNCTEST_TB=1           also store the emulated time base (what the game's OSGetTime reads) in every snapshot and set it
+//                                back on restore (default 0). Decrementer and CoreTiming are left alone.
+//   REV3_SYNCTEST_EXCLUDE=path   JSON {"ranges":[{"start","end"}]} subtracted from the snapshot (logged as NOTE exclude user ...),
+//                                to test excluding audio / scratch ranges without editing the whitelist
 //   SyncTest only runs once armed (both fighters found through the TEAMS pointers); menus and loading screens are never
 //   rolled back. See REV3.md for what a clean run looks like.
 //
@@ -49,6 +53,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "Common/CommonTypes.h"
@@ -111,6 +116,13 @@ constexpr u32 HOOK_REGION_END = 0x80002A00;  // exclusive
 // Removes [lo, hi) from every range (a range around it is split in two, one inside it disappears). Returns the bytes removed.
 u64 SubtractRange(std::vector<Range>* ranges, u32 lo, u32 hi);
 
+class Sink;  // defined below
+
+// REV3_SYNCTEST_EXCLUDE: parses `json_text` like a whitelist ({"ranges":[...]}) and subtracts each range from *ranges, logging one
+// "NOTE exclude user 0xSTART-0xEND (n bytes were in the whitelist)" line per range to `sink`. False (and *ranges untouched) when the
+// JSON is bad or the exclusions would leave nothing; *error says why.
+bool ApplyExclusions(const std::string& json_text, std::vector<Range>* ranges, Sink& sink, std::string* error);
+
 // ---- the fighter checksum fields (rev3-mod rbchecksum.py FIELDS, FIELDS_VERSION 1) ---------------------------------------------
 constexpr u32 TEAMS_ADDR = 0x8038FE50;     // four team pointers; team 0 -> player 1, team 1 -> player 2
 constexpr size_t FIELD_COUNT = 61;
@@ -132,6 +144,10 @@ public:
   virtual bool Write(u32 addr, const void* src, size_t n) = 0;
   // Called after a restore wrote [addr, addr + n): drop any translated code for it (the Dolphin JIT). Default: nothing to do.
   virtual void InvalidateCode(u32 /*addr*/, size_t /*n*/) {}
+  // The emulated time base (TBU:TBL, 64 bit) as the game's mftb reads it right now. False: not available (default).
+  virtual bool ReadTimeBase(u64* /*out*/) const { return false; }
+  // Sets the time base so that the game's next mftb reads `value`. False: not available (default).
+  virtual bool WriteTimeBase(u64 /*value*/) { return false; }
 };
 
 // A memory region that emulated hardware reads or writes on its own (GX FIFO, audio DMA, XFB, DVD DMA). It must not be rewound
@@ -170,6 +186,7 @@ struct SyncTestOptions
   bool arm_by_pad = false;        // arm / disarm on P1's Z press (edge) while fighters are present
   bool noop = false;              // capture then restore the same frame every frame; no comparisons
   bool invalidate_code = true;    // call GuestMemory::InvalidateCode for every restored range
+  bool restore_timebase = false;  // REV3_SYNCTEST_TB=1: store the time base in each snapshot and set it back on restore
   u32 hardware_check_every = 600; // hook calls between two hardware exclusion checks while armed
 };
 
@@ -204,6 +221,10 @@ public:
   // Writes the final summary line (once). The destructor does not.
   void Finish();
 
+  // Optional: returns a one-line description of the DSP / audio DMA state (read without side effects). It is logged once when
+  // SyncTest arms ("NOTE dsp at arm: ...") and appended to every HB line, so a freeze shows whether audio DMA stopped.
+  void SetDspState(std::function<std::string()> dsp_state) { m_dsp_state = std::move(dsp_state); }
+
   const SyncTestStats& Stats() const { return m_stats; }
   bool Active() const { return m_armed; }  // armed (a fight, past the arm delay or toggled on by Z)
   const std::vector<Range>& Ranges() const { return m_ranges; }  // the current snapshot ranges (whitelist minus exclusions)
@@ -222,6 +243,8 @@ private:
     std::array<std::array<u8, FIELD_BYTES>, 2> fields{};    // raw field bytes per player
     std::vector<u32> crc;                                   // CRC32 per whitelist range
     std::array<PadBytes, 2> inputs{};
+    bool timebase_valid = false;
+    u64 timebase = 0;                                       // emulated time base at capture (only with restore_timebase)
   };
 
   bool FindFighters(std::array<u32, 2>* addrs) const;
@@ -234,10 +257,15 @@ private:
   bool Restore(const Slot& s, const Command& command, u32 to);
   Reply Noop(const Command& command);
   void RebuildLayout();
-  void RefreshExclusions();
+  void RefreshExclusions(bool at_arm = false);
   void ClearHistory();
   void Compare(const Slot& reference, const Slot& live, u32 frame);
   void SummaryLine(const char* tag);
+  void LogFieldCoverage(const std::array<u32, 2>& fighters, const char* when);
+  // "0xSTART-0xEND" of the current snapshot range that holds [addr, addr + 4); empty when none does.
+  std::string RangeContaining(u32 addr) const;
+  // Same, plus the slot's stack window ("stack_window 0x..-0x.."); empty when none holds it.
+  std::string SnapshotRangeOf(const Slot& slot, u32 addr) const;
   Slot& SlotFor(u32 frame) { return m_ring[frame % m_ring.size()]; }
 
   SyncTestOptions m_options;
@@ -260,7 +288,10 @@ private:
   bool m_hardware_due = false;  // an exclusion re-check is waiting for a call outside a resimulation
   bool m_prev_z = false;     // Z was down on the previous command
   bool m_z_pending = false;  // a Z press not yet acted on (acted on outside a resimulation)
-  u32 m_restore_logs = 0;    // RESTORE lines written (the first 10 only)
+  u32 m_restore_logs = 0;    // RESTORE lines written (the first 10 in full, restores 11..30 as one short line)
+  std::function<std::string()> m_dsp_state;
+  std::array<u32, 2> m_fighters{};            // the fighter addresses of the latest command (valid while both were found)
+  std::vector<std::string> m_fields_annotated;  // field names already logged with their address / snapshot range
 
   u32 m_streak = 0;          // consecutive commands with both fighters found
   bool m_armed = false;
