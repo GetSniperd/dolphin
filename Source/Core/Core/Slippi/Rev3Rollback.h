@@ -117,6 +117,7 @@
 #include <vector>
 
 #include "Common/CommonTypes.h"
+#include "Core/Slippi/Rev3Bot.h"
 
 namespace Core
 {
@@ -1163,6 +1164,10 @@ constexpr u32 TRACE_EVERY_DEFAULT = 30;                             // REV3_TRAC
 // The fighter structs found through TEAMS (team 0 -> [0], team 1 -> [1]); a team that is not found gives 0. Returns how many were found.
 size_t FindFighterStructs(const GuestMemory& memory, std::array<u32, 2>* addrs);
 
+// What the soak bot / the automatic exit see of the game at a hook call (Bot::GameObs): both fighters found, a found fighter at health 0
+// (+0x28 == 0, as the arm gate reads it), the scene type / sub words (rev3-mod tools/takes/rev3_menu.py SCENE_TYPE / SCENE_SUB). Read-only.
+Bot::GameObs ReadGameObs(const GuestMemory& memory);
+
 // The desync checksum of `frame`, exactly rev3-mod rbchecksum.py checksum(): CRC-32 (zlib, init 0) over u32 BE frame, then for player
 // 1 and 2 (a player not found is skipped) u32 BE player id and the FIELD_COUNT fields' raw big-endian bytes in FIELDS order.
 // Returns how many fighters went into it (0..2); with 0 the checksum is that of the frame alone.
@@ -1240,6 +1245,11 @@ public:
 
   void Finish();  // flushes the record and the trace
 
+  // REV3_PAD_BOT: after the script has had its say (and before the record and the trace), the bot may replace the local pad
+  // (command->pads[0], pad_return = 0x80000000) on calls that are not resimulations. Not owned; null = no bot. See Rev3Bot.h for the takeover rule.
+  void SetBot(Bot::PadBotController* bot) { m_bot = bot; }
+  bool HasBot() const { return m_bot != nullptr; }
+
   u32 RecordedLines() const { return m_record_lines; }
   u32 TraceLines() const { return m_trace_lines; }
   bool ScriptEnded() const { return m_script_ended; }
@@ -1256,6 +1266,7 @@ private:
   u32 m_trace_lines = 0;
   bool m_script_ended = false;
   bool m_unreadable_logged = false;
+  Bot::PadBotController* m_bot = nullptr;
 };
 
 // ---- Dolphin glue ---------------------------------------------------------------------------------------------------------

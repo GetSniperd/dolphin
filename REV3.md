@@ -887,6 +887,43 @@ Tests: `ProtocolsTwoAndThree*`, `ResimHideEnvValuesParse`, `TheFlagWordIs*`, `Ea
 `SyncTestSetsTheFlagsOnlyWhileItResimulates`, `SyncTestWithHooksOfProtocolTwo*`, `TheHideCountersGoIntoTheNetSummaryNote`, `Rev3NetLink.HelloCarriesTheHookProtocol*`.
 Not done: the optional refinement of resim_skip.md 5.4 (clear bit 0 one call earlier so the corrected frame N - 1 is drawn).
 
+## Bot soak (`REV3_PAD_BOT`, `REV3_NET_EXIT`, unattended matches)
+
+Lets two Dolphins play a whole match against each other with nobody at the keyboard and quit by themselves, so a soak (many matches, with
+`REV3_NETSIM`) can run overnight. The driver is `tools/rollback/soak.py` in rev3-mod; this section is the fork side. Code: `Rev3Bot.h/.cpp` (pure,
+unit tested in `Rev3BotTest.cpp`), glue in `Rev3Rollback.cpp` (`DeterminismKit::OnCommand`, `InitializeBot`, `ObserveExit`, `ExitWatcher`).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `REV3_PAD_BOT=<seed>` | off | the local pad (command port 0) is a generated, person-like stream once the fight has started. `<seed>` is a number (u64); the same seed on the same side gives the same pad stream, the host (game port 0) and the guest (port 1) get different streams from the same seed. A bad value is an `ERROR` in the Rev3 log and the bot stays off |
+| `REV3_NET_EXIT=match\|frames:N\|rounds:N` | unset = never | when to quit: `match` = after the match result (below), `frames:N` = N game frames after the fight was found, `rounds:N` = after N KOs (a round ends with a KO) |
+| `REV3_NET_EXIT_WAIT_S=<s>` | 5 | seconds the exit waits after the decision, so both sides see the same last frames and the result screen loads (s) |
+| `REV3_NET_FREEZE_EXIT_S=<s>` | 0 = off | the game thread has not entered the hook for this long after it ran before (s; needs the freeze dump on) -> the process writes `LEAVE ... reason=freeze` / `EXIT freeze` to the Rev3 log and ends with exit code 70 (`std::_Exit`, so the freeze dump of `REV3_SYNCTEST_DUMP` has been written first) |
+| `REV3_NET_MAX_S=<s>` | 0 = off | wall clock cap for the whole process (s) -> exit code 71 |
+
+Takeover (Rev3: scene type 0x803C11D4 = 2 is a match, rev3_menu.py `SCENE_TYPE`; fighters are found through the TEAMS chain, health at
+fighter+0x28, rev3_menu.py / fighter walk in `ReadGameObs`): before the first frame at which both fighters are found the bot sends a menu pad
+(a short A or Start pulse about every 48 frames, jittered, so character and stage select run to the end by themselves). A recorded menu script
+(`REV3_PAD_SCRIPT`, Option A) is the one that really picks the characters and the stage: it is what `soak.py record-menu` records and what each
+soak run plays on both sides, so the characters and the stage are fixed and the fight is reached the same way every run. When the fight is found
+the bot takes the pad over for good, even if the script has frames left. The take system (`tools/takes`) could not be reused to reach a versus
+fight: its navigator is picture and probe driven and targets Training, and the select-screen cursor has no known memory address.
+
+Match over (`ExitController`, numbers in `ExitTuning`, all in hook calls = frames): `rounds:N` and `match` count KOs (a health of zero for 30
+calls in a row, a one call zero while loading is ignored). `match` ends 600 calls after the fighters were lost, 60 calls after the scene type
+left 2 once at least 2 rounds were played, or 1800 calls after the last KO with nothing else seen. The exact Rev3 result-scene values are not
+known, so these are deliberately redundant. The first rule that fires logs `EXIT planned frame=.. reason="..." ko=..`.
+
+Quitting: `Host_Message(WMUserStop)` (the same path as closing the window; Dolphin must run with `-b`, otherwise the Qt main window asks for a
+confirmation or stays open). `Rev3::Shutdown` then writes `BYE` (reason `planned exit: ...`, so the peer logs `LEAVE reason=the peer left (planned
+exit: ...)`) and `SUMMARY`. If the stop has not ended the process after 20 s (`STOP_GRACE_MS`) it ends with exit code 72.
+
+Exit codes: 0 = clean stop, 70 = freeze, 71 = `REV3_NET_MAX_S`, 72 = stop did not finish. Anything else (and a crash) is the runner's CRASH.
+
+Log lines (Rev3 log; the net log gets the `EXIT stop requested` line): `NOTE bot on (REV3_PAD_BOT=..)`, `NOTE automatic exit ..`, `NOTE exit watcher ..`, `BOT fight found frame=..`, `BOT takeover frame=.. why=.. seed=.. port=..`, `BOT mode=fight|menu frame=..`, `EXIT watching ..`, `EXIT ko=<n> frame=..`, `EXIT planned reason=".." frame=.. ko=..`, `EXIT stop requested ..`, `EXIT freeze ..`, `EXIT code=70 (freeze)`, `EXIT max_s ..`, `EXIT stop did not end the process ..`, `ERROR REV3_PAD_BOT ..` / `ERROR REV3_NET_EXIT ..`.
+
+Tests: `Rev3Bot.*` (29), `Rev3Rollback.*Bot*` / `ReadGameObs*`.
+
 ## Known gaps (after M6 fork side)
 
 - Pacing and MAXR measurement are built (M5) but only run in the test network; the real numbers are D's loopback (above). Not done: a pacing OSD line (the log has it), and the adaptive MAXR is off by default.

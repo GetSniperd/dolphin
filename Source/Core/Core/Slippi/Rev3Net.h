@@ -196,6 +196,9 @@ public:
   Reply OnCommand(const Command& command);
   // Leaves the session (BYE to the peer), writes the final lines, stops the network thread. Idempotent.
   void Shutdown();
+  // The reason the BYE carries when the emulator closes (default "the emulator was closed"). The unattended soak sets "planned exit: ..." before
+  // it asks the emulator to stop, so the peer's `LEAVE ... reason=the peer left (planned exit: ...)` is told apart from a crash.
+  void SetExitReason(const std::string& reason) { m_exit_reason = reason; }
 
 private:
   void Start(const Command& command);
@@ -213,6 +216,7 @@ private:
 
   bool m_started = false;
   bool m_shut_down = false;
+  std::string m_exit_reason = "the emulator was closed";
   GateTracker m_gate_tracker;
   ResimHiding m_hiding;
   Gate m_last_gate;
