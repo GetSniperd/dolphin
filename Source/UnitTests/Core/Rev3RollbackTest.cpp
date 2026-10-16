@@ -3954,3 +3954,192 @@ TEST(Rev3Rollback, LearningAPageWhileArmedBlocksRollbacksToOlderSnapshots)
   test.Finish();
   EXPECT_TRUE(sink.Contains("layout_refused=0 late_learn_rollbacks="));
 }
+
+// ---- learned-page reporting (names the pages; the include-file tool reads these lines) ----------------------------------------------
+
+TEST(Rev3Rollback, FormatRangeListNamesRangesAndCapsTheList)
+{
+  EXPECT_EQ(FormatRangeList({}, 4), "");
+  EXPECT_EQ(FormatRangeList({{0x80A00000, 0x80A01000}}, 4), "0x80A00000-0x80A01000");
+  const std::vector<Range> five = {{0x80000000, 0x80001000}, {0x80002000, 0x80003000}, {0x80004000, 0x80005000},
+                                   {0x90000000, 0x90002000}, {0x93FFF000, 0x94000000}};
+  EXPECT_EQ(FormatRangeList(five, 3), "0x80000000-0x80001000,0x80002000-0x80003000,0x80004000-0x80005000,+2 more");
+  EXPECT_EQ(FormatRangeList(five, 5), "0x80000000-0x80001000,0x80002000-0x80003000,0x80004000-0x80005000,0x90000000-0x90002000,"
+                                       "0x93FFF000-0x94000000");
+  EXPECT_EQ(FormatRangeList(five, 0), "+5 more");
+}
+
+TEST(Rev3Rollback, NewRangesAndPageCounts)
+{
+  const std::vector<Range> before = {{0x80001000, 0x80003000}, {0x80010000, 0x80011000}};
+  const std::vector<Range> after = {{0x80001000, 0x80004000}, {0x8000F000, 0x80011000}, {0x80020000, 0x80021000}};
+  const std::vector<Range> fresh = NewRanges(after, before);
+  ASSERT_EQ(fresh.size(), 3u);
+  EXPECT_EQ(fresh[0].start, 0x80003000u);
+  EXPECT_EQ(fresh[0].end, 0x80004000u);
+  EXPECT_EQ(fresh[1].start, 0x8000F000u);
+  EXPECT_EQ(fresh[1].end, 0x80010000u);
+  EXPECT_EQ(fresh[2].start, 0x80020000u);
+  EXPECT_EQ(RangesBytes(fresh), 0x3000u);
+  EXPECT_EQ(RangesPages(fresh), 3u);
+  EXPECT_EQ(RangesPages({{0x80000000, 0x80000010}, {0x80002000, 0x80002800}}), 1u);  // 0x810 bytes round up to one page
+  EXPECT_EQ(RangesPages({}), 0u);
+  EXPECT_TRUE(NewRanges(before, before).empty());
+  EXPECT_EQ(CountTouching(fresh, before), 2u);  // 0x80003000 starts where an old range ends; 0x8000F000-0x80010000 ends where one starts
+}
+
+TEST(Rev3Rollback, PadRangesIsClippedToTheRegion)
+{
+  // 1 page each side, merged where the pads meet.
+  std::vector<Range> padded = PadRanges({{0x80005000, 0x80006000}, {0x80007000, 0x80008000}}, 0x1000);
+  ASSERT_EQ(padded.size(), 1u);
+  EXPECT_EQ(padded[0].start, 0x80004000u);
+  EXPECT_EQ(padded[0].end, 0x80009000u);
+  // Not past the start of MEM1, not past the end of MEM1 / MEM2, never across the gap between them.
+  padded = PadRanges({{0x80000000, 0x80001000}, {0x817FF000, 0x81800000}, {0x90000000, 0x90001000}, {0x93FFF000, 0x94000000}}, 0x3000);
+  ASSERT_EQ(padded.size(), 4u);
+  EXPECT_EQ(padded[0].start, 0x80000000u);
+  EXPECT_EQ(padded[0].end, 0x80004000u);
+  EXPECT_EQ(padded[1].start, 0x817FC000u);
+  EXPECT_EQ(padded[1].end, 0x81800000u);
+  EXPECT_EQ(padded[2].start, 0x90000000u);
+  EXPECT_EQ(padded[2].end, 0x90004000u);
+  EXPECT_EQ(padded[3].start, 0x93FFC000u);
+  EXPECT_EQ(padded[3].end, 0x94000000u);
+  // Zero pad = merge only; ranges outside both regions are untouched; an empty range disappears.
+  padded = PadRanges({{0x2000, 0x3000}, {0x2800, 0x3800}, {0x80001000, 0x80001000}}, 0);
+  ASSERT_EQ(padded.size(), 1u);
+  EXPECT_EQ(padded[0].start, 0x2000u);
+  EXPECT_EQ(padded[0].end, 0x3800u);
+  padded = PadRanges({{0x2000, 0x3000}}, 0x1000);
+  ASSERT_EQ(padded.size(), 1u);
+  EXPECT_EQ(padded[0].start, 0x2000u);
+  EXPECT_EQ(padded[0].end, 0x3000u);
+}
+
+TEST(Rev3Rollback, LearnedSummaryNamesEveryPageLearnedAfterArming)
+{
+  FakeGame game(false);
+  game.SetLatePage(1500);
+  FakeSink sink;
+  SyncTest test(AdaptiveOptions(3), {}, game.Mem(), sink, FakeClock());
+  while (game.Counter() < 1500)
+    game.Frame(test);
+  ASSERT_TRUE(test.Active());
+  EXPECT_FALSE(sink.Contains("NOTE learned summary"));
+  for (int i = 0; i < 400 && !sink.Contains("NOTE learned +"); ++i)
+    game.Frame(test);
+  ASSERT_TRUE(LinesContain(sink, "NOTE learned +1 pages", "new=[0x80A00000-0x80A01000]"));
+  // The periodic SUMMARY line carries the summary only when it changed; Finish always writes it once.
+  test.Finish();
+  EXPECT_EQ(test.LearnedRanges().size(), 1u);
+  EXPECT_TRUE(sink.Contains("NOTE learned summary pages=1 ranges=[0x80A00000-0x80A01000]"));
+  EXPECT_TRUE(sink.Contains("NOTE learned adjacency growths=1 ranges_touching_old_set=0 learn_pad_pages=0"));
+  int summaries = 0;
+  for (const std::string& l : sink.lines)
+    summaries += l.rfind("NOTE learned summary", 0) == 0;
+  EXPECT_EQ(summaries, 1);
+}
+
+TEST(Rev3Rollback, LearnedSummaryIsWrittenEvenWhenNothingWasLearned)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTest test(AdaptiveOptions(2), {}, game.Mem(), sink, FakeClock());
+  for (int i = 0; i < 400; ++i)
+    game.Frame(test);
+  ASSERT_TRUE(test.Active());
+  test.Finish();
+  EXPECT_TRUE(sink.Contains("NOTE learned summary pages=0 ranges=[]"));
+}
+
+TEST(Rev3Rollback, RateLimitedLearnLinesStillNameEveryPageInTheSummary)
+{
+  FakeGame game(false);
+  game.SetWalker(4400, 22 * 0x1000);  // see LearningWhileArmedIsRateLimitedInTheLog: 60 growths in a row, each 22 pages further on
+  FakeSink sink;
+  SyncTest test(AdaptiveOptions(2, 1024, 3), {}, game.Mem(), sink, FakeClock());
+  while (game.Counter() < 4400 + 1100)
+    game.Frame(test);
+  ASSERT_TRUE(test.Active());
+  test.Finish();
+  // Every learned page is in the summary, whether or not its own line was logged: the walker's pages are 22 pages apart, so one range each.
+  EXPECT_EQ(RangesPages(test.LearnedRanges()), test.Stats().pages_learned_armed);
+  EXPECT_GE(test.LearnedRanges().size(), 50u);
+  std::string summary;
+  for (const std::string& l : sink.lines)
+  {
+    if (l.rfind("NOTE learned summary", 0) == 0)
+      summary = l;
+  }
+  EXPECT_NE(summary.find("0x80C00000-0x80C01000"), std::string::npos) << summary;
+  EXPECT_EQ(summary.find("more"), std::string::npos) << summary;  // far under MAX_LEARN_SUMMARY_RANGES
+  // A "NOTE learned +n" line is capped (16 ranges named, the rest counted) and the pages named in all of them are the learned ones.
+  size_t named = 0;
+  for (const std::string& l : sink.lines)
+  {
+    if (l.rfind("NOTE learned +", 0) != 0)
+      continue;
+    const size_t at = l.find("new=[");
+    ASSERT_NE(at, std::string::npos) << l;
+    const size_t close = l.find(']', at);
+    ASSERT_NE(close, std::string::npos) << l;
+    const std::string list = l.substr(at + 5, close - at - 5);
+    named += static_cast<size_t>(std::count(list.begin(), list.end(), '-'));
+  }
+  EXPECT_GE(named, 10u);
+}
+
+TEST(Rev3Rollback, LearnPadTakesTheNeighbouringPagesAlong)
+{
+  for (const u32 pad : {0u, 1u, 2u})
+  {
+    FakeGame game(false);
+    game.SetLatePage(1500);
+    FakeSink sink;
+    SyncTestOptions o = AdaptiveOptions(3);
+    o.learn_pad_pages = pad;
+    SyncTest test(o, {}, game.Mem(), sink, FakeClock());
+    while (game.Counter() < 1500)
+      game.Frame(test);
+    ASSERT_TRUE(test.Active());
+    for (int i = 0; i < 400 && !sink.Contains("NOTE learned +"); ++i)
+      game.Frame(test);
+    ASSERT_TRUE(sink.Contains("NOTE learned +"));
+    EXPECT_TRUE(SetContains(test.Ranges(), LATE_PAGE));
+    EXPECT_EQ(SetContains(test.Ranges(), LATE_PAGE - 0x1000), pad >= 1) << pad;
+    EXPECT_EQ(SetContains(test.Ranges(), LATE_PAGE + 0x1000), pad >= 1) << pad;
+    EXPECT_EQ(SetContains(test.Ranges(), LATE_PAGE + 0x2000), pad >= 2) << pad;
+    EXPECT_FALSE(SetContains(test.Ranges(), LATE_PAGE + 0x3000)) << pad;
+    // The log names the whole learned run, pad included.
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "new=[0x%08X-0x%08X]", LATE_PAGE - pad * 0x1000, LATE_PAGE + 0x1000 + pad * 0x1000);
+    const std::string expect = buf;
+    EXPECT_TRUE(LinesContain(sink, "NOTE learned +1 pages", expect)) << pad;
+  }
+}
+
+TEST(Rev3Rollback, LearnPadMakesTheNeighbourPageFreeToLearnLater)
+{
+  // A page next to a learned one that starts to change later is already in the set: no relayout, no cleared history.
+  FakeGame game(false);
+  game.SetLatePage(1500);
+  FakeSink sink;
+  SyncTestOptions o = AdaptiveOptions(3);
+  o.learn_pad_pages = 1;
+  SyncTest test(o, {}, game.Mem(), sink, FakeClock());
+  while (game.Counter() < 1500)
+    game.Frame(test);
+  for (int i = 0; i < 400 && !sink.Contains("NOTE learned +"); ++i)
+    game.Frame(test);
+  ASSERT_TRUE(sink.Contains("NOTE learned +"));
+  for (int i = 0; i < 30; ++i)
+    game.Frame(test);
+  const size_t bytes = test.SnapshotBytes();
+  const u32 growths = static_cast<u32>(test.LearnedRanges().size());
+  game.Mem().SetU32(LATE_PAGE + 0x1000, 1);  // the neighbour page changes for the first time
+  for (int i = 0; i < 100; ++i)
+    game.Frame(test);
+  EXPECT_EQ(test.SnapshotBytes(), bytes);
+  EXPECT_EQ(test.LearnedRanges().size(), growths);
+}

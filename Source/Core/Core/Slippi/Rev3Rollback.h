@@ -194,6 +194,21 @@ bool ApplyExclusions(const std::string& json_text, std::vector<Range>* ranges, S
 // Sorts by start and merges overlapping or touching ranges.
 std::vector<Range> MergeRanges(std::vector<Range> ranges);
 
+// ---- learned-page reporting (pure helpers; tools/rollback/learned_include.py reads what they print) ----------------------------
+// "0xSTART-0xEND,0xSTART-0xEND,..." in the order given; at most `max_listed` entries, then ",+N more" (N = the rest). An empty list gives "".
+std::string FormatRangeList(const std::vector<Range>& ranges, size_t max_listed);
+// The bytes in `ranges` (they are assumed not to overlap, e.g. MergeRanges output), and that many 4 KB pages, rounded up.
+u64 RangesBytes(const std::vector<Range>& ranges);
+u64 RangesPages(const std::vector<Range>& ranges);
+// `after` minus `before`: the parts of `after` that `before` does not cover (sorted, merged).
+std::vector<Range> NewRanges(const std::vector<Range>& after, const std::vector<Range>& before);
+// How many ranges of `fresh` touch (share a boundary with) a range of `old`: a page learned right next to a page that was already
+// in the set, i.e. what REV3_SNAPSHOT_PAD would have caught.
+size_t CountTouching(const std::vector<Range>& fresh, const std::vector<Range>& old);
+// Widens every range by `pad_bytes` at both ends, clipped to the MEM1 / MEM2 region that holds it (never across the gap between them);
+// the result is merged. Ranges outside both regions are kept as they are. pad_bytes 0 = MergeRanges only.
+std::vector<Range> PadRanges(std::vector<Range> ranges, u32 pad_bytes);
+
 // REV3_SNAPSHOT_INCLUDE: parses `json_text` with the very entry formats ApplyExclusions takes ({"start","end"} ranges and pointer based
 // {"ptr","size","note"} entries) but for the opposite purpose: the regions are forced INTO the snapshot set when SyncTest (or a netplay
 // session) arms. Fixed ranges go to *fixed, pointer entries to *ptrs (the u32 at `ptr` is read at arm and [value, value + size) is
@@ -509,6 +524,9 @@ struct SyncTestOptions
   u32 scan_slices = 16;           // REV3_SYNCTEST_SCAN_SLICES: each hook call hashes 1/scan_slices of all pages (1..4096)
   u32 learn_cycles = 20;          // REV3_SYNCTEST_LEARN: full scan cycles (scan_slices calls each) needed before arming
   bool ef_pool = true;            // REV3_EF_POOL: force the nw4r::ef pool into the snapshot set at arm (FindEfPool)
+  u32 learn_pad_pages = 0;        // REV3_SNAPSHOT_PAD: every page the tracker learned also pulls this many 4 KB pages on each side into the set
+                                  // (0 = off, 0..16). More bytes per snapshot (see the NOTE learn pad line), fewer late relayouts when a game
+                                  // block spans pages that change one after the other. A page that never changes costs only copy time.
   u32 ef_check_restores = 200;    // REV3_EFCHECK: restores (count, not frames) that get the ef list check before / after the write-back;
                                   // 0 = off, EF_CHECK_ALL = every restore. 200 restores = 200 checks of a few thousand reads each (microseconds)
 };
@@ -629,6 +647,13 @@ public:
   size_t DynamicPages() const { return m_tracker.DynamicPages(); }
   u32 LearnCycles() const { return m_tracker.Cycles(); }
 
+  // Learned-page bookkeeping (pages that entered the set after the first arm). NoteLearned adds `after` minus `before` to the all-time list
+  // and to the list of pages not yet logged, and returns the new part. LearnedSummaryLine writes `NOTE learned summary pages=N ranges=[..]`
+  // (+ `NOTE learned adjacency ..`); SyncTest::Finish and every SUMMARY line do. The netplay session calls NoteLearned when the set grows.
+  std::vector<Range> NoteLearned(const std::vector<Range>& before, const std::vector<Range>& after);
+  void LearnedSummaryLine();
+  const std::vector<Range>& LearnedRanges() const { return m_learned_all; }
+
 private:
   struct Slot
   {
@@ -737,6 +762,11 @@ private:
   u32 m_learn_logs = 0;          // "NOTE learned" lines written
   u32 m_learn_log_call = 0;      // m_armed_calls at the last such line
   u32 m_learned_unlogged = 0;    // pages learned since that line
+  std::vector<Range> m_learned_all;       // every range that entered the set after the first arm (merged)
+  std::vector<Range> m_learned_unlogged_ranges;  // the part of it not yet named in a "NOTE learned" line
+  size_t m_learned_fresh_ranges = 0;      // learned ranges (one per growth) ... and how many touched the set as it was
+  size_t m_learned_touching = 0;
+  u64 m_learned_summary_pages = ~0ull;    // pages in the latest `learned summary` line (a SUMMARY line repeats it only when this changed)
   u64 m_scan_iv_total = 0;       // scan time since the last HB line (microseconds), its count and its maximum
   u32 m_scan_iv_n = 0;
   u64 m_scan_iv_max = 0;

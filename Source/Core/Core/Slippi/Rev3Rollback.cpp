@@ -70,6 +70,8 @@ constexpr size_t MAX_AUDIO_STATE_BYTES = 4u << 20;  // a larger audio state is n
 constexpr u32 MAX_AUDIO_SIZE_NOTES = 3;           // "audio state size changed" lines (the size varies with the HLE mail queue)
 constexpr u32 MAX_RESTORE_LOGS = 10;              // the first restores log RESTORE begin / done lines (bytes, microseconds)
 constexpr u32 MAX_SHORT_RESTORE_LOGS = 30;        // restores 11..30 log one short line "RESTORE n -> m us=.." (places a later hang)
+constexpr size_t MAX_LEARN_LIST_RANGES = 16;      // ranges named in one "NOTE learned +n pages" line (then ",+N more"; the summary names all of them)
+constexpr size_t MAX_LEARN_SUMMARY_RANGES = 2000; // ranges named in "NOTE learned summary" (about 22 bytes each; the list is merged, so far fewer occur)
 constexpr u32 MAX_LEARN_LOGS = 10;                // "NOTE learned" lines written in full, then at most one per LEARN_LOG_EVERY armed calls
 constexpr u32 LEARN_LOG_EVERY = 300;
 constexpr u32 MAX_IO_POSTPONE_LOGS = 5;           // "NOTE rollback postponed" lines (the count continues in SUMMARY)
@@ -466,6 +468,88 @@ std::vector<Range> MergeRanges(std::vector<Range> ranges)
   return out;
 }
 
+// ---- (2b) learned-page reporting --------------------------------------------------------------------------------------------
+
+std::string FormatRangeList(const std::vector<Range>& ranges, size_t max_listed)
+{
+  std::string out;
+  for (size_t i = 0; i < ranges.size(); ++i)
+  {
+    if (i == max_listed)
+    {
+      out += Format("%s+%zu more", i == 0 ? "" : ",", ranges.size() - i);
+      break;
+    }
+    out += Format("%s0x%08X-0x%08X", i == 0 ? "" : ",", ranges[i].start, ranges[i].end);
+  }
+  return out;
+}
+
+u64 RangesBytes(const std::vector<Range>& ranges)
+{
+  u64 total = 0;
+  for (const Range& r : ranges)
+    total += r.end > r.start ? r.end - r.start : 0;
+  return total;
+}
+
+u64 RangesPages(const std::vector<Range>& ranges)
+{
+  return (RangesBytes(ranges) + PAGE_SIZE - 1) / PAGE_SIZE;
+}
+
+std::vector<Range> NewRanges(const std::vector<Range>& after, const std::vector<Range>& before)
+{
+  std::vector<Range> fresh = MergeRanges(after);
+  for (const Range& old_range : before)
+    SubtractRange(&fresh, old_range.start, old_range.end);
+  return fresh;
+}
+
+size_t CountTouching(const std::vector<Range>& fresh, const std::vector<Range>& old)
+{
+  size_t touching = 0;
+  for (const Range& f : fresh)
+  {
+    for (const Range& o : old)
+    {
+      if (o.end == f.start || o.start == f.end)
+      {
+        ++touching;
+        break;
+      }
+    }
+  }
+  return touching;
+}
+
+std::vector<Range> PadRanges(std::vector<Range> ranges, u32 pad_bytes)
+{
+  for (Range& r : ranges)
+  {
+    if (r.end <= r.start || pad_bytes == 0)
+      continue;
+    u32 lo, hi;
+    if (InMem1(r.start))
+    {
+      lo = MEM1_BASE;
+      hi = MEM1_END;
+    }
+    else if (InMem2(r.start))
+    {
+      lo = MEM2_BASE;
+      hi = MEM2_END;
+    }
+    else
+    {
+      continue;
+    }
+    r.start = r.start - lo > pad_bytes ? r.start - pad_bytes : lo;
+    r.end = static_cast<u32>(std::min<u64>(static_cast<u64>(r.end) + pad_bytes, hi));
+  }
+  return MergeRanges(std::move(ranges));
+}
+
 // ---- (3) the fighter field table ------------------------------------------------------------------------------------------
 
 // rev3-mod rbchecksum.py FIELDS (FIELDS_VERSION 1, fields_digest 0xD4076EF2), same order.
@@ -702,7 +786,11 @@ std::vector<Range> SyncTest::ComputeRanges(const std::vector<Range>& forced) con
     all = MergeRanges(std::move(all));
   if (m_options.adaptive)
   {
-    m_tracker.AppendDynamicRanges(&all);
+    std::vector<Range> dynamic;
+    m_tracker.AppendDynamicRanges(&dynamic);
+    if (m_options.learn_pad_pages != 0)  // REV3_SNAPSHOT_PAD: the neighbours of a learned page come along (they are cut like the rest below)
+      dynamic = PadRanges(std::move(dynamic), m_options.learn_pad_pages * PAGE_SIZE);
+    all.insert(all.end(), dynamic.begin(), dynamic.end());
     for (u32 fighter : m_fighters)
     {
       const u32 region_end = RegionEnd(fighter);
@@ -1515,6 +1603,7 @@ void SyncTest::Compare(const Slot& reference, const Slot& live, u32 frame)
 
 void SyncTest::SummaryLine(const char* tag)
 {
+  LearnedSummaryLine();  // only when the learned pages changed since the last such line
   const double n = m_stats.restores != 0 ? static_cast<double>(m_stats.restores) : 1.0;
   m_sink.Line(Format("%s frame=%u rollbacks=%u frames_compared=%u mismatching_frames=%u restore_us_mean=%.1f restore_us_max=%llu "
                      "icache_us_mean=%.1f icache_us_max=%llu sp_mismatches=%u noop_restores=%u dynamic_pages=%zu scan_us_mean=%.1f "
@@ -1531,11 +1620,42 @@ void SyncTest::SummaryLine(const char* tag)
                      m_stats.layout_refused, m_stats.late_learn_rollbacks));
 }
 
+// Pages that entered the set after the first arm: the part of `after` that `before` lacks goes to the all-time list (merged) and to the
+// list of pages not yet named in a log line. Also counts how many of the new ranges touch the old set (see CountTouching).
+std::vector<Range> SyncTest::NoteLearned(const std::vector<Range>& before, const std::vector<Range>& after)
+{
+  std::vector<Range> fresh = NewRanges(after, before);
+  if (fresh.empty())
+    return fresh;
+  m_learned_fresh_ranges += fresh.size();
+  m_learned_touching += CountTouching(fresh, before);
+  m_learned_all.insert(m_learned_all.end(), fresh.begin(), fresh.end());
+  m_learned_all = MergeRanges(std::move(m_learned_all));
+  m_learned_unlogged_ranges.insert(m_learned_unlogged_ranges.end(), fresh.begin(), fresh.end());
+  m_learned_unlogged_ranges = MergeRanges(std::move(m_learned_unlogged_ranges));
+  return fresh;
+}
+
+// `NOTE learned summary pages=N ranges=[..]` = every page learned after the first arm, merged (MAX_LEARN_SUMMARY_RANGES named at most);
+// pages = bytes / 4 KB rounded up. The line after it says how many of the growths touched pages already in the set.
+void SyncTest::LearnedSummaryLine()
+{
+  const u64 pages = RangesPages(m_learned_all);
+  if (pages == m_learned_summary_pages)
+    return;
+  m_learned_summary_pages = pages;
+  m_sink.Line(Format("NOTE learned summary pages=%llu ranges=[%s]", static_cast<unsigned long long>(pages),
+                     FormatRangeList(m_learned_all, MAX_LEARN_SUMMARY_RANGES).c_str()));
+  m_sink.Line(Format("NOTE learned adjacency growths=%zu ranges_touching_old_set=%zu learn_pad_pages=%u", m_learned_fresh_ranges,
+                     m_learned_touching, m_options.learn_pad_pages));
+}
+
 void SyncTest::Finish()
 {
   if (m_finished)
     return;
   m_finished = true;
+  LearnedSummaryLine();
   SummaryLine("SUMMARY final");
 }
 
@@ -1549,10 +1669,9 @@ void SyncTest::LearnWhileArmed(u32 added)
   std::vector<Range> ranges = ComputeRanges();
   if (SameRanges(ranges, m_ranges))
     return;
-  // What is new: the new set minus the old one (listed in the log, so a run shows WHICH pages the game touched after the learning phase).
-  std::vector<Range> fresh = ranges;
-  for (const Range& old_range : m_ranges)
-    SubtractRange(&fresh, old_range.start, old_range.end);
+  // What is new: the new set minus the old one (named in the log, so a run shows WHICH pages the game touched after the learning phase;
+  // tools/rollback/learned_include.py turns these lines into a REV3_SNAPSHOT_INCLUDE file).
+  NoteLearned(m_ranges, ranges);
   m_ranges = std::move(ranges);
   RebuildLayout();
   ClearHistory();
@@ -1566,17 +1685,15 @@ void SyncTest::LearnWhileArmed(u32 added)
   {
     ++m_learn_logs;
     m_learn_log_call = m_armed_calls;
-    std::string where;
-    for (size_t i = 0; i < fresh.size() && i < 4; ++i)
-      where += Format("%s0x%08X-0x%08X", i == 0 ? "" : ",", fresh[i].start, fresh[i].end);
-    if (fresh.size() > 4)
-      where += Format(",+%zu more", fresh.size() - 4);
+    // Every range learned since the previous such line (rate limiting must not hide pages), merged, at most MAX_LEARN_LIST_RANGES named.
+    const std::string where = FormatRangeList(m_learned_unlogged_ranges, MAX_LEARN_LIST_RANGES);
     m_sink.Line(Format("NOTE learned +%u pages (now ranges=%zu bytes=%zu) frame %u, history cleared; new=[%s]%s", m_learned_unlogged,
                        m_ranges.size(), m_ranges_bytes, m_last_frame, where.c_str(),
                        late ? " WARNING a rollback ran within the last scan cycle without these pages" : ""));
     m_sink.Line(Format("NOTE snapshot now ranges=%zu bytes=%zu snapshot_bytes=%zu slots=%zu", m_ranges.size(), m_ranges_bytes,
                        m_snapshot_bytes, m_ring.size()));
     m_learned_unlogged = 0;
+    m_learned_unlogged_ranges.clear();
     if (m_learn_logs == MAX_LEARN_LOGS)
       m_sink.Line(Format("NOTE further learning is logged at most every %u hook calls", LEARN_LOG_EVERY));
   }
@@ -3791,6 +3908,15 @@ void Initialize(Module& module, Core::System& system)
   options.invalidate_code = GetEnv("REV3_SYNCTEST_ICACHE") != "0";
   options.restore_timebase = GetEnv("REV3_SYNCTEST_TB") == "1";
   options.ef_pool = GetEnv("REV3_EF_POOL") != "0";
+  // REV3_SNAPSHOT_PAD=<pages>: each learned page also pulls this many neighbouring 4 KB pages (each side) into the snapshot set.
+  const std::string pad = GetEnv("REV3_SNAPSHOT_PAD");
+  if (!pad.empty())
+  {
+    if (ParseInt(pad, &value) && value >= 0 && value <= 16)
+      options.learn_pad_pages = static_cast<u32>(value);
+    else
+      ERROR_LOG_FMT(SLIPPI, "Rev3 SyncTest: ignoring REV3_SNAPSHOT_PAD={} (0..16)", pad);
+  }
   // REV3_EFCHECK: unset = the first 200 restores, 0 = off, all = every restore, N = the first N restores.
   const std::string efcheck = GetEnv("REV3_EFCHECK");
   if (!efcheck.empty())
@@ -3890,6 +4016,11 @@ void Initialize(Module& module, Core::System& system)
   {
     module.sink->Line(Format("NOTE removed %llu bytes of the hook region 0x%08X-0x%08X from the whitelist",
                              static_cast<unsigned long long>(hook_bytes), HOOK_REGION_START, HOOK_REGION_END));
+  }
+  if (options.learn_pad_pages != 0)
+  {
+    module.sink->Line(Format("NOTE learn pad pages=%u (REV3_SNAPSHOT_PAD): every learned page also takes %u KB on each side into the snapshot set",
+                             options.learn_pad_pages, options.learn_pad_pages * PAGE_SIZE / 1024));
   }
   if (hardware_exclude)
     module.hardware = std::make_unique<DolphinHardware>(system, *module.sink);

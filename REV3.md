@@ -77,6 +77,7 @@ Run (set the variables before starting Slippi_Dolphin.exe; the patched game with
 | `REV3_SYNCTEST_EXCLUDE=path` | optional JSON `{"ranges":[{"start","end"}]}` (same format as the whitelist) subtracted from the snapshot after the whitelist is loaded; each range is logged as `NOTE exclude user 0x..-0x.. (n bytes were in the whitelist)`. Use it to test excluding audio / scratch ranges without editing the whitelist. A bad file or one that removes everything (classic mode only) turns SyncTest off with an error. Entries may be pointer based, `{"ptr":"0x8049D000","size":"0x3F0000","note":"nw4r sound system"}`: the u32 at `ptr` is read when SyncTest arms and at every exclusion re-check (every 600 hook calls) and `[value, value+size)` is excluded (for heaps the game allocates at run time: sound system work block `*0x8049D000` 0x3F0000 bytes, Home Button sound block `*0x80461B50` 0x18700 bytes). Logged as `NOTE exclude ptr entry 0x.. size=.. note=..` once, then `NOTE exclude ptr 0x8049D000 -> 0xS-0xE (n bytes were in the whitelist)` per resolved region (a region that moves adds a cut, the old one stays) or `NOTE exclude ptr 0x.. skipped: pointer is 0 | pointer is outside MEM1 / MEM2 (value 0x..)` once per value |
 | `REV3_EF_POOL=0` | do not force the nw4r::ef effect pool into the snapshot at arm (default 1, see "Effect pool" below) |
 | `REV3_SNAPSHOT_INCLUDE=path` | optional JSON, the very entry formats of `REV3_SYNCTEST_EXCLUDE` (`{"start","end"}` ranges, `{"ptr","size","note"}` pointer entries): these regions are forced INTO the snapshot set at every arm, on top of the learned pages (and of the ef pool). Logged `NOTE include user 0x..-0x.. (n bytes ...)`, `NOTE include ptr entry ..` at start and `NOTE include ptr 0x.. -> 0xS-0xE (n bytes) note=..` / `NOTE include ptr 0x.. skipped: pointer is 0 \| outside MEM1 / MEM2` at arm, then `NOTE forced include: ranges=.. bytes=..; the snapshot set grows by n bytes`. The cuts (hook region, `REV3_SYNCTEST_EXCLUDE`, hardware regions) still win. A bad file turns SyncTest off with an error (like the exclude file). Use it to test a suspicion without rebuilding |
+| `REV3_SNAPSHOT_PAD=n` | 0..16, default 0 = off. Every page the tracker learns also pulls n neighbouring 4 KB pages on each side into the snapshot set (clipped to MEM1 / MEM2, cuts still win; `NOTE learn pad pages=n ..` at start). Costs snapshot bytes (up to 2n pages per learned run), saves relayouts when a game block spans pages that start to change one after the other. Whether it would have helped a run is in `NOTE learned adjacency` (below) |
 | `REV3_EFCHECK=N\|all\|0` | the ef list check around restores (see "Effect pool"): unset = the first 200 restores, `N` = the first N, `all` = every restore, `0` = off |
 | `REV3_SYNCTEST_LOG=path` | log file (default `<User>\Logs\rev3_synctest.log`), appended, flushed per line |
 
@@ -95,7 +96,7 @@ once (whitelist=(none) and ranges=0 with the adaptive set and no seed); `NOTE ar
 adaptive: `NOTE learning complete: 20 scan cycles (slices=16) dynamic_pages=.. (.. bytes) at frame N`, `NOTE arm deferred: learning (n/20
 cycles)` (once per wish), `NOTE arm cancelled by Z at frame N`, at arm `NOTE adaptive set at arm: dynamic_pages=.. (.. bytes)
 scan_cycles=.. slices=.. ranges=.. bytes=.. snapshot_bytes=..` and `NOTE snapshot now ranges=.. bytes=.. snapshot_bytes=.. slots=..`,
-while armed `NOTE learned +n pages (now ranges=.. bytes=..) frame N, history cleared` followed by `NOTE snapshot now ...` (the first 10
+while armed `NOTE learned +n pages (now ranges=.. bytes=..) frame N, history cleared; new=[0xS-0xE,..]` followed by `NOTE snapshot now ...` (the first 10
 growths, then at most one per 300 hook calls plus `NOTE further learning is logged at most every 300 hook calls`),
 `ERROR frame N: not all fighter fields are inside the snapshot set (an exclusion cuts a fighter struct); not arming` (after the
 `NOTE field coverage` lines naming the missing fields);
@@ -276,6 +277,41 @@ NOT cover is the other direction: a page noticed late. Rollbacks that ran during
 and its discovery did not rewind that page. `NOTE learned +n pages (...); new=[0xS-0xE,..]` now lists the new pages and adds `WARNING a
 rollback ran within the last scan cycle without these pages` (counted in `late_learn_rollbacks`) when that happened. Any such line in a
 netplay run names a region that should be added to `REV3_SNAPSHOT_INCLUDE` (or to the code, like the ef pool).
+
+### Late-learned pages: naming them, and keeping them out of the next relayout
+
+A page is learned when its hash differs between two scans one cycle (16 hook calls) apart, so a page the game writes only now and then
+(an effect, a special move, a sound) is found in the middle of a fight, long after the 20 learning cycles. In netplay each such growth is
+a relayout (`GATE relayout`): the snapshot history is dropped and no rollback is possible until it has refilled (a D match: 25 relayouts of
+1-3 pages each). Three things help, in this order of cost:
+
+1. **Name the pages.** Every `NOTE learned +n pages` line (SyncTest; the netplay line `... while slots are in use` on rev3-net, see below)
+   ends in `new=[0xS-0xE,..]`: merged runs, at most 16 named then `,+N more`. A rate limited SyncTest line names every range learned since the
+   previous line. `NOTE learned summary pages=N ranges=[0xS-0xE,..]` lists ALL pages learned after the first arm, merged (N = bytes / 4 KB,
+   rounded up; at most 2000 ranges named). It is written with the periodic SUMMARY line when the list changed and always at shutdown
+   (`pages=0 ranges=[]` when nothing was learned, so a log shows the fork has the line); `NOTE learned adjacency growths=.. ranges_touching_old_set=..
+   learn_pad_pages=..` says how many of the new ranges lay directly next to a range that was already in the set.
+2. **Include them next time.** `tools/rollback/learned_include.py` (rev3-mod) reads those lines from any number of logs and writes a
+   `REV3_SNAPSHOT_INCLUDE` file: ranges padded to whole pages, gaps under 16 KB joined, optionally only ranges seen in at least N logs
+   (`--min-logs`; the heap layout moves from match to match, so an address seen in one log only may not repeat), a `note` per range (first
+   frame, logs). The fork then puts those pages in the set at every arm: no growth, no relayout. This works exactly as far as the addresses
+   repeat between runs (fixed pools and static data do, a heap block may not); the tool's report says how many ranges all logs agree on.
+3. **Neighbours.** `REV3_SNAPSHOT_PAD=1` is the cheap form of "pages next to a learned one": see the variable table. It is always safe
+   (a page in the set that never changes is rewound to what it already holds) and costs only snapshot bytes and copy time, so it is
+   off by default; try it where `ranges_touching_old_set` is a large share of `growths`. A real "same heap block" rule would need the
+   game's heap block headers; that is not attempted.
+
+Why the old history cannot simply be kept when the set grows: an old slot has no bytes for the new pages, and copying their CURRENT
+contents into it would be wrong unless the page had not changed since that slot was taken, which cannot be known (that is the point: the
+page was only just found to change). So a relayout stays a relayout; the fix is to make fewer of them.
+
+Merging this into rev3-net (netplay path, which lives only there): (a) in `NetObserve`, add `; new=[%s]` to the `NOTE learned +%u pages while slots
+are in use` line with `FormatRangeList(NewRanges(ComputeRanges(), m_ranges), MAX_LEARN_LIST_RANGES)`; (b) in `NetPrepareArm`, after
+`ResolveInclusions()`: `std::vector<Range> next = ComputeRanges(); if (m_net_armed_once) { const auto fresh = NoteLearned(m_ranges, next); if (!fresh.empty())
+Line("NOTE learned +%llu pages at arm (frame %u): new=[%s]") } m_ranges = std::move(next); m_net_armed_once = true;` (the first arm builds the
+set, it learns nothing); (c) call `LearnedSummaryLine()` before the net SUMMARY line and in the net `Finish`; (d) `REV3_SNAPSHOT_PAD` is parsed in the
+shared options code and needs nothing; (e) the runner must hand `REV3_SNAPSHOT_INCLUDE` / `REV3_SNAPSHOT_PAD` to the fork (rev3-mod netplay.py
+`KEEP_REV3_VARS`).
 
 Tests: `Rev3Rollback.EfPool*`, `InclusionFile*`, `EfCheck*`, `EfDump*`, `FreezeDumpCarriesTheEfLines`, `ArmForcesTheEfPool*`, `WithoutThePool*`,
 `WithThePoolForced*`, `UserInclusionsAreForced*`, `LearningAPageWhileArmed*` (a synthetic ef image with the same offsets).
