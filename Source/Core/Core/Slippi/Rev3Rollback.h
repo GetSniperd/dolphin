@@ -96,6 +96,14 @@ struct Range
 // sets *error. The list is kept in file order (overlaps are allowed; they are saved twice, which is harmless).
 bool ParseWhitelist(const std::string& json_text, std::vector<Range>* ranges, std::string* error);
 
+// The hook's own code and data (command / reply buffers, frame counter) live at 0x80002400-0x80002A00 (rev3-mod rbhook.py). They must
+// survive a restore (the hook sets its counter itself), so they never belong in a snapshot.
+constexpr u32 HOOK_REGION_START = 0x80002400;
+constexpr u32 HOOK_REGION_END = 0x80002A00;  // exclusive
+
+// Removes [lo, hi) from every range (a range around it is split in two, one inside it disappears). Returns the bytes removed.
+u64 SubtractRange(std::vector<Range>* ranges, u32 lo, u32 hi);
+
 // ---- the fighter checksum fields (rev3-mod rbchecksum.py FIELDS, FIELDS_VERSION 1) ---------------------------------------------
 constexpr u32 TEAMS_ADDR = 0x8038FE50;     // four team pointers; team 0 -> player 1, team 1 -> player 2
 constexpr size_t FIELD_COUNT = 61;

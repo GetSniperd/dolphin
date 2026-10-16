@@ -29,6 +29,7 @@ Run (set the variables before starting Slippi_Dolphin.exe; the patched game with
 |---|---|
 | `REV3_SYNCTEST=K` | 1..8 frames to roll back; absent or 0 = off |
 | `REV3_WHITELIST=path` | whitelist.json `{"ranges":[{"start":"0x80...","end":"0x80..."}]}`, hex strings or numbers, end exclusive; required |
+| (automatic) | the hook's own region 0x80002400-0x80002A00 is cut out of every whitelist range (logged as a NOTE); it must survive a restore |
 | `REV3_SYNCTEST_EVERY=N` | roll back when `frame % N == 0` (default 1 = every frame) |
 | `REV3_STACK_WINDOW=bytes` | bytes saved from the hook's sp upward (default 0x4000) |
 | `REV3_SYNCTEST_LOG=path` | log file (default `<User>\Logs\rev3_synctest.log`), appended, flushed per line |

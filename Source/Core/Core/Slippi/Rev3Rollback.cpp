@@ -240,6 +240,29 @@ bool ParseWhitelist(const std::string& json_text, std::vector<Range>* ranges, st
   return true;
 }
 
+u64 SubtractRange(std::vector<Range>* ranges, u32 lo, u32 hi)
+{
+  std::vector<Range> result;
+  u64 removed = 0;
+  for (const Range& r : *ranges)
+  {
+    if (r.end <= lo || r.start >= hi)
+    {
+      result.push_back(r);
+      continue;
+    }
+    const u32 cut_lo = std::max(r.start, lo);
+    const u32 cut_hi = std::min(r.end, hi);
+    removed += cut_hi - cut_lo;
+    if (r.start < cut_lo)
+      result.push_back({r.start, cut_lo});
+    if (cut_hi < r.end)
+      result.push_back({cut_hi, r.end});
+  }
+  *ranges = std::move(result);
+  return removed;
+}
+
 // ---- (3) the fighter field table ------------------------------------------------------------------------------------------
 
 // rev3-mod rbchecksum.py FIELDS (FIELDS_VERSION 1, fields_digest 0xD4076EF2), same order.
@@ -835,6 +858,13 @@ void Initialize(Module& module, Core::System& system)
     error = "cannot read " + whitelist_path;
   else
     ParseWhitelist(text, &ranges, &error);
+  u64 hook_bytes = 0;
+  if (!ranges.empty())
+  {
+    hook_bytes = SubtractRange(&ranges, HOOK_REGION_START, HOOK_REGION_END);
+    if (ranges.empty())
+      error = "every range lies inside the hook region 0x80002400-0x80002A00";
+  }
   if (ranges.empty())
   {
     const std::string message = "Rev3 SyncTest: whitelist unusable (" + error + "); SyncTest is off";
@@ -844,6 +874,11 @@ void Initialize(Module& module, Core::System& system)
     return;
   }
 
+  if (hook_bytes != 0)
+  {
+    module.sink->Line(Format("NOTE removed %llu bytes of the hook region 0x%08X-0x%08X from the whitelist",
+                             static_cast<unsigned long long>(hook_bytes), HOOK_REGION_START, HOOK_REGION_END));
+  }
   module.memory = std::make_unique<DolphinMemory>(system);
   module.synctest = std::make_unique<SyncTest>(options, std::move(ranges), *module.memory, *module.sink);
   module.sink->Osd(Format("Rev3 SyncTest on: K=%d, every %d frame(s), log %s", options.k, options.every, log_path.c_str()));

@@ -282,6 +282,21 @@ TEST(Rev3Rollback, WhitelistParsing)
   }
 }
 
+TEST(Rev3Rollback, HookRegionIsCutOut)
+{
+  std::vector<Range> r = {{0x80002000, 0x80003000}, {0x80002500, 0x80002600}, {0x80002A00, 0x80002B00}, {0x80001000, 0x80002400},
+                          {0x80005000, 0x80006000}};
+  EXPECT_EQ(SubtractRange(&r, HOOK_REGION_START, HOOK_REGION_END), 0x600u + 0x100u);
+  const std::vector<Range> want = {{0x80002000, 0x80002400}, {0x80002A00, 0x80003000}, {0x80002A00, 0x80002B00},
+                                   {0x80001000, 0x80002400}, {0x80005000, 0x80006000}};
+  ASSERT_EQ(r.size(), want.size());
+  for (size_t i = 0; i < r.size(); ++i)
+  {
+    EXPECT_EQ(r[i].start, want[i].start) << i;
+    EXPECT_EQ(r[i].end, want[i].end) << i;
+  }
+}
+
 TEST(Rev3Rollback, FieldTableMatchesChecksumModule)
 {
   // rev3-mod rbchecksum.py: 61 fields of 4 bytes, first "action" at 0x140, last "str_pending" at 0x13EC, spanning 0x24..0x1648.
