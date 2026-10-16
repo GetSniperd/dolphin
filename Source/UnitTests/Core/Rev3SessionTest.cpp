@@ -779,9 +779,8 @@ TEST(Rev3Session, ReplyPadsAreEightBytesWithErrZero)
   rig.Handshake();
   rig.net.Deliver(0, P(1, 2, 3));
   Command cmd = rig.Cmd(0, P(9, 8, 7));
-  cmd.pads[0][8] = 0xFF;  // analogA/B and err of the local block are not forwarded
+  cmd.pads[0][8] = 0xFF;  // analogA/B and byte 11 of the local block are not forwarded (err stays 0: a connected pad)
   cmd.pads[0][9] = 0xFF;
-  cmd.pads[0][10] = 0xFF;
   cmd.pads[0][11] = 0xFF;
   Reply r;
   ASSERT_TRUE(rig.session->Step(cmd, Closed(), &r));
@@ -805,6 +804,39 @@ TEST(Rev3Session, StalePadReadReusesThePreviousLocalPad)
   ASSERT_TRUE(rig.session->Step(cmd, Closed(), &r));
   EXPECT_TRUE(SanitizePad(r.pads[0]) == P(0x31));
   EXPECT_TRUE(rig.net.sent.back().pad == P(0x31));
+}
+
+TEST(Rev3Session, PadReadReturnIsAPortMaskNotAnError)
+{
+  // Rev3's PADRead returns 0x80000000 (port 0 has data) on every good read (D's pad record, Oct 16); the pad must be used.
+  Rig rig(Role::Host, 0);
+  rig.Handshake();
+  rig.net.Deliver(0, P(1));
+  Command cmd = rig.Cmd(0, P(0x42, 0x43));
+  cmd.pad_return = static_cast<s32>(0x80000000u);
+  Reply r;
+  ASSERT_TRUE(rig.session->Step(cmd, Closed(), &r));
+  EXPECT_TRUE(SanitizePad(r.pads[0]) == P(0x42, 0x43));
+  EXPECT_TRUE(rig.net.sent.back().pad == P(0x42, 0x43));
+}
+
+TEST(Rev3Session, PadErrTransferReusesAndNoControllerIsNeutral)
+{
+  Rig rig(Role::Host, 0);
+  rig.Handshake();
+  rig.net.Deliver(0, P(1));
+  rig.net.Deliver(1, P(2));
+  rig.net.Deliver(2, P(3));
+  rig.Frame(P(0x31), Closed());
+  Command stale = rig.Cmd(1, P(0x99));
+  stale.pads[0][10] = 0xFD;  // PAD_ERR_TRANSFER: the block holds the previous poll
+  Reply r;
+  ASSERT_TRUE(rig.session->Step(stale, Closed(), &r));
+  EXPECT_TRUE(SanitizePad(r.pads[0]) == P(0x31));
+  Command none = rig.Cmd(2, P(0x77));
+  none.pads[0][10] = 0xFF;  // PAD_ERR_NO_CONTROLLER
+  ASSERT_TRUE(rig.session->Step(none, Closed(), &r));
+  EXPECT_TRUE(rig.net.sent.back().pad == Pad8{});  // neutral
 }
 
 TEST(Rev3Session, LockstepWaitsForTheRemotePadOfEveryFrame)

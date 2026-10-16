@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstdarg>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 
@@ -558,8 +559,19 @@ Pad8 RollbackSession::LocalAt(s32 frame) const
 
 void RollbackSession::StoreLocal(const Command& command, s32 frame)
 {
-  // PADRead failed (-3): the block holds the previous poll, so the previous local pad is the best statement of the player's input.
-  const Pad8 pad = command.pad_return != 0 ? m_last_local : SanitizePad(command.pads[0]);
+  // PADRead's return value is a bit mask of the ports with data (Rev3 normally returns 0x80000000 = port 0; D's pad record, Oct 16),
+  // not an error code, so it cannot tell a failed read. The port's PADStatus err byte (+10) does: PAD_ERR_TRANSFER (-3) means the block
+  // holds the previous poll, so the previous local pad is the best statement of the player's input; PAD_ERR_NO_CONTROLLER (-1) and
+  // PAD_ERR_NOT_READY (-2) mean no input (neutral). (Until Oct 16 any non-zero return was taken as a failure, so every local pad was
+  // neutral and neither loopback window reacted to the controller.)
+  const int err = static_cast<std::int8_t>(command.pads[0][10]);
+  Pad8 pad;
+  if (err == -3 || command.pad_return == -3)
+    pad = m_last_local;
+  else if (err == -1 || err == -2)
+    pad = NEUTRAL_PAD;
+  else
+    pad = SanitizePad(command.pads[0]);
   m_last_local = pad;
   const s32 target = frame + m_delay;
   PadSlot& slot = m_local[static_cast<size_t>(target) % RING];
