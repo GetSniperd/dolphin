@@ -362,14 +362,17 @@ TEST(Rev3NetLink, ReliableEnvelopeRoundTrips)
   EXPECT_EQ(type, MsgType::StartCheck);
   EXPECT_EQ(sequence, 0x01020304u);
   EXPECT_EQ(back, payload);
-  // An empty payload is fine; ids outside 0x90..0x93 and short buffers are not.
+  // An empty payload is fine; ids outside 0x90..0x94 and short buffers are not.
   const std::vector<u8> bye = EncodeReliable(MsgType::Bye, 9, {});
   EXPECT_TRUE(DecodeReliable(bye.data(), bye.size(), &type, &sequence, &back));
   EXPECT_TRUE(back.empty());
   std::vector<u8> bad = wire;
   bad[0] = 0x80;
   EXPECT_FALSE(DecodeReliable(bad.data(), bad.size(), &type, &sequence, &back));
-  bad[0] = 0x94;
+  bad[0] = 0x94;  // RANGE_CRC (M4)
+  EXPECT_TRUE(DecodeReliable(bad.data(), bad.size(), &type, &sequence, &back));
+  EXPECT_EQ(type, MsgType::RangeCrc);
+  bad[0] = 0x95;
   EXPECT_FALSE(DecodeReliable(bad.data(), bad.size(), &type, &sequence, &back));
   EXPECT_FALSE(DecodeReliable(wire.data(), RELIABLE_HEADER_BYTES - 1, &type, &sequence, &back));
 }
@@ -484,6 +487,30 @@ TEST(Rev3NetLink, EverythingCanBeSet)
   EXPECT_EQ(o.log_path, "C:\\x\\net.log");
   EXPECT_EQ(o.stable_path, "stable.json");
   EXPECT_TRUE(o.warnings.empty());
+}
+
+TEST(Rev3NetLink, M4OptionsHaveDefaultsAndCanBeSet)
+{
+  NetOptions o = ParseNetOptions(EnvOf({{"REV3_NET_ROLE", "host"}, {"REV3_NET_PEER", "1.2.3.4:5"}}));
+  ASSERT_TRUE(o.ok);
+  EXPECT_EQ(o.busy_calls, 3u);
+  EXPECT_FALSE(o.range_crc);
+  EXPECT_TRUE(o.netsim.empty());
+  o = ParseNetOptions(EnvOf({{"REV3_NET_ROLE", "host"},
+                             {"REV3_NET_PEER", "1.2.3.4:5"},
+                             {"REV3_NET_BUSY", "0"},
+                             {"REV3_NET_RANGE_CRC", "1"},
+                             {"REV3_NETSIM", "delay_ms=80,jitter_ms=30,loss_pct=5,seed=1"}}));
+  ASSERT_TRUE(o.ok);
+  EXPECT_EQ(o.busy_calls, 0u);
+  EXPECT_TRUE(o.range_crc);
+  EXPECT_EQ(o.netsim, "delay_ms=80,jitter_ms=30,loss_pct=5,seed=1");
+  EXPECT_TRUE(o.warnings.empty());
+  o = ParseNetOptions(EnvOf({{"REV3_NET_ROLE", "host"}, {"REV3_NET_PEER", "1.2.3.4:5"}, {"REV3_NET_BUSY", "5000"}, {"REV3_NET_RANGE_CRC", "maybe"}}));
+  ASSERT_TRUE(o.ok);
+  EXPECT_EQ(o.busy_calls, 3u);
+  EXPECT_FALSE(o.range_crc);
+  EXPECT_EQ(o.warnings.size(), 2u);
 }
 
 TEST(Rev3NetLink, BadRoleOrPeerIsRefusedWithAReason)
@@ -683,41 +710,92 @@ TEST(Rev3NetLink, GateNeedsTheSnapshotSetAndALockstepSession)
   EXPECT_TRUE(t.Update(in, nullptr).open);
 }
 
-TEST(Rev3NetLink, GateClosesOnHealthZeroFightersLostAndChangedSet)
+TEST(Rev3NetLink, TheOpenDecisionNeedsFightersAndNobodyAtHealthZero)
 {
   GateTracker t(Cfg(1, 0));
-  ASSERT_TRUE(t.Update(Good(), nullptr).open);
   GateInputs dead = Good();
   dead.health_zero = true;
   GateDecision d = t.Update(dead, nullptr);
   EXPECT_FALSE(d.open);
   EXPECT_STREQ(d.why, "health 0");
-  EXPECT_TRUE(t.Update(Good(), nullptr).open);  // health back: it reopens (the set is prepared again)
-
-  GateInputs pending = Good();
-  pending.set_pending = true;
-  d = t.Update(pending, nullptr);
+  ASSERT_TRUE(t.Update(Good(), nullptr).open);
+  t.Close();  // the session closed (a final frame said so): shut until it opens again
+  EXPECT_FALSE(t.open());
+  d = t.Update(dead, nullptr);
   EXPECT_FALSE(d.open);
-  EXPECT_STREQ(d.why, "snapshot set changed");
-  EXPECT_TRUE(t.Update(Good(), nullptr).open);
-
+  EXPECT_STREQ(d.why, "health 0");
   GateInputs lost;
-  d = t.Update(lost, nullptr);
-  EXPECT_FALSE(d.open);
-  EXPECT_STREQ(d.why, "fighters lost");
   EXPECT_STREQ(t.Update(lost, nullptr).why, "no fighters");
   EXPECT_TRUE(t.Update(Good(), nullptr).open);  // the streaks restarted: arm_calls is 1 here
 }
 
-TEST(Rev3NetLink, ADiscReadWhileOpenDoesNotCloseTheGate)
+TEST(Rev3NetLink, WhileArmedNothingLiveEverClosesTheGate)
 {
+  // THE GATE RULE: the close is the session's, from final frames. The tracker reports the local conditions only, and "open" stays true.
   GateTracker t(Cfg(1, 0));
+  ASSERT_TRUE(t.Update(Good(), nullptr).open);
+  GateInputs dead = Good();
+  dead.health_zero = true;
+  GateDecision d = t.UpdateArmed(dead);
+  EXPECT_TRUE(d.open);
+  EXPECT_TRUE(t.open());
+  GateInputs lost;  // fighters not found
+  d = t.UpdateArmed(lost);
+  EXPECT_TRUE(d.open);
+  GateInputs pending = Good();
+  pending.set_pending = true;
+  d = t.UpdateArmed(pending);
+  EXPECT_TRUE(d.open);
+  EXPECT_TRUE(d.layout_pending);  // a local relayout, not a close
+  EXPECT_FALSE(t.UpdateArmed(Good()).layout_pending);
+}
+
+TEST(Rev3NetLink, ADiscReadWhileArmedOnlyPostponesRollbacksUntilItIsSustained)
+{
+  GateConfig cfg = Cfg(1, 0);
+  cfg.hold_calls = 3;
+  GateTracker t(cfg);
   ASSERT_TRUE(t.Update(Good(), nullptr).open);
   GateInputs busy = Good();
   busy.hardware_busy = true;
-  const GateDecision d = t.Update(busy, nullptr);
-  EXPECT_TRUE(d.open);            // hysteresis: rollbacks merely wait (hardware_quiet false)
-  EXPECT_FALSE(d.hardware_quiet);
+  GateDecision d = t.UpdateArmed(busy);
+  EXPECT_TRUE(d.open);
+  EXPECT_FALSE(d.hardware_quiet);  // rollbacks merely wait
+  EXPECT_FALSE(d.hold);
+  EXPECT_FALSE(t.UpdateArmed(busy).hold);
+  d = t.UpdateArmed(busy);  // the third call in a row: HOLD (predict nothing); still open for the peer
+  EXPECT_TRUE(d.hold);
+  EXPECT_TRUE(d.open);
+  // It ends only after HOLD_RELEASE_CALLS quiet calls, so a flickering read does not toggle it every frame.
+  EXPECT_TRUE(t.UpdateArmed(Good()).hold);
+  EXPECT_TRUE(t.UpdateArmed(busy).hold);
+  EXPECT_TRUE(t.UpdateArmed(Good()).hold);
+  EXPECT_FALSE(t.UpdateArmed(Good()).hold);
+  // ... and it needs a sustained read again.
+  EXPECT_FALSE(t.UpdateArmed(busy).hold);
+}
+
+TEST(Rev3NetLink, HoldCanBeSwitchedOff)
+{
+  GateConfig cfg = Cfg(1, 0);
+  cfg.hold_calls = 0;
+  GateTracker t(cfg);
+  ASSERT_TRUE(t.Update(Good(), nullptr).open);
+  GateInputs busy = Good();
+  busy.hardware_busy = true;
+  for (int i = 0; i < 20; ++i)
+    EXPECT_FALSE(t.UpdateArmed(busy).hold);
+}
+
+TEST(Rev3NetLink, ASustainedDiscReadBeforeOpeningStillKeepsTheGateShut)
+{
+  GateTracker t(Cfg(1, 5));
+  GateInputs busy = Good();
+  busy.hardware_busy = true;
+  EXPECT_STREQ(t.Update(busy, nullptr).why, "hardware busy");
+  for (int i = 0; i < 4; ++i)
+    EXPECT_FALSE(t.Update(Good(), nullptr).open);
+  EXPECT_TRUE(t.Update(Good(), nullptr).open);
 }
 
 TEST(Rev3NetLink, AnUnusableSnapshotSetKeepsTheGateShutUntilTheFightersAreLostAndFoundAgain)

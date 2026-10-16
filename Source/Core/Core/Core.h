@@ -26,6 +26,8 @@ class System;
 
 bool GetIsThrottlerTempDisabled();
 void SetIsThrottlerTempDisabled(bool disable);
+// Rev3 netplay (M4): throttle off while resimulated frames run; independent of the user's throttle hotkey (which rewrites the flag above).
+void SetIsThrottlerResimDisabled(bool disable);
 
 void Callback_NewField(Core::System& system);
 

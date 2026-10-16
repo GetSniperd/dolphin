@@ -3,6 +3,7 @@ add_dolphin_test(PageFaultTest PageFaultTest.cpp)
 add_dolphin_test(CoreTimingTest CoreTimingTest.cpp)
 add_dolphin_test(PatchAllowlistTest PatchAllowlistTest.cpp)
 add_dolphin_test(Rev3NetLinkTest Rev3NetLinkTest.cpp)
+add_dolphin_test(Rev3NetSimTest Rev3NetSimTest.cpp)
 add_dolphin_test(Rev3RollbackTest Rev3RollbackTest.cpp)
 add_dolphin_test(Rev3SessionTest Rev3SessionTest.cpp)
 

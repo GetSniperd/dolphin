@@ -562,6 +562,8 @@ add_library(core
   Slippi/Rev3Net.h
   Slippi/Rev3NetLink.cpp
   Slippi/Rev3NetLink.h
+  Slippi/Rev3NetSim.cpp
+  Slippi/Rev3NetSim.h
   Slippi/Rev3Rollback.cpp
   Slippi/Rev3Rollback.h
   Slippi/Rev3Session.cpp

@@ -262,6 +262,7 @@ present and unit/loopback tested, but the gate is off until you ask for it.
 | `REV3_NET_WAIT_MS=n` | 10000 | no remote pad this long in lockstep = the peer is gone, play on offline |
 | `REV3_NET_LOG=file` | `<User>\Logs\rev3_net_<role>.log` | the net log (below). The Rev3 log (`rev3_synctest.log`) only gets a pointer line |
 | `REV3_NET_STABLE=file` | none | `{"ranges":[...]}`: memory whose CRC both sides compare at arm time (START_CHECK); the file's CRC is part of HELLO so both must use the same file |
+| `REV3_NETSIM`, `REV3_NET_BUSY`, `REV3_NET_RANGE_CRC` | | M4, see "Netplay (M4)" |
 | `REV3_PAD_SCRIPT` / `REV3_PAD_RECORD` / `REV3_TRACE` | | as in the determinism kit, with the netplay meaning below |
 | `REV3_SYNCTEST` | | ignored in a netplay run (noted in the net log) |
 
@@ -280,7 +281,7 @@ counter is the session clock; the first command must be frame 0 or the run leave
 |---|---|---|
 | PAD `0x80` | 1, unsequenced | `u8 id, s32 newest wire frame, u8 sender port, s32 checksum frame, u32 checksum`, then the unacked local pads, 8 bytes each, newest first (Slippi's `SendSlippiPad` layout, big endian) |
 | PAD_ACK `0x81` | 2, unsequenced | `u8 id, s32 acked wire frame, u8 sender port` |
-| HELLO `0x90`, START_CHECK `0x91`, DESYNC_DUMP `0x92`, BYE `0x93` | 0, reliable | `u8 id, u32 sequence, payload` (payloads: `Rev3Session.h`) |
+| HELLO `0x90`, START_CHECK `0x91`, DESYNC_DUMP `0x92`, BYE `0x93`, RANGE_CRC `0x94` (M4, testing) | 0, reliable | `u8 id, u32 sequence, payload` (payloads: `Rev3Session.h`) |
 
 The receiver stores every pad of a packet by its own frame and acks R, the highest frame with all pads up to it present, so a lost packet
 never makes an ack lie; the first 64 or more remote pads are contiguous from frame 0. A sender re-sends its unacked pads after about
@@ -299,10 +300,9 @@ numbers, and the `REV3_NET_STABLE` file CRC. Two equal roles are a mismatch. The
 
 Opens after: both fighters found for `REV3_NET_ARM` normal calls in a row, no disc read in flight for `REV3_NET_QUIET` calls, nobody at
 health 0 (fighter + 0x28), the adaptive snapshot set learned, the session in lockstep. Then the snapshot set is installed and both
-machines exchange START_CHECK (the exact state at the same frame) before prediction starts. Once open it closes again when the fighters
-are lost, a fighter reaches health 0, or the snapshot set would change (a newly learned page, a new hardware region): the session
-drains to lockstep, `NetClear` installs the new set, and the gate may open again. The set never changes while snapshot slots are in
-use. A disc read in flight only postpones rollbacks.
+machines exchange START_CHECK (the exact state at the same frame) before prediction starts. How it closes again (fighters lost, a
+fighter at health 0) and what a disc read does is the M4 gate rule below: both machines close at the same frame, decided on final
+frames only. The set never changes while snapshot slots are in use.
 
 ### The net log (`REV3_NET_LOG`)
 
@@ -325,9 +325,135 @@ Typical clean start: `NET start ...`, `HELLO sent`, `NET connected to ...`, `HEL
   sent from `Step`, not from the wait that blocks it).
 - Not yet run: two real Dolphin processes with Rev3 (D does that; see the report in the commit / PR).
 
-### Known gaps (M4)
+## Netplay (M4): network simulator, hiding resimulated frames, a deterministic gate, log volume, desync dump
 
-Matchmaking-free direct connect only (no NAT traversal beyond simultaneous open, no relay); `REV3_NETSIM` (loss / delay injection) is
-read and ignored; no spectators, no replay file; rollback depth is capped at 7; the first command must be frame 0 (a game already in
-progress cannot join); a window closed while the peer waits ends the peer's wait through the BYE (or the wait timeout), not instantly if
-the machine crashes.
+Milestone M4 makes rollback testable and safe to leave running: a simulated bad network in the real transport, the first version of
+hiding resimulated frames, a gate whose open/close decisions both machines always take at the same frame, a log that stays readable in a
+long match, and a desync report that names the first wrong field. Files: `Slippi/Rev3NetSim.{h,cpp}` (new, pure, tests in
+`Rev3NetSimTest.cpp`), `Rev3Session.{h,cpp}` (gate rule, hold / relayout, hiding interface, log limits, dump, range CRCs),
+`Rev3NetLink.{h,cpp}` (options, arm gate tracker), `Rev3Net.{h,cpp}` (NetSim in the network thread, hiding hookup),
+`Rev3Rollback.{h,cpp}` (RESTORE log policy, `NetRangeCrcs`, `DolphinResimHider`), `Core.{h,cpp}` (the resim throttle flag).
+
+### Variables
+
+| variable | default | meaning |
+|---|---|---|
+| `REV3_NETSIM=delay_ms=80,jitter_ms=30,loss_pct=5,seed=1` | unset = off | the network simulator (below). Any subset of keys, any order; unset keys are 0, `seed` defaults to 1. A bad value is `ERROR NET REV3_NETSIM=...` in the net log and **no** simulation (the run is not the test that was asked for) |
+| `REV3_NET_BUSY=n` | 3 | consecutive armed calls with a disc read in flight before a HOLD starts (below); 0 = never hold. 0..1000. Local to a machine, not part of HELLO |
+| `REV3_NET_RANGE_CRC=1` | 0 | testing only: both sides exchange the CRC of every snapshot range at each checksum frame (below). Both machines should set it; one side without it simply gets no comparison |
+
+### REV3_NETSIM
+
+Implemented in `Rev3NetSim.cpp` and applied in `EnetTransport` on what the network thread **receives**, after ENet and before the session sees
+it. Every received message (PAD, PAD_ACK, and the reliable ones) is held until `now + delay_ms +- jitter_ms` (uniform, never below 0; jitter
+reorders messages like a real network; ties leave in arrival order). `loss_pct` of the **PAD / PAD_ACK** packets are dropped; reliable
+messages (HELLO, START_CHECK, DESYNC_DUMP, BYE, RANGE_CRC) are late but never dropped, which is what ENet's own retransmission gives you.
+The ENet connect handshake is not a message of this layer and is never touched. Both machines apply it to what they receive, so the round
+trip is `2 x delay_ms` (`delay_ms=80` is a 160 ms RTT). The random draws are splitmix64 (no `std::` distributions: their output differs between
+standard libraries) from two streams per instance, one for the loss draws (only PAD / ACK packets consume it) and one for jitter, seeded from
+`seed` and the role (host 0, guest 1) so the two sides do not mirror each other. The same seed and the same arrival sequence give the same
+drops and release times on every platform. The network thread shortens its ENet wait to the next release time.
+
+Log: `NET netsim delay_ms=80 jitter_ms=30 loss_pct=5 seed=1` at start; `SUMMARY` carries `netsim_dropped=` and `netsim_held=` (messages
+held for a non-zero time).
+
+### Hiding resimulated frames, v1
+
+While `RollbackSession::Resimulating()` is true (from the RESTORED reply to the end of the last re-run frame):
+
+- the **throttle is off** (`Core::SetIsThrottlerResimDisabled`; `GetIsThrottlerTempDisabled()` returns it OR-ed with the user's flag. A flag of
+  its own, because the hotkey scheduler rewrites the user's flag every loop), so the re-run frames cost CPU time only, not wall time;
+- the **audio output is muted** (`SoundStream::SetVolume(0)`; restored with `AudioCommon::UpdateSoundStream`, i.e. the user's volume, or 0 if
+  the user muted). The DSP is never paused or touched: the emulated audio hardware keeps its timing. Backends without volume control
+  (`SupportsVolumeChanges`) ignore it.
+
+Both are restored when the resimulation ends, when the session leaves (desync, BYE, timeout) and at shutdown. The log has one line
+`NOTE resim hiding v1: throttle off + mute` the first time. The session talks to an injectable `ResimHider` (`Rev3Session.h`); the unit tests use a fake.
+Not in v1: skipping the render / SFX of re-run frames inside the game (M6), so a resimulated frame still draws.
+
+### The gate rule (both machines always agree on WHEN the shared mode changes)
+
+The shared modes are LOCKSTEP and ARMED. In M3 the gate was evaluated on the live state every call, which a misprediction can change: one machine
+could see a fighter at health 0 in a timeline that never happened and close while the other did not. Now:
+
+- **Open** is decided in LOCKSTEP, where every frame is final. It takes effect at the frame where both START_CHECKs name the same frame and
+  carry the same state; a side whose local conditions differ simply sends none and both stay in lockstep.
+- **Close** (a fighter at health 0, or fighters not found) is decided on **final frames only**. The live flags of every call (resimulated
+  ones too) are recorded with the capture of the frame; when frame F becomes final (all remote pads below F were played as confirmed) its record
+  is the same on both machines. The first final frame F whose record says "lost" schedules the close for frame **F + MAXR + 1**
+  (`GATE close scheduled final_frame=F effective_frame=E why=...`). F is always declared final by call F + MAXR (the stall rule keeps
+  N - R <= MAXR; the session declares finals before it rolls back, so a run of rollbacks cannot delay it), so neither machine has passed
+  E when it learns of the close. Until E both keep predicting; at call E both enter DRAIN (`GATE close frame=E ...`), confirm everything, roll
+  back what is due and continue in lockstep. A close applied after its frame would be `GATE close late` and counts in `gate_late` (must be 0).
+  A live state, which may be a misprediction's, never closes anything. A frame without fighters can't be snapshotted, so it is never predicted
+  (the call waits for the real pad) and is recorded as lost.
+- **Local reasons never change the shared mode**, because the peer cannot know about them:
+  - *busy hardware*: see the next section;
+  - *the snapshot set would change* on one machine (a newly learned page, a hardware cut) -> **RELAYOUT**: that machine drains (waits for
+    every remote pad, rolls back what is due), installs the new set and carries on ARMED (`GATE relayout frame=..`, `GATE relayout done`). The peer
+    sees a short stall and nothing else; the frames played are the same, so the final states cannot differ.
+
+The unit tests (`Rev3SessionTest.cpp`) include a mispredicted live state that looks lost on one machine only (no close on either), the
+other direction (a misprediction hides a real loss until the true timeline makes the frame final), and a 150-seed simulation with a
+"health 0" that is a function of the live state, mispredictions, delay, jitter, loss, busy hardware and relayouts, which asserts that both
+machines log the same `GATE close frame=` lines in the same order and that `gate_late` stays 0. The simulation counts the calls where the live
+state said "lost" and the true timeline did not (a gate that followed the live state would have closed one side there) and the test requires
+that they happen; a mutation that follows the live state makes the tests fail.
+
+### Busy hardware (disc read / DVD DMA)
+
+A rollback while a disc read is in flight can't rewind the read, so in M3 it was postponed until it would exceed MAXR and then **forced**
+(`forced=hardware_busy` on the ROLLBACK line). M4 stops that from happening in normal play without changing the shared mode: after
+`REV3_NET_BUSY` (3) armed calls in a row with a disc read in flight the machine starts a **HOLD**: it predicts nothing while the read lasts
+(each call waits for the real remote pad of its own frame, `GATE hold frame=..`), so no rollback can become due while the hardware is busy. The
+HOLD ends after 2 calls without a read (`GATE hold end frame=.. held_calls=..`). A misprediction made before the hold is still postponed
+while the depth allows, as before. The gate itself stays open for the peer: a HOLD is invisible on the wire, it is only a machine that
+waits for pads more often. `SUMMARY` counts `hw_holds`, `hold_calls`, `postponed`, `forced_hw`; a `forced_hw` that is not 0 in normal play is a bug report. This
+is the one place where the brief's "close the gate on sustained busy hardware" is done as "hold" instead: a close must be the same on both
+machines, and the peer cannot see our disc.
+
+### Log volume
+
+`ROLLBACK`, `STALL` and `RESIM` detail lines of the session: the first 200 of each kind are written in full (a `STALL end` or `RESIM done` line goes with
+its start line, written or left out together). After that, one line per window of 600 frames, only when the window left lines out:
+`ROLLBACK depth_hist=1:12,2:7,3:2 window=1210-1809 rollbacks=21 stalls=3 stall_ms=41.0 postponed=0 forced_hw=0 lines_left_out=48`. The counts
+cover **all** events of the window, written or not; `SUMMARY` has the exact totals (`depth_hist=[..]`, `log_suppressed=`). SyncTest's `RESTORE` lines follow the same
+numbers in a netplay run (200 in full, then `RESTORE summary frames=a-b n=.. us_mean=.. us_max=..` per window). `CHK`, `DESYNC`, `ERROR`, `GATE`, `LEAVE`,
+`SUMMARY` are never limited.
+
+### Desync dump
+
+On a checksum mismatch both sides exchange the field trace of the last frames (M3) and each writes, to its own net log:
+
+    DESYNC first_diff frame=106 field=p1.<name> own=0x.. peer=0x.. fields_differing=3 last_equal_frame=105
+      <up to 8 differing fields>
+    DESYNC fields frame=106 side=own player=1 <all 61 fields of that player>
+    DESYNC fields frame=106 side=peer player=1 ...
+    (and player=2)
+
+So the log alone names the first differing frame and field, and holds both sides' complete 61-field arrays for it.
+
+`REV3_NET_RANGE_CRC=1` (testing only) additionally sends, at every checksum frame, the CRC-32 of each snapshot range (reliable message `0x94`; taken
+from the frame's snapshot slot, or from live memory at the frame's own call in lockstep) and logs `NOTE range_crc frame=N ranges=.. differing=..`
+plus one line per differing range. It never triggers a desync (some ranges legitimately differ between two healthy runs: audio and picture
+memory); it is what tells you which memory to look at when the field checksum fires. `SUMMARY` has `range_checks=` and `range_diff_frames=`.
+
+### Verification
+
+- Unit tests (`Rev3NetSimTest.cpp` new: parsing, determinism per seed, stream separation, band and ordering of jitter, loss only for PAD / ACK, loss rate,
+  independence of the loss pattern from jitter and reliable traffic; additions to `Rev3SessionTest.cpp`, `Rev3NetLinkTest.cpp`,
+  `Rev3RollbackTest.cpp` for the gate rule, hold, relayout, hiding, log limits, the dump, range CRCs, options, `RESTORE` windows, `NetRangeCrcs`).
+- Loopback run (real `Rev3Net.cpp` + ENet over 127.0.0.1, two NetModules in one process, deterministic game, fake hider) with
+  `REV3_NETSIM=delay_ms=80,jitter_ms=30,loss_pct=5,seed=N`: see the commit message for the numbers per seed. Both sides ended in identical states,
+  `CHK` lines matched, no `DESYNC` or `ERROR`, hiding was off at the end, and with a fighter that goes to health 0 as a function of the state
+  both sides logged the same `GATE close` lines.
+- Not yet run: two real Dolphin processes with Rev3 and `REV3_NETSIM` (D does that), the real throttle / mute under a real audio backend.
+
+## Known gaps (after M4)
+
+- Pacing (CalcTimeOffsetUs port: keeping the two clocks in step so the faster machine does not run into the stall rule) and MAXR measurement are M5.
+- The in-game side of hiding (skip render and SFX of re-run frames, the rbhook patch) is M6; v1 only turns the throttle off and mutes the output.
+- Internet play (NAT traversal beyond simultaneous open, relay, matchmaking) is M7; direct connect only.
+- A HOLD makes a machine wait for the peer's pads more often during a disc read; there is no measurement of how often yet.
+- No spectators, no replay file; rollback depth is capped at 7; the first command must be frame 0 (a game already in progress cannot join); a
+  window closed while the peer waits ends the peer's wait through the BYE (or the wait timeout), not instantly if the machine crashes.

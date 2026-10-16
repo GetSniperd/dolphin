@@ -13,10 +13,13 @@
 //   ReliableInbox      messages 0x90..0x93 ride in ENet reliable packets with a u32 sequence number in front, so the same message arriving over
 //                      both connections of a simultaneous connect (each side connects to the other) is delivered once, in order.
 //   ParsePeerAddress   "ip:port"
-//   ParseNetOptions    the REV3_NET_* environment variables (REV3.md "Netplay (M3)")
+//   ParseNetOptions    the REV3_NET_* environment variables (REV3.md "Netplay (M3)" and "Netplay (M4)")
 //   BuildHello         the HELLO items from a struct of settings (the Dolphin side fills the struct)
 //   GateTracker        the arm gate: fighters found for N normal calls, hardware quiet for M calls, nobody at health 0, snapshot set learned;
-//                      hysteresis once open (it closes on fighters lost, a fighter at health 0, a changed snapshot set)
+//                      hysteresis once open. It decides OPENING only (in LOCKSTEP, where the state is exact). Once the session is ARMED the
+//                      close is the session's own deterministic decision (Rev3Session.h, THE GATE RULE); the tracker only reports the
+//                      machine-local conditions of an armed stretch: hardware busy for several calls (HOLD) and a changed snapshot set
+//                      (RELAYOUT), and is told with Close() when the session went back to lockstep.
 //
 // HOW IT FITS IN
 //   Rev3Session.h (pure session state machine; its Transport / Hello / Gate types are used here)  <-  this file  <-  Rev3Net.{h,cpp}
@@ -156,7 +159,9 @@ struct NetOptions
   u32 wait_timeout_ms = 10000;      // REV3_NET_WAIT_MS: no remote pad this long in lockstep = the peer is gone
   std::string log_path;    // REV3_NET_LOG ("" = User\Logs\rev3_net_<role>.log)
   std::string stable_path; // REV3_NET_STABLE: {"ranges":[...]} whose CRC is compared at arm time (START_CHECK); "" = none
-  std::string netsim;      // REV3_NETSIM (set by the loopback runner; not implemented before M4, noted in the log)
+  std::string netsim;      // REV3_NETSIM (Rev3NetSim.h): delay_ms=..,jitter_ms=..,loss_pct=..,seed=.. ; "" = off
+  u32 busy_calls = 3;      // REV3_NET_BUSY: consecutive armed calls with a disc read in flight that start a HOLD (predict nothing); 0 = never
+  bool range_crc = false;  // REV3_NET_RANGE_CRC=1 (testing only): exchange the CRCs of the snapshot ranges at every checksum frame
 };
 using GetEnvFn = std::function<std::string(const char*)>;  // "" for unset
 NetOptions ParseNetOptions(const GetEnvFn& get_env);
@@ -199,6 +204,7 @@ struct GateConfig
   bool rollback = false;  // false: the gate never opens
   u32 arm_calls = 600;
   u32 quiet_calls = 60;
+  u32 hold_calls = 3;     // armed calls in a row with the hardware busy before a HOLD starts (0 = never)
 };
 
 struct GateInputs
@@ -215,8 +221,11 @@ struct GateDecision
 {
   bool open = false;
   bool hardware_quiet = true;
-  const char* why = "";  // static text
+  bool hold = false;            // armed: the hardware has been busy long enough (and not quiet for HOLD_RELEASE_CALLS yet)
+  bool layout_pending = false;  // armed: the snapshot set would change
+  const char* why = "";         // static text
 };
+constexpr u32 HOLD_RELEASE_CALLS = 2;  // a HOLD ends after this many calls in a row without a disc read in flight
 
 // Feed it once per NORMAL hook call (not a resimulated one). `prepare` is called once when everything else allows opening and must install
 // the snapshot set (SyncTest::NetPrepareArm); false keeps the gate shut until the fighters are lost and found again.
@@ -224,13 +233,21 @@ class GateTracker
 {
 public:
   explicit GateTracker(const GateConfig& config) : m_cfg(config) {}
+  // LOCKSTEP (and the frame-0 barrier): may the gate open now?
   GateDecision Update(const GateInputs& in, const std::function<bool()>& prepare);
+  // ARMED: the local conditions only (the session decides the close itself).
+  GateDecision UpdateArmed(const GateInputs& in);
+  // The session left the armed stretch (drained into lockstep): the gate is shut until it opens again through Update().
+  void Close();
   bool open() const { return m_open; }
 
 private:
   GateConfig m_cfg;
   u32 m_found_streak = 0;
   u32 m_quiet_streak = 0;
+  u32 m_busy_streak = 0;     // armed calls in a row with a disc read in flight
+  u32 m_release_streak = 0;  // armed calls in a row without one (ends a HOLD)
+  bool m_holding = false;
   bool m_open = false;
   bool m_prepared = false;
   bool m_prepare_failed = false;

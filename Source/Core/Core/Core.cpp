@@ -102,6 +102,7 @@ static std::vector<StateChangedCallbackFunc> s_on_state_changed_callbacks;
 
 static std::thread s_cpu_thread;
 static bool s_is_throttler_temp_disabled = false;
+static bool s_is_throttler_resim_disabled = false;
 static bool s_frame_step = false;
 static std::atomic<bool> s_stop_frame_step;
 
@@ -136,7 +137,13 @@ static Common::EventHook s_frame_presented =
 
 bool GetIsThrottlerTempDisabled()
 {
-  return s_is_throttler_temp_disabled;
+  return s_is_throttler_temp_disabled || s_is_throttler_resim_disabled;
+}
+
+// Rev3 netplay (M4): a flag of its own, because the hotkey scheduler rewrites s_is_throttler_temp_disabled every loop.
+void SetIsThrottlerResimDisabled(bool disable)
+{
+  s_is_throttler_resim_disabled = disable;
 }
 
 void SetIsThrottlerTempDisabled(bool disable)

@@ -217,6 +217,19 @@ public:
     slots.clear();
     ++clears;
   }
+  bool RangeCrcs(s32 /*frame*/, bool /*live*/, std::vector<RangeCrc>* out) override
+  {
+    if (!ranges_ok)
+      return false;
+    *out = ranges;
+    return true;
+  }
+  bool Relayout() override
+  {
+    slots.clear();
+    ++relayouts;
+    return relayout_ok;
+  }
 
   struct Slot
   {
@@ -230,6 +243,10 @@ public:
   std::vector<s32> restored;  // every Restore() in order
   u32 captures = 0;
   u32 clears = 0;
+  u32 relayouts = 0;
+  bool relayout_ok = true;
+  bool ranges_ok = false;
+  std::vector<RangeCrc> ranges;  // what RangeCrcs reports (REV3_NET_RANGE_CRC tests)
   bool fail_capture = false;
 };
 
@@ -335,12 +352,29 @@ Gate Busy()
   g.hardware_quiet = false;
   return g;
 }
+// A fighter at health 0 in the live state (the KO that ends the fight). In ARMED this closes nothing by itself: the state is recorded with
+// the capture of the frame and the close is scheduled when that frame is FINAL (THE GATE RULE).
+Gate Lost()
+{
+  Gate g = Open();
+  g.health_zero = true;
+  g.why = "test";
+  return g;
+}
+// The fighters cannot be found: nothing can be snapshotted, so the frame is never predicted.
+Gate NoFighters()
+{
+  Gate g = Open();
+  g.fighters_found = false;
+  return g;
+}
 
 // One machine of the unit tests: session + scripted transport + fake game, with a tiny "game loop" (the hook counter, applying the reply).
 struct Rig
 {
-  explicit Rig(Role role = Role::Host, int delay = 0, int maxr = 5) : store(&game, static_cast<size_t>(maxr) + 2)
+  explicit Rig(Role role = Role::Host, int delay = 0, int maxr = 5, bool range_crc = false) : store(&game, static_cast<size_t>(maxr) + 2)
   {
+    cfg.range_crc = range_crc;
     cfg.role = role;
     cfg.delay = delay;
     cfg.max_rollback = maxr;
@@ -1204,7 +1238,7 @@ TEST(Rev3Session, RollbackSpMismatchAndMissingSnapshotAreDesyncClassErrors)
   }
 }
 
-TEST(Rev3Session, TheGateIsIgnoredWhileResimulating)
+TEST(Rev3Session, ALostStateInAResimulatedCallDrainsNothingAndRecordsTheNewTimeline)
 {
   Rig rig(Role::Host, 0, 5);
   rig.ReadyToArm(10);
@@ -1215,15 +1249,16 @@ TEST(Rev3Session, TheGateIsIgnoredWhileResimulating)
   rig.net.Deliver(12, P(0xA3));
   rig.Frame(LocalPad(13), Open());  // RESTORED
   ASSERT_TRUE(rig.session->Resimulating());
-  // Re-running frames the fighters of which may look different (health 0 in the old timeline): a closed gate here must not drain.
+  // Re-running frames: the live state may look different from the old timeline (here: health 0). That only changes what is recorded for the
+  // frame; nothing drains because of a resimulated call.
   for (s32 m = 11; m <= 13; ++m)
-    rig.Frame(LocalPad(m), Closed());
+    rig.Frame(LocalPad(m), Lost());
   EXPECT_TRUE(rig.session->mode() == Mode::ARMED);
   EXPECT_EQ(rig.session->stats().gate_closes, 0u);
-  // A normal call with the gate closed drains: it waits for the remote pad of 13 (R >= N - 1).
-  EXPECT_FALSE(rig.TryFrame(LocalPad(14), Closed()));
-  EXPECT_TRUE(rig.session->mode() == Mode::DRAIN);
-  EXPECT_EQ(rig.session->stats().gate_closes, 1u);
+  // A normal call right after it carries on ARMED.
+  EXPECT_TRUE(rig.TryFrame(LocalPad(14), Open()));
+  EXPECT_TRUE(rig.session->mode() == Mode::ARMED);
+  EXPECT_EQ(rig.session->stats().gate_closes, 0u);
 }
 
 // ---- the stall rule --------------------------------------------------------------------------------------------------------------
@@ -1333,72 +1368,107 @@ TEST(Rev3Session, QuietHardwareRollsBackAtOnce)
 
 // ---- drain -----------------------------------------------------------------------------------------------------------------------
 
-TEST(Rev3Session, ClosingTheGateDrainsConfirmsEverythingRollsBackAndContinuesInLockstep)
+// Plays an armed session whose frame 10 (final at once: everything below it was played in lockstep) is recorded as lost, so the close is
+// scheduled for frame 16 = 10 + MAXR + 1. Every remote pad equals its prediction. Ends in LOCKSTEP with the counter at 17.
+void PlayALostFrameToTheDrain(Rig& rig)
+{
+  rig.ReadyToArm(10);
+  const Pad8 predicted = RemotePadScript(9);
+  rig.Frame(LocalPad(10), Lost());
+  for (s32 f = 11; f <= 14; ++f)
+    rig.Frame(LocalPad(f), Open());
+  rig.net.Deliver(10, predicted);
+  rig.Frame(LocalPad(15), Open());
+  for (s32 f = 11; f <= 15; ++f)
+    rig.net.Deliver(f, predicted);
+  rig.net.Deliver(16, P(0x16));
+  rig.Frame(LocalPad(16), Open());
+}
+
+TEST(Rev3Session, ALostFinalFrameClosesTheGateMaxrPlusOneFramesLaterDrainsRollsBackAndContinuesInLockstep)
 {
   Rig rig(Role::Host, 0, 5);
   rig.ReadyToArm(10);
   const Pad8 predicted = RemotePadScript(9);
-  for (s32 f = 10; f <= 12; ++f)
-    rig.Frame(LocalPad(f), Open());
-  const Pad8 real10 = P(0xA1);
-  rig.net.Deliver(10, real10);
+  // Frame 10 is final when it is played (all remote pads below it are confirmed): the close is scheduled at once, for the same frame the peer
+  // will pick, 10 + MAXR + 1 = 16.
+  rig.Frame(LocalPad(10), Lost());
+  EXPECT_TRUE(rig.sink.Has("GATE close scheduled final_frame=10 effective_frame=16"));
+  EXPECT_TRUE(rig.session->mode() == Mode::ARMED);
+  rig.Frame(LocalPad(11), Open());
+  rig.Frame(LocalPad(12), Open());
+  rig.net.Deliver(10, predicted);
   rig.net.Deliver(11, predicted);
+  const Pad8 real12 = P(0xA1);
+  rig.net.Deliver(12, real12);  // frame 12 was mispredicted; busy hardware postpones the rollback until the close
+  for (s32 f = 13; f <= 15; ++f)
+    rig.Frame(LocalPad(f), Busy());
+  EXPECT_TRUE(rig.session->mode() == Mode::ARMED);
+  EXPECT_EQ(rig.session->stats().gate_closes, 0u);
+  EXPECT_TRUE(rig.store.restored.empty());
 
-  // The gate closes at call 13 (KO): wait for every remote input below 13 (R >= 12).
-  EXPECT_FALSE(rig.TryFrame(LocalPad(13), Closed()));
-  EXPECT_TRUE(rig.sink.Has("GATE close frame=13 why=test"));
+  // Call 16: both machines enter DRAIN here. Wait for every remote input below 16 (R >= 15).
+  EXPECT_FALSE(rig.TryFrame(LocalPad(16), Open()));
+  EXPECT_TRUE(rig.sink.Has("GATE close frame=16 why=final frame 10: a fighter at health 0"));
   EXPECT_TRUE(rig.session->mode() == Mode::DRAIN);
   EXPECT_EQ(rig.session->BlockTimeoutMs(), 10000u);
   EXPECT_FALSE(rig.session->BlockSatisfied());
-  rig.net.Deliver(12, predicted);
+  for (s32 f = 13; f <= 15; ++f)
+    rig.net.Deliver(f, predicted);
   EXPECT_TRUE(rig.session->BlockSatisfied());
 
-  // The rollback that is still due (frame 10) is done, whatever the gate says now.
+  // The rollback that is still due (frame 12) is done, whatever the hardware says: a drain cannot wait.
   Reply r;
-  ASSERT_TRUE(rig.TryFrame(LocalPad(13), Closed(), &r));
+  ASSERT_TRUE(rig.TryFrame(LocalPad(16), Busy(), &r));
   EXPECT_EQ(r.flags, REPLY_FLAG_RESTORED);
-  EXPECT_EQ(r.frame, 10u);
-  EXPECT_TRUE(SanitizePad(r.pads[1]) == real10);
-  rig.Frame(LocalPad(11), Closed());  // resim 11, 12 with confirmed pads
-  const Reply r12 = rig.Frame(LocalPad(12), Closed());
-  EXPECT_TRUE(SanitizePad(r12.pads[1]) == predicted);
-  // The second run of 13 needs the pad of 13 itself: lockstep.
-  EXPECT_FALSE(rig.TryFrame(LocalPad(13), Closed()));
+  EXPECT_EQ(r.frame, 12u);
+  EXPECT_TRUE(SanitizePad(r.pads[1]) == real12);
+  rig.Frame(LocalPad(13), Open());  // resim 13, 14, 15 with confirmed pads (the gate is not looked at)
+  rig.Frame(LocalPad(14), Open());
+  const Reply r15 = rig.Frame(LocalPad(15), Open());
+  EXPECT_TRUE(SanitizePad(r15.pads[1]) == predicted);
+  // The second run of 16 needs the pad of 16 itself: lockstep.
+  EXPECT_FALSE(rig.TryFrame(LocalPad(16), Open()));
   EXPECT_FALSE(rig.session->BlockSatisfied());
-  rig.net.Deliver(13, P(0xD3));
+  rig.net.Deliver(16, P(0xD3));
   const u32 clears = rig.store.clears;
-  const Reply r13 = rig.Frame(LocalPad(13), Closed());
-  EXPECT_EQ(r13.flags, 0u);
-  EXPECT_TRUE(SanitizePad(r13.pads[1]) == P(0xD3));
+  const Reply r16 = rig.Frame(LocalPad(16), Open());
+  EXPECT_EQ(r16.flags, 0u);
+  EXPECT_TRUE(SanitizePad(r16.pads[1]) == P(0xD3));
   EXPECT_TRUE(rig.session->mode() == Mode::LOCKSTEP);
   EXPECT_FALSE(rig.session->Resimulating());
   EXPECT_GT(rig.store.clears, clears);  // the ring is cleared
-  EXPECT_TRUE(rig.sink.Has("DRAIN done frame=13"));
+  EXPECT_TRUE(rig.sink.Has("DRAIN done frame=16"));
   EXPECT_EQ(rig.session->stats().gate_closes, 1u);
+  EXPECT_EQ(rig.session->stats().gate_late, 0u);
 
   // From here on: plain lockstep, nothing predicted.
-  EXPECT_FALSE(rig.TryFrame(LocalPad(14), Closed()));
-  rig.net.Deliver(14, P(1));
-  rig.Frame(LocalPad(14), Closed());
-  EXPECT_EQ(rig.session->stats().predicted_frames, 3u + 0u);  // the three predicted frames before the rollback, none since
+  EXPECT_FALSE(rig.TryFrame(LocalPad(17), Closed()));
+  rig.net.Deliver(17, P(1));
+  rig.Frame(LocalPad(17), Closed());
+  EXPECT_EQ(rig.session->stats().predicted_frames, 6u);  // frames 10..15 before the rollback, none since
 }
 
-TEST(Rev3Session, DrainWithNothingWrongJustWaitsAndSwitchesToLockstep)
+TEST(Rev3Session, ADrainWithNothingWrongJustWaitsAndSwitchesToLockstep)
 {
   Rig rig(Role::Host, 0, 5);
   rig.ReadyToArm(10);
   const Pad8 predicted = RemotePadScript(9);
-  rig.Frame(LocalPad(10), Open());
-  rig.Frame(LocalPad(11), Open());
-  EXPECT_FALSE(rig.TryFrame(LocalPad(12), Closed()));  // needs R >= 11
+  rig.Frame(LocalPad(10), Lost());
+  for (s32 f = 11; f <= 14; ++f)
+    rig.Frame(LocalPad(f), Open());
   rig.net.Deliver(10, predicted);
-  EXPECT_FALSE(rig.TryFrame(LocalPad(12), Closed()));
+  rig.Frame(LocalPad(15), Open());
+  EXPECT_FALSE(rig.TryFrame(LocalPad(16), Open()));  // the close: needs R >= 15
   rig.net.Deliver(11, predicted);
-  EXPECT_FALSE(rig.TryFrame(LocalPad(12), Closed()));  // and then R >= 12 for the frame itself
-  rig.net.Deliver(12, P(0x12));
-  const Reply r = rig.Frame(LocalPad(12), Closed());
+  EXPECT_FALSE(rig.TryFrame(LocalPad(16), Open()));
+  for (s32 f = 12; f <= 15; ++f)
+    rig.net.Deliver(f, predicted);
+  EXPECT_FALSE(rig.TryFrame(LocalPad(16), Open()));  // and then R >= 16 for the frame itself
+  rig.net.Deliver(16, P(0x16));
+  const Reply r = rig.Frame(LocalPad(16), Open());
   EXPECT_EQ(r.flags, 0u);
-  EXPECT_TRUE(SanitizePad(r.pads[1]) == P(0x12));
+  EXPECT_TRUE(SanitizePad(r.pads[1]) == P(0x16));
   EXPECT_EQ(rig.session->stats().rollbacks, 0u);
   EXPECT_TRUE(rig.session->mode() == Mode::LOCKSTEP);
 }
@@ -1406,22 +1476,454 @@ TEST(Rev3Session, DrainWithNothingWrongJustWaitsAndSwitchesToLockstep)
 TEST(Rev3Session, TheGateCanOpenAgainAfterADrain)
 {
   Rig rig(Role::Host, 0, 5);
-  rig.ReadyToArm(10);
-  rig.net.Deliver(10, RemotePadScript(9));
-  rig.Frame(LocalPad(10), Open());
-  rig.net.Deliver(11, RemotePadScript(9));
-  rig.Frame(LocalPad(11), Closed());
+  PlayALostFrameToTheDrain(rig);
   EXPECT_TRUE(rig.session->mode() == Mode::LOCKSTEP);
-  for (s32 f = 12; f < 20; ++f)
-  {
-    rig.net.Deliver(f, RemotePadScript(f));
-    rig.Frame(LocalPad(f), Closed());
-  }
+  rig.Lockstep(3);       // frames 17..19
   rig.PeerStartCheck();  // frame 20
   rig.net.Deliver(20, RemotePadScript(20));
   rig.Frame(LocalPad(20), Open());
   EXPECT_TRUE(rig.session->mode() == Mode::ARMED);
   EXPECT_EQ(rig.session->stats().gate_opens, 2u);
+}
+
+TEST(Rev3Session, TheCloseOfALostFrameIsScheduledOnlyOnce)
+{
+  Rig rig(Role::Host, 0, 5);
+  rig.ReadyToArm(10);
+  rig.Frame(LocalPad(10), Lost());
+  rig.Frame(LocalPad(11), Lost());  // a second lost frame before the close: no second schedule
+  rig.Frame(LocalPad(12), Lost());
+  EXPECT_EQ(rig.sink.Count("GATE close scheduled"), 1u);
+}
+
+// ---- the deterministic gate (M4) ---------------------------------------------------------------------------------------------------
+
+TEST(Rev3Session, AMispredictedLiveStateThatLooksLostNeverClosesTheGate)
+{
+  // Machine A predicted frame 10 wrongly and its live state at call 11 shows a fighter at health 0 (a state the real game never reaches).
+  // Machine B predicted right and never saw it. A gate that follows the live state would close on A alone; the final-frame rule closes on
+  // neither: the frame is re-recorded by the resimulation before it is ever final.
+  Rig a(Role::Host, 0, 5);
+  Rig b(Role::Guest, 0, 5);
+  a.ReadyToArm(10);
+  b.ReadyToArm(10);
+  a.Frame(LocalPad(10), Open());
+  a.Frame(LocalPad(11), Lost());  // the live (wrong) timeline
+  a.Frame(LocalPad(12), Open());
+  b.Frame(LocalPad(10), Open());
+  b.Frame(LocalPad(11), Open());
+  b.Frame(LocalPad(12), Open());
+  EXPECT_TRUE(a.session->mode() == Mode::ARMED);  // the live flag alone changed nothing
+  a.net.Deliver(10, P(0xA1));                     // the misprediction
+  a.net.Deliver(11, P(0xA1));
+  a.net.Deliver(12, P(0xA1));
+  Reply r;
+  ASSERT_TRUE(a.TryFrame(LocalPad(13), Open(), &r));
+  EXPECT_EQ(r.flags, REPLY_FLAG_RESTORED);
+  for (s32 f = 11; f <= 13; ++f)  // the true timeline has no lost fighter
+    a.Frame(LocalPad(f), Open());
+  for (s32 f = 14; f <= 16; ++f)
+  {
+    a.net.Deliver(f - 1, P(0xA1));
+    a.Frame(LocalPad(f), Open());
+    b.net.Deliver(f - 4, P(0xA1));
+  }
+  EXPECT_FALSE(a.sink.Has("GATE close"));
+  EXPECT_EQ(a.session->stats().gate_closes, 0u);
+  EXPECT_TRUE(a.session->mode() == Mode::ARMED);
+  EXPECT_TRUE(b.session->mode() == Mode::ARMED);
+}
+
+TEST(Rev3Session, ALostFrameThatIsMispredictedAtFirstClosesWhenTheTrueTimelineMakesItFinal)
+{
+  // The other direction: the live prediction showed nothing, the true timeline has a fighter at health 0 at frame 11. The close is
+  // scheduled from the FINAL record (after the resimulation), for 11 + MAXR + 1 = 17, on this machine and on its peer alike.
+  Rig rig(Role::Host, 0, 5);
+  rig.ReadyToArm(10);
+  rig.Frame(LocalPad(10), Open());
+  rig.Frame(LocalPad(11), Open());
+  EXPECT_FALSE(rig.sink.Has("GATE close scheduled"));
+  rig.net.Deliver(10, P(0xA1));  // frame 10 was mispredicted
+  Reply r;
+  ASSERT_TRUE(rig.TryFrame(LocalPad(12), Open(), &r));
+  EXPECT_EQ(r.flags, REPLY_FLAG_RESTORED);
+  rig.Frame(LocalPad(11), Lost());  // resim: the true state of frame 11
+  rig.net.Deliver(11, P(0xA1));
+  rig.Frame(LocalPad(12), Open());  // second run of 12
+  EXPECT_FALSE(rig.sink.Has("GATE close scheduled"));  // 11 is not final yet: pad 11 only just arrived and frame 12 was predicted
+  rig.net.Deliver(12, P(0xA1));
+  rig.Frame(LocalPad(13), Open());
+  EXPECT_TRUE(rig.sink.Has("GATE close scheduled final_frame=11 effective_frame=17"));
+}
+
+TEST(Rev3Session, NoFightersMeansNoPredictionAndAScheduledClose)
+{
+  Rig rig(Role::Host, 0, 5);
+  rig.ReadyToArm(10);
+  rig.Frame(LocalPad(10), Open());
+  // No fighters at call 11: nothing can be snapshotted, so the frame cannot be predicted; it waits for the real pad.
+  EXPECT_FALSE(rig.TryFrame(LocalPad(11), NoFighters()));
+  EXPECT_TRUE(rig.session->mode() == Mode::ARMED);
+  rig.net.Deliver(10, RemotePadScript(9));
+  EXPECT_FALSE(rig.TryFrame(LocalPad(11), NoFighters()));
+  rig.net.Deliver(11, P(0x11));
+  Reply r;
+  ASSERT_TRUE(rig.TryFrame(LocalPad(11), NoFighters(), &r));
+  EXPECT_TRUE(SanitizePad(r.pads[1]) == P(0x11));
+  EXPECT_EQ(rig.session->stats().predicted_frames, 1u);  // only frame 10
+  EXPECT_TRUE(rig.sink.Has("GATE close scheduled final_frame=11 effective_frame=17 why=final frame 11: fighters not found"));
+}
+
+TEST(Rev3Session, ASustainedBusyHardwareHoldsPredictionsInsteadOfClosingTheGate)
+{
+  Rig rig(Role::Host, 0, 5);
+  rig.ReadyToArm(10);
+  rig.Frame(LocalPad(10), Open());
+  Gate hold = Busy();
+  hold.hardware_hold = true;
+  // HOLD: the call waits for the real pad of its own frame; nothing is predicted.
+  EXPECT_FALSE(rig.TryFrame(LocalPad(11), hold));
+  EXPECT_TRUE(rig.sink.Has("GATE hold frame=11"));
+  rig.net.Deliver(10, RemotePadScript(9));
+  EXPECT_FALSE(rig.TryFrame(LocalPad(11), hold));
+  rig.net.Deliver(11, P(0x11));
+  Reply r;
+  ASSERT_TRUE(rig.TryFrame(LocalPad(11), hold, &r));
+  EXPECT_TRUE(SanitizePad(r.pads[1]) == P(0x11));
+  EXPECT_EQ(rig.session->stats().hw_holds, 1u);
+  EXPECT_EQ(rig.session->stats().hold_calls, 1u);
+  EXPECT_EQ(rig.session->stats().predicted_frames, 1u);
+  EXPECT_EQ(rig.session->stats().gate_closes, 0u);
+  EXPECT_TRUE(rig.session->mode() == Mode::ARMED);
+  // The hardware is quiet again: predictions resume, the gate never closed.
+  rig.Frame(LocalPad(12), Open());
+  EXPECT_TRUE(rig.sink.Has("GATE hold end frame=12 held_calls=1"));
+  EXPECT_EQ(rig.session->stats().predicted_frames, 2u);
+  EXPECT_FALSE(rig.sink.Has("GATE close"));
+}
+
+TEST(Rev3Session, ARollbackNeverRunsWhileTheHardwareIsHeldBusyUnlessItIsForced)
+{
+  // The point of HOLD: with the hardware busy for a while, no frame is predicted, so there is nothing to roll back while a disc read is in
+  // flight. A misprediction made BEFORE the hold is still postponed as long as the depth allows.
+  Rig rig(Role::Host, 0, 5);
+  rig.ReadyToArm(10);
+  rig.Frame(LocalPad(10), Open());
+  rig.net.Deliver(10, P(0xA1));  // frame 10 was mispredicted
+  Gate hold = Busy();
+  hold.hardware_hold = true;
+  rig.net.Deliver(11, P(0xA1));
+  rig.Frame(LocalPad(11), hold);
+  rig.net.Deliver(12, P(0xA1));
+  rig.Frame(LocalPad(12), hold);
+  EXPECT_TRUE(rig.store.restored.empty());
+  EXPECT_EQ(rig.session->stats().forced_hw, 0u);
+  EXPECT_EQ(rig.session->stats().postponed, 2u);  // counted once per call
+  EXPECT_EQ(rig.session->stats().predicted_frames, 1u);  // only frame 10: the held calls played real pads
+  // The hardware quiets down: the postponed rollback runs.
+  Reply r;
+  ASSERT_TRUE(rig.TryFrame(LocalPad(13), Open(), &r));
+  EXPECT_EQ(r.flags, REPLY_FLAG_RESTORED);
+  EXPECT_EQ(r.frame, 10u);
+}
+
+TEST(Rev3Session, ALocalRelayoutDrainsRollsBackAndCarriesOnArmed)
+{
+  Rig rig(Role::Host, 0, 5);
+  rig.ReadyToArm(10);
+  rig.Frame(LocalPad(10), Open());
+  rig.Frame(LocalPad(11), Open());
+  Gate relayout = Open();
+  relayout.layout_pending = true;
+  EXPECT_FALSE(rig.TryFrame(LocalPad(12), relayout));  // wait for every remote pad below 12
+  EXPECT_TRUE(rig.session->mode() == Mode::DRAIN);
+  EXPECT_TRUE(rig.sink.Has("GATE relayout frame=12"));
+  rig.net.Deliver(10, RemotePadScript(9));
+  rig.net.Deliver(11, RemotePadScript(9));
+  EXPECT_FALSE(rig.TryFrame(LocalPad(12), relayout));  // and for the frame itself
+  rig.net.Deliver(12, P(0x12));
+  Reply r;
+  ASSERT_TRUE(rig.TryFrame(LocalPad(12), relayout, &r));  // the flag is still set in this call: it must not start another drain
+  EXPECT_EQ(r.flags, 0u);
+  EXPECT_TRUE(SanitizePad(r.pads[1]) == P(0x12));
+  EXPECT_TRUE(rig.session->mode() == Mode::ARMED);
+  EXPECT_EQ(rig.store.relayouts, 1u);
+  EXPECT_EQ(rig.session->stats().relayouts, 1u);
+  EXPECT_EQ(rig.session->stats().gate_closes, 0u);
+  EXPECT_TRUE(rig.sink.Has("GATE relayout done frame=12"));
+  // ARMED goes on: the next frame is predicted again.
+  rig.Frame(LocalPad(13), Open());
+  EXPECT_EQ(rig.session->stats().predicted_frames, 3u);  // 10, 11 and 13
+}
+
+TEST(Rev3Session, ARelayoutThatCannotBeInstalledLeavesTheSession)
+{
+  Rig rig(Role::Host, 0, 5);
+  rig.ReadyToArm(10);
+  rig.Frame(LocalPad(10), Open());
+  rig.net.Deliver(10, RemotePadScript(9));
+  rig.net.Deliver(11, P(0x11));
+  rig.store.relayout_ok = false;
+  Gate relayout = Open();
+  relayout.layout_pending = true;
+  rig.TryFrame(LocalPad(11), relayout);
+  EXPECT_TRUE(rig.session->mode() == Mode::OFFLINE);
+  EXPECT_TRUE(rig.sink.Has("ERROR frame 11: the new snapshot set is not usable"));
+}
+
+// ---- hiding the resimulated frames (M4) --------------------------------------------------------------------------------------------
+
+class FakeHider final : public ResimHider
+{
+public:
+  void SetHidden(bool hidden) override { calls.push_back(hidden); }
+  std::vector<bool> calls;
+};
+
+TEST(Rev3Session, ResimHidingFollowsTheResimulationFlagAndLogsOnce)
+{
+  FakeHider hider;
+  TestSink log;
+  ResimHiding hiding(&hider, log);
+  hiding.Update(false);
+  EXPECT_TRUE(hider.calls.empty());  // nothing to undo
+  hiding.Update(true);
+  hiding.Update(true);  // already hidden: no second call
+  ASSERT_EQ(hider.calls.size(), 1u);
+  EXPECT_TRUE(hider.calls[0]);
+  EXPECT_TRUE(hiding.hidden());
+  hiding.Update(false);
+  ASSERT_EQ(hider.calls.size(), 2u);
+  EXPECT_FALSE(hider.calls[1]);
+  EXPECT_FALSE(hiding.hidden());
+  hiding.Update(true);
+  hiding.Update(false);
+  EXPECT_EQ(hider.calls.size(), 4u);
+  EXPECT_EQ(hiding.hides(), 2u);
+  EXPECT_EQ(log.Count("NOTE resim hiding v1: throttle off + mute"), 1u);  // once, however many resimulations
+}
+
+TEST(Rev3Session, ResimHidingWithoutAHiderDoesNothing)
+{
+  TestSink log;
+  ResimHiding hiding(nullptr, log);
+  hiding.Update(true);
+  hiding.Update(false);
+  EXPECT_FALSE(hiding.hidden());
+  EXPECT_TRUE(log.lines.empty());
+}
+
+TEST(Rev3Session, ResimHidingTracksARealSessionFromTheRestoredReplyToTheLastResimulatedCall)
+{
+  Rig rig(Role::Host, 0, 5);
+  FakeHider hider;
+  ResimHiding hiding(&hider, rig.sink);
+  rig.ReadyToArm(10);
+  for (s32 f = 10; f <= 12; ++f)
+    rig.Frame(LocalPad(f), Open());
+  hiding.Update(rig.session->Resimulating());
+  EXPECT_TRUE(hider.calls.empty());
+  rig.net.Deliver(10, P(0xA1));
+  rig.net.Deliver(11, P(0xA2));
+  rig.net.Deliver(12, P(0xA3));
+  rig.Frame(LocalPad(13), Open());  // RESTORED
+  hiding.Update(rig.session->Resimulating());
+  EXPECT_TRUE(hiding.hidden());
+  rig.Frame(LocalPad(11), Open());
+  hiding.Update(rig.session->Resimulating());
+  EXPECT_TRUE(hiding.hidden());
+  rig.Frame(LocalPad(12), Open());
+  hiding.Update(rig.session->Resimulating());
+  EXPECT_TRUE(hiding.hidden());
+  rig.Frame(LocalPad(13), Open());  // the last resimulated call
+  hiding.Update(rig.session->Resimulating());
+  EXPECT_FALSE(hiding.hidden());
+  ASSERT_EQ(hider.calls.size(), 2u);
+  EXPECT_TRUE(hider.calls[0]);
+  EXPECT_FALSE(hider.calls[1]);
+}
+
+TEST(Rev3Session, ResimHidingIsRestoredWhenTheSessionLeavesInTheMiddleOfAResimulation)
+{
+  Rig rig(Role::Host, 0, 5);
+  FakeHider hider;
+  ResimHiding hiding(&hider, rig.sink);
+  rig.ReadyToArm(10);
+  for (s32 f = 10; f <= 12; ++f)
+    rig.Frame(LocalPad(f), Open());
+  rig.net.Deliver(10, P(0xA1));
+  rig.Frame(LocalPad(13), Open());  // RESTORED
+  hiding.Update(rig.session->Resimulating());
+  ASSERT_TRUE(hiding.hidden());
+  rig.session->Abort("test: the peer is gone");
+  EXPECT_FALSE(rig.session->Resimulating());
+  hiding.Update(rig.session->Resimulating());
+  EXPECT_FALSE(hiding.hidden());
+  EXPECT_FALSE(hider.calls.back());
+}
+
+// ---- the log volume (M4) -----------------------------------------------------------------------------------------------------------
+
+// Plays `n` consecutive one-frame mispredictions: frame f is predicted, the real pad differs, the next call rolls back (RESTORED) and the
+// resimulation ends at the second run of f + 1, whose own pad is delivered equal to the prediction.
+void PlayRollbacks(Rig& rig, s32 first, u32 n)
+{
+  s32 f = first;
+  for (u32 i = 0; i < n; ++i, f += 2)
+  {
+    const u8 v = (i % 2 == 0) ? 0xA1 : 0xA2;
+    rig.Frame(LocalPad(f), Open());
+    rig.net.Deliver(f, P(v));
+    rig.Frame(LocalPad(f + 1), Open());  // RESTORED: frame f
+    rig.Frame(LocalPad(f + 1), Open());  // the second run of f + 1 (predicted with P(v))
+    rig.net.Deliver(f + 1, P(v));
+  }
+}
+
+TEST(Rev3Session, TheFirst200RollbackLinesAreWrittenInFullThenOneSummaryPerWindow)
+{
+  Rig rig(Role::Host, 0, 5);
+  rig.ReadyToArm(10);
+  PlayRollbacks(rig, 10, 330);  // frames 10..669: 330 rollbacks, one window boundary at frame 610
+  EXPECT_EQ(rig.session->stats().rollbacks, 330u);
+  EXPECT_EQ(rig.sink.Count("ROLLBACK depth="), 200u);
+  EXPECT_EQ(rig.sink.Count("RESIM done"), 200u);
+  EXPECT_EQ(rig.session->stats().log_suppressed, 2u * 130u);  // the ROLLBACK line and the RESIM line of each of the 130 others
+  EXPECT_EQ(rig.sink.Count("ROLLBACK depth_hist="), 1u);      // the window that was closed by now
+  rig.session->Finish();
+  EXPECT_EQ(rig.sink.Count("ROLLBACK depth_hist="), 2u);
+  // The counts of the two summaries add up to the rollbacks that were left out, and the depth histogram is exact.
+  u32 left_out = 0;
+  for (const std::string& line : rig.sink.lines)
+  {
+    const size_t at = line.find("ROLLBACK depth_hist=");
+    if (at == std::string::npos)
+      continue;
+    EXPECT_NE(line.find("1:"), std::string::npos) << line;  // all rollbacks have depth 1
+    unsigned rollbacks = 0;
+    ASSERT_EQ(sscanf(line.c_str() + line.find("rollbacks="), "rollbacks=%u", &rollbacks), 1) << line;
+    left_out += rollbacks;
+  }
+  EXPECT_GE(left_out, 130u);  // the first window also holds rollbacks that were written in full
+  EXPECT_TRUE(rig.sink.Has("SUMMARY final"));
+  EXPECT_TRUE(rig.sink.Has("log_suppressed=260"));
+}
+
+TEST(Rev3Session, ThereIsNoSummaryLineWhenNothingWasLeftOut)
+{
+  Rig rig(Role::Host, 0, 5);
+  rig.ReadyToArm(10);
+  PlayRollbacks(rig, 10, 50);
+  rig.session->Finish();
+  EXPECT_EQ(rig.sink.Count("ROLLBACK depth_hist="), 0u);
+  EXPECT_EQ(rig.sink.Count("ROLLBACK depth="), 50u);
+  EXPECT_TRUE(rig.sink.Has("log_suppressed=0"));
+}
+
+TEST(Rev3Session, ChkDesyncErrorAndGateLinesAreNeverRateLimited)
+{
+  Rig rig(Role::Host, 0, 5);
+  rig.ReadyToArm(10);
+  PlayRollbacks(rig, 10, 250);  // past the budget
+  EXPECT_GT(rig.session->stats().log_suppressed, 0u);
+  rig.Frame(LocalPad(510), Lost());
+  EXPECT_TRUE(rig.sink.Has("GATE close scheduled"));  // still written in full
+}
+
+TEST(Rev3Session, StallLinesHaveTheirOwnBudgetOf200AndAnEndLineFollowsItsStartLine)
+{
+  Rig rig(Role::Host, 0, 2);
+  rig.ReadyToArm(10);
+  rig.Frame(LocalPad(10), Open());
+  rig.Frame(LocalPad(11), Open());
+  // Call 12 stalls (3 predicted frames > MAXR 2); every pad that arrives ends the stall and the next call stalls again: 260 stalls.
+  for (s32 i = 0; i < 260; ++i)
+  {
+    EXPECT_FALSE(rig.TryFrame(LocalPad(12 + i), Open()));
+    rig.net.Deliver(10 + i, RemotePadScript(9));
+    rig.Frame(LocalPad(12 + i), Open());
+  }
+  EXPECT_EQ(rig.sink.Count("STALL start"), 200u);
+  EXPECT_EQ(rig.sink.Count("STALL end"), 200u);
+  EXPECT_EQ(rig.session->stats().stalls, 260u);
+  EXPECT_EQ(rig.session->stats().log_suppressed, 120u);  // the start and the end line of each of the 60 left out
+}
+
+// ---- REV3_NET_RANGE_CRC (testing) --------------------------------------------------------------------------------------------------
+
+TEST(Rev3Session, RangeCrcsAreExchangedAtEachCheckFrameAndDifferencesAreLoggedWithoutADesync)
+{
+  Rig rig(Role::Host, 0, 5, true);
+  rig.store.ranges_ok = true;
+  rig.store.ranges = {{0x80000000u, 0x80001000u, 0x11111111u}, {0x80002000u, 0x80003000u, 0x22222222u}, {0x90000000u, 0x90000100u, 0x33333333u}};
+  rig.Handshake();
+  rig.Lockstep(31);  // frame 30 is a check frame: our CRCs go out
+  const Message* sent = rig.net.LastOut(MsgType::RangeCrc);
+  ASSERT_NE(sent, nullptr);
+  RangeCrcMsg ours;
+  ASSERT_TRUE(ParseRangeCrc(sent->bytes, &ours));
+  EXPECT_EQ(ours.frame, 30);
+  EXPECT_EQ(ours.ranges.size(), 3u);
+  // The peer's: one range differs, one is missing on its side.
+  RangeCrcMsg theirs;
+  theirs.frame = 30;
+  theirs.ranges = {{0x80000000u, 0x80001000u, 0x11111111u}, {0x80002000u, 0x80003000u, 0xDEADBEEFu}};
+  rig.net.inbox.push_back({MsgType::RangeCrc, SerializeRangeCrc(theirs)});
+  rig.net.Deliver(31, RemotePadScript(31));
+  rig.Frame(LocalPad(31), Closed());
+  EXPECT_TRUE(rig.sink.Has("NOTE range_crc frame=30 ranges=3 differing=2"));
+  EXPECT_TRUE(rig.sink.Has("range 0x80002000-0x80003000 own=0x22222222 peer=0xDEADBEEF"));
+  EXPECT_TRUE(rig.sink.Has("range 0x90000000-0x90000100 only on the own side"));
+  EXPECT_FALSE(rig.sink.Has("DESYNC"));
+  EXPECT_TRUE(rig.session->mode() == Mode::LOCKSTEP);
+  EXPECT_EQ(rig.session->stats().range_checks, 1u);
+  EXPECT_EQ(rig.session->stats().range_diff_frames, 1u);
+}
+
+TEST(Rev3Session, RangeCrcsThatMatchLogNothingAndWithoutTheOptionNothingIsSent)
+{
+  {
+    Rig rig(Role::Host, 0, 5, true);
+    rig.store.ranges_ok = true;
+    rig.store.ranges = {{0x80000000u, 0x80001000u, 0x11111111u}};
+    rig.Handshake();
+    rig.Lockstep(31);
+    RangeCrcMsg theirs;
+    theirs.frame = 30;
+    theirs.ranges = rig.store.ranges;
+    rig.net.inbox.push_back({MsgType::RangeCrc, SerializeRangeCrc(theirs)});
+    rig.net.Deliver(31, RemotePadScript(31));
+    rig.Frame(LocalPad(31), Closed());
+    EXPECT_FALSE(rig.sink.Has("range_crc"));
+    EXPECT_EQ(rig.session->stats().range_checks, 1u);
+    EXPECT_EQ(rig.session->stats().range_diff_frames, 0u);
+  }
+  {
+    Rig rig(Role::Host, 0, 5, false);
+    rig.store.ranges_ok = true;
+    rig.store.ranges = {{0x80000000u, 0x80001000u, 0x11111111u}};
+    rig.Handshake();
+    rig.Lockstep(31);
+    EXPECT_EQ(rig.net.CountOut(MsgType::RangeCrc), 0u);
+    RangeCrcMsg theirs;
+    theirs.frame = 30;
+    theirs.ranges = {{0x80000000u, 0x80001000u, 0x1u}};
+    rig.net.inbox.push_back({MsgType::RangeCrc, SerializeRangeCrc(theirs)});  // the peer has the option, we do not: ignored, no error
+    rig.net.Deliver(31, RemotePadScript(31));
+    rig.Frame(LocalPad(31), Closed());
+    EXPECT_TRUE(rig.session->mode() == Mode::LOCKSTEP);
+    EXPECT_FALSE(rig.sink.Has("ERROR"));
+  }
+}
+
+TEST(Rev3Session, SummaryCarriesTheM4Counters)
+{
+  Rig rig(Role::Host, 0, 5);
+  rig.ReadyToArm(10);
+  rig.Frame(LocalPad(10), Open());
+  rig.session->Finish();
+  for (const char* key : {"hw_holds=", "hold_calls=", "relayouts=", "forced_hw=", "gate_late=", "log_suppressed=", "depth_hist=["})
+    EXPECT_TRUE(rig.sink.Has(key)) << key;
 }
 
 // ---- checksums -------------------------------------------------------------------------------------------------------------------
@@ -1806,7 +2308,10 @@ struct SimParams
   s32 close_at = 270;                  // closes for good: the last frames run in lockstep so the end states are exact
   s32 mid_close = -1, mid_reopen = -1; // optional close / reopen in the middle
   u32 change_pct = 15;                 // chance per frame that a player's pad changes (otherwise a prediction is right)
-  bool busy_hardware = false;          // each machine independently reports "hardware busy" on ~10% of its calls
+  bool busy_hardware = false;          // each machine independently reports "hardware busy" on ~10% of its calls, and in bursts (HOLD)
+  u32 lost_mod = 0;                    // != 0: a fighter is "at health 0" when (state word 0 >> 5) % lost_mod == 0, a function of the LIVE state:
+                                       // a mispredicted timeline can show it where the real one does not (0 = only the frame windows below)
+  u32 relayout_pct = 0;                // chance per armed call that THIS machine wants a new snapshot set (local: the peer never knows)
   u64 period_us[2] = {16667, 16700};   // each machine's frame period (clock drift)
   u64 start_us[2] = {0, 0};
   s32 bug_frame = -1;                  // machine 1's game has a rules difference at this frame (a desync)
@@ -1818,6 +2323,7 @@ struct SimMachineResult
   SessionStats stats;
   Mode mode = Mode::OFFLINE;
   std::map<s32, u32> finals;  // frame -> checksum the session called final
+  u32 phantom_lost = 0;       // normal ARMED calls whose live state said "lost" where the true timeline does not (a live-following gate would close here)
   std::string log;
   size_t chk_lines = 0;
   s32 counter = 0;
@@ -1828,12 +2334,24 @@ struct SimResult
 {
   SimMachineResult m[2];
   std::array<u32, 4> reference_state{};
+  std::vector<std::array<u32, 4>> reference_states;  // the state at the start of each frame
   std::vector<u32> reference_checksum;
   bool finished = false;
   u64 end_us = 0;
   u64 log_hash = 0;
 };
 
+// The fight is over (frame windows: the end of the run, the optional middle window) or a fighter is at health 0 in the live state.
+bool LostAt(const SimParams& p, const FakeGame& game, s32 frame)
+{
+  if (frame >= p.close_at)
+    return true;
+  if (p.mid_close >= 0 && frame >= p.mid_close && frame < p.mid_reopen)
+    return true;
+  return p.lost_mod != 0 && frame >= p.open_at && ((game.s[0] >> 5) % p.lost_mod) == 0;
+}
+
+// The window in which the gate may open (a function of the frame: in lockstep it is a function of game state that both machines share).
 bool GateAt(const SimParams& p, s32 frame)
 {
   if (frame < p.open_at || frame >= p.close_at)
@@ -1850,6 +2368,7 @@ void Reference(const SimParams& p, const std::vector<Pad8> script[2], SimResult*
   for (s32 f = 0; f < p.frames; ++f)
   {
     out->reference_checksum.push_back(g.Checksum(f));
+    out->reference_states.push_back(g.s);
     const Pad8 host = f >= p.delay ? script[0][static_cast<size_t>(f - p.delay)] : Pad8{};
     const Pad8 guest = f >= p.delay ? script[1][static_cast<size_t>(f - p.delay)] : Pad8{};
     g.Apply(f, host, guest);
@@ -1901,6 +2420,11 @@ struct SimMachine
   bool done = false;
   bool blocking = false;
   u64 block_start = 0;
+  u32 phantom_lost = 0;
+  u32 busy_left = 0;     // calls left in the current hardware-busy burst
+  u32 busy_streak = 0;   // consecutive busy calls so far
+  bool layout_pending = false;
+  u32 relayouts_seen = 0;
 };
 
 // Runs the two machines to completion. False: the scheduler gave up (a deadlock: a bug).
@@ -1950,9 +2474,13 @@ bool RunSim(const SimParams& p, SimResult* out)
       c.pads[0] = ToPadBytes(m.session->Resimulating() ? RandomPad(junk) : m.script[static_cast<size_t>(m.counter)]);
       c.pads[1] = ToPadBytes(RandomPad(junk));
       Gate gate;
-      gate.open = GateAt(p, m.counter);
-      gate.hardware_quiet = !(p.busy_hardware && m.rng.Below(10) == 0);
+      gate.health_zero = LostAt(p, m.game, m.counter);
+      gate.open = GateAt(p, m.counter) && !gate.health_zero;
+      gate.hardware_quiet = !(p.busy_hardware && (m.busy_left > 0 || m.rng.Below(10) == 0));
+      gate.hardware_hold = m.busy_left > 0 && m.busy_streak >= 3;  // GateTracker: busy for 3 calls in a row
+      gate.layout_pending = m.layout_pending && m.session->mode() == Mode::ARMED;
       gate.why = "sim";
+      const bool armed_call = m.session->mode() == Mode::ARMED && !m.session->Resimulating();
       Reply r;
       if (!m.session->Step(c, gate, &r))
       {
@@ -1970,6 +2498,36 @@ bool RunSim(const SimParams& p, SimResult* out)
         continue;
       }
       m.blocking = false;
+      if (armed_call && gate.health_zero && m.counter >= 0 && static_cast<size_t>(m.counter) < out->reference_states.size())
+      {
+        FakeGame truth;
+        truth.s = out->reference_states[static_cast<size_t>(m.counter)];
+        if (!LostAt(p, truth, m.counter))
+          ++m.phantom_lost;
+      }
+      if (p.busy_hardware)
+      {
+        if (m.busy_left > 0)
+        {
+          --m.busy_left;
+          ++m.busy_streak;
+        }
+        else
+        {
+          m.busy_streak = 0;
+          if (m.rng.Below(40) == 0)
+            m.busy_left = 3 + static_cast<u32>(m.rng.Below(6));
+        }
+      }
+      if (m.session->stats().relayouts != m.relayouts_seen)
+      {
+        m.relayouts_seen = m.session->stats().relayouts;
+        m.layout_pending = false;
+      }
+      else if (p.relayout_pct != 0 && m.session->mode() == Mode::ARMED && m.rng.Below(100) < p.relayout_pct)
+      {
+        m.layout_pending = true;
+      }
       if ((r.flags & REPLY_FLAG_RESTORED) != 0)
         m.counter = static_cast<s32>(r.frame);
       m.game.Apply(m.counter, SanitizePad(r.pads[0]), SanitizePad(r.pads[1]));
@@ -1990,6 +2548,7 @@ bool RunSim(const SimParams& p, SimResult* out)
     r.stats = m.session->stats();
     r.mode = m.session->mode();
     r.finals = m.finals;
+    r.phantom_lost = m.phantom_lost;
     r.log = m.sink.Dump();
     r.chk_lines = m.sink.Count("CHK frame=");
     r.counter = m.counter;
@@ -2023,6 +2582,8 @@ SimParams ParamsFromSeed(u64 seed)
   }
   p.change_pct = 5 + r.Below(30);
   p.busy_hardware = r.Below(3) == 0;
+  p.lost_mod = r.Below(2) == 0 ? 0 : 20 + r.Below(200);
+  p.relayout_pct = r.Below(4) == 0 ? 1 + r.Below(3) : 0;
   p.period_us[0] = 15500 + r.Below(2500);
   p.period_us[1] = 15500 + r.Below(2500);
   p.start_us[0] = r.Below(80000);
@@ -2030,11 +2591,32 @@ SimParams ParamsFromSeed(u64 seed)
   return p;
 }
 
+// The "GATE close frame=.. why=.." lines of a log, in order: both machines must have the same ones (THE GATE RULE).
+std::vector<std::string> CloseLines(const std::string& log)
+{
+  std::vector<std::string> out;
+  size_t pos = 0;
+  while ((pos = log.find("GATE close frame=", pos)) != std::string::npos)
+  {
+    const size_t end = log.find('\n', pos);
+    out.push_back(log.substr(pos, end == std::string::npos ? std::string::npos : end - pos));
+    pos = end == std::string::npos ? log.size() : end;
+  }
+  return out;
+}
+
 // The checks every healthy run must pass; returns a description of the first failure ("" = fine).
 std::string CheckHealthy(const SimParams& p, const SimResult& res)
 {
   if (!res.finished)
     return "the scheduler gave up (deadlock)";
+  if (CloseLines(res.m[0].log) != CloseLines(res.m[1].log))
+    return "the two machines closed the gate at different frames or for different reasons";
+  if (res.m[0].stats.gate_closes != res.m[1].stats.gate_closes || res.m[0].stats.gate_opens != res.m[1].stats.gate_opens)
+    return "the two machines opened / closed a different number of times";
+  for (int i = 0; i < 2; ++i)
+    if (res.m[i].stats.gate_late != 0)
+      return "machine " + std::to_string(i) + " applied a scheduled close late";
   for (int i = 0; i < 2; ++i)
   {
     const SimMachineResult& m = res.m[i];
@@ -2207,6 +2789,46 @@ TEST(Rev3Session, ThousandSeedsWithDelayJitterAndLossAgreeWithTheReference)
   EXPECT_LE(deep, 7u);
 }
 
+TEST(Rev3Session, LiveStatesThatLookLostOnOneSideOnlyNeverCloseTheGateOnOneSideOnly)
+{
+  // Many mispredictions + a "health 0" test that is a function of the LIVE state: a mispredicted timeline shows it where the true one does
+  // not (phantom_lost counts those calls). A gate that followed the live state would close one machine and not the other on them; the
+  // final-frame rule keeps both closes at the same frames, for the same reason, every time.
+  u64 phantom = 0, closes = 0, relayouts = 0, holds = 0;
+  for (u64 seed = 1; seed <= 150; ++seed)
+  {
+    SimParams p;
+    p.seed = seed;
+    p.delay = static_cast<int>(seed % 3);
+    p.maxr = 3 + static_cast<int>(seed % 5);
+    p.net.delay_us = 40000 + (seed % 7) * 15000;
+    p.net.jitter_us = 25000;
+    p.net.loss_pct = seed % 4 == 0 ? 10 : 3;
+    p.frames = 420;
+    p.open_at = 25;
+    p.close_at = 390;
+    p.change_pct = 35;
+    p.lost_mod = 12 + static_cast<u32>(seed % 40);
+    p.busy_hardware = seed % 3 == 0;
+    p.relayout_pct = seed % 5 == 0 ? 2 : 0;
+    SimResult res;
+    RunSim(p, &res);
+    const std::string problem = CheckHealthy(p, res);
+    ASSERT_EQ(problem, "") << "seed " << seed;
+    for (const SimMachineResult& m : res.m)
+    {
+      phantom += m.phantom_lost;
+      closes += m.stats.gate_closes;
+      relayouts += m.stats.relayouts;
+      holds += m.stats.hw_holds;
+    }
+  }
+  EXPECT_GT(phantom, 100u);   // the situation did occur
+  EXPECT_GT(closes, 300u);
+  EXPECT_GT(relayouts, 10u);
+  EXPECT_GT(holds, 10u);
+}
+
 TEST(Rev3Session, AnInjectedRulesDifferenceIsCaughtAtTheNextCheckFrameByBothSides)
 {
   u32 caught = 0;
@@ -2251,8 +2873,14 @@ TEST(Rev3Session, AnInjectedDifferenceNamesTheFirstDifferingFieldOnBothSides)
   for (int i = 0; i < 2; ++i)
   {
     // The bug flips bit 6 of state word 2 at frame 105: the dump shows the first frame whose fields differ, and the field.
-    EXPECT_TRUE(res.m[i].log.find("DESYNC first_diff frame=106") != std::string::npos) << res.m[i].log;
+    EXPECT_TRUE(res.m[i].log.find("DESYNC first_diff frame=106 field=p1.") != std::string::npos) << res.m[i].log;
     EXPECT_TRUE(res.m[i].log.find("p1 ") != std::string::npos);
+    // Both sides' arrays of that frame, both players, are in the log (the 61 fields, as hex words).
+    for (const char* side : {"own", "peer"})
+      for (int player = 1; player <= 2; ++player)
+        EXPECT_TRUE(res.m[i].log.find(std::string("DESYNC fields frame=106 side=") + side + " player=" + std::to_string(player) + " ") != std::string::npos)
+            << side << " " << player << "\n"
+            << res.m[i].log;
   }
 }
 

@@ -37,16 +37,30 @@
 //   One thread (the CPU thread, inside the EXI DMA handler) calls OnCommand()/Step(). The Transport implementation must make
 //   its own state safe against the network thread; the session never takes a lock.
 //
+// THE GATE RULE (M4: both machines always agree on WHEN the shared mode changes)
+//   The shared modes are LOCKSTEP and ARMED. Whatever changes them must be a function of state both machines have, applied at a frame both
+//   know. Three kinds of decisions exist; each is handled in the one way that keeps the machines in agreement:
+//   OPEN   decided in LOCKSTEP, where every frame is final (all inputs confirmed). Applied at the frame where both sides' START_CHECKs
+//          name the same frame and carry the same state; a side whose local conditions (quiet hardware, snapshot set learned) differ
+//          simply sends no matching START_CHECK, and both stay in lockstep (a mismatch of frames is refused on both sides).
+//   CLOSE  (a fighter at health 0, fighters not found) decided ONLY on FINAL frames: the state recorded at the capture of frame F is
+//          identical on both machines once F is final (every remote pad below F was played as confirmed). The first final frame F whose
+//          record says "lost" schedules the close for frame F + MAXR + 1, on both machines alike. F is always declared final by call
+//          F + MAXR (stall rule: R >= N - MAXR; the pre-rollback finalisation below keeps rollbacks from delaying it), so neither side
+//          has passed F + MAXR + 1 when it learns the decision. Until then the machines keep predicting; at that frame both enter DRAIN
+//          together. A live (possibly mispredicted) state never closes anything.
+//   LOCAL  reasons that exist on one machine only never change the shared mode, because the peer cannot know about them:
+//            hardware busy for a while  -> HOLD: this side predicts nothing while it lasts (it waits for the real pad of every frame),
+//                                          so a rollback cannot become due while the hardware is busy; the gate stays open for the peer.
+//            snapshot set would change  -> RELAYOUT: this side drains (waits for every remote pad, rolls back what is due), installs the
+//                                          new set and carries on ARMED. The peer sees a short stall, nothing else.
+//          Both are invisible on the wire, and the frames played are the same, so the final states cannot differ.
+//   A frame without fighters cannot be snapshotted, so such a frame is never predicted (the call waits for the real pad), and a live state
+//   without fighters is recorded as "lost" like a health-0 fighter.
+//
 // NOT DONE YET (later milestones)
-//   M3: the real Transport on SlippiNetplayClient (direct connect, wire frame = hook frame + 1, HELLO/START_CHECK/DUMP/BYE ids
-//       0x90..0x93), the real SnapshotStore on Rev3Rollback's slots, the real WaitFn, EXI glue (HandleCommand third branch,
-//       REV3_NET_* variables), the arm gate evaluation (fighters found N calls + hardware quiet + nobody at 0 health), the HELLO
-//       contents (CPU core, DSP, RTC, save hash, ...). M4: v1 hiding of the resim (throttle off + mute, polled through
-//       Resimulating()), NetSim. M5: pacing (CalcTimeOffsetUs port), MAXR measurement. See also the header notes at the
-//       declarations marked "M3".
-//   Known gap: the gate-close decision is made on the (possibly predicted) live state; if a misprediction makes one machine close
-//   the gate that the other keeps open, the first machine drains into lockstep and its re-arm waits (START_CHECK timeout) for a
-//   peer that is not asking. It stays correct (lockstep), only slower, until the gate closes and opens again.
+//   M5: pacing (CalcTimeOffsetUs port), MAXR measurement. M6: the game-side render / SFX skip. See also the header notes at the
+//   declarations marked "M3".
 
 #pragma once
 
@@ -60,6 +74,7 @@
 #include <vector>
 
 #include "Common/CommonTypes.h"
+#include "Core/Slippi/Rev3NetSim.h"
 #include "Core/Slippi/Rev3Rollback.h"
 
 namespace Rev3::Net
@@ -113,6 +128,7 @@ enum class MsgType : u8
   StartCheck = 0x91,
   DesyncDump = 0x92,
   Bye = 0x93,
+  RangeCrc = 0x94,  // M4, REV3_NET_RANGE_CRC=1 only: the CRCs of the snapshot ranges at a checksum frame (testing)
 };
 
 struct Message
@@ -150,6 +166,8 @@ public:
   // pads that have not been acked for about one round trip. Slippi only re-sends when a new pad is queued (its game keeps asking while it
   // stalls); a blocked session queues nothing, so without this a lost packet at the wrong moment would deadlock both sides.
   virtual void Pump() {}
+  // REV3_NETSIM counters (M4) for the SUMMARY line; `active` false = no simulation.
+  virtual NetSimStats NetSimCounts() const { return {}; }
 };
 
 // ---- snapshots -------------------------------------------------------------------------------------------------------------
@@ -166,6 +184,9 @@ struct CaptureInfo
   u32 checksum = 0;  // Rev3Checksum(frame) of the live state (rbchecksum.py), taken in the same breath as the capture
   FieldSet fields;
 };
+
+// One memory range and the CRC-32 of its bytes (REV3_NET_RANGE_CRC).
+using RangeCrc = RangeHash;  // Rev3Rollback.h
 
 // Snapshot slots keyed by hook frame; M3 implements this on Rev3Rollback's capture/restore. The session needs MAXR + 2 slots.
 class SnapshotStore
@@ -186,6 +207,16 @@ public:
   // The fields recorded at the capture of `frame` (the desync field trace; at least the last 31 frames are kept). False: not kept.
   virtual bool Fields(s32 frame, FieldSet* out) const = 0;
   virtual void Clear() = 0;  // forget every slot (the gate closed)
+  // M4. The snapshot set changed on this machine only (learned pages, a new hardware cut): forget every slot, install the new set and verify
+  // that the fighters are inside it. False: not usable (the session leaves). The default is Clear().
+  virtual bool Relayout()
+  {
+    Clear();
+    return true;
+  }
+  // M4, REV3_NET_RANGE_CRC=1 (testing only). CRC-32 of each snapshot range as it was at the start of `frame`: from the frame's slot, or, when
+  // `live` (the caller is at that frame's own hook call), from live memory. False: not available.
+  virtual bool RangeCrcs(s32 /*frame*/, bool /*live*/, std::vector<RangeCrc>* /*out*/) { return false; }
 };
 
 // The FieldSet of raw big-endian field bytes (Rev3::ReadFighterFields / SyncTest::NetSnapshotInfo), `present` as in FieldSet.
@@ -224,6 +255,17 @@ std::vector<u8> SerializeStartCheck(const StartCheck& check);
 bool ParseStartCheck(const std::vector<u8>& bytes, StartCheck* out);
 std::vector<std::string> StartCheckMismatches(const StartCheck& mine, const StartCheck& theirs);  // empty = equal
 
+// REV3_NET_RANGE_CRC=1 (testing): at each checksum frame both sides send the CRC of every snapshot range; a difference is logged (the
+// names of the memory ranges that differ) and never ends the session. It finds the whitelist range that is missing when the field
+// checksum fires.
+struct RangeCrcMsg
+{
+  s32 frame = 0;
+  std::vector<RangeCrc> ranges;
+};
+std::vector<u8> SerializeRangeCrc(const RangeCrcMsg& msg);
+bool ParseRangeCrc(const std::vector<u8>& bytes, RangeCrcMsg* out);
+
 // The field trace both sides exchange after a checksum mismatch: (frame, fields) for the frames around it.
 struct DesyncDump
 {
@@ -243,16 +285,25 @@ struct Config
   u32 wait_timeout_ms = 10000;        // lockstep / drain / ARMED waits for a peer that sends nothing
   u32 stall_disconnect_frames = 420;  // a stall (N - R > MAXR) that lasts this many frames (x 1/60 s) ends the session (Slippi's number)
   u32 start_check_timeout_ms = 10000; // waiting for the peer's START_CHECK at arm time (a timeout only refuses to arm)
+  bool range_crc = false;             // REV3_NET_RANGE_CRC=1: exchange the CRCs of the snapshot ranges at every checksum frame (testing only)
   Hello hello;                        // this side's HELLO (role and delay are filled in from this config when the session starts)
 };
 
-// What the caller evaluates outside the session (needs the game state; the session stays pure). Read on every NORMAL call; resimulated
-// calls (Resimulating() true when the command arrives) ignore it: the fighters of an old timeline must not close the gate.
+// What the caller evaluates outside the session (needs the game state; the session stays pure). EVERY call carries the live-state flags
+// (fighters_found, health_zero), resimulated calls included: the session records them with the capture of the frame and decides on the
+// FINAL frames only (see "THE GATE RULE" above). The remaining fields are read on NORMAL calls only.
 struct Gate
 {
-  bool open = false;            // fighters found for N consecutive calls AND hardware quiet for M calls AND nobody at health 0
+  // ---- the live state of THIS call (start of the frame being run)
+  bool fighters_found = true;   // both fighters found through TEAMS; false = nothing can be snapshotted, the frame is never predicted
+  bool health_zero = false;     // a fighter's health (+0x28) is 0 (the KO that ends the fight)
+  // ---- LOCKSTEP: may the session arm now
+  bool open = false;            // fighters found for N consecutive calls AND hardware quiet for M calls AND nobody at health 0 AND set ready
+  // ---- local conditions (see the rule above: never a shared decision)
   bool hardware_quiet = true;   // no DVD/ARAM DMA in flight right now (HardwareView): a rollback may run
-  const char* why = "";         // logged with GATE open/close
+  bool hardware_hold = false;   // ARMED: the hardware has been busy for several calls in a row: predict nothing while it lasts
+  bool layout_pending = false;  // ARMED: the snapshot set would change (learned pages / a hardware cut): re-install it at a drain
+  const char* why = "";         // logged with GATE open
 };
 
 struct SessionStats
@@ -268,12 +319,55 @@ struct SessionStats
   u64 stall_us_max = 0;
   u32 postponed = 0;                  // rollbacks postponed because hardware was busy
   u32 forced_hw = 0;                  // rollbacks done while busy because postponing would have exceeded MAXR (or in DRAIN)
+  u32 hw_holds = 0;                   // times a sustained busy hardware made this side predict nothing (HOLD)
+  u32 hold_calls = 0;                 // calls answered with the real remote pad because of a HOLD
+  u32 relayouts = 0;                  // local drains that installed a changed snapshot set and carried on ARMED
+  u32 gate_late = 0;                  // a scheduled close that was applied after its frame (the machines may have closed apart: must stay 0)
+  u32 log_suppressed = 0;             // ROLLBACK / STALL / RESIM detail lines left out (rate limit); summarised per window
+  u32 range_checks = 0;               // REV3_NET_RANGE_CRC: checksum frames whose range CRCs were compared
+  u32 range_diff_frames = 0;          // ... of which differing
   u32 checks_ok = 0;
   u32 checks_bad = 0;
   u32 gate_opens = 0;
   u32 gate_closes = 0;
   u32 arm_refused = 0;
 };
+
+// ---- hiding the resimulated frames, v1 (M4) ---------------------------------------------------------------------------------
+// While the game re-runs frames after a RESTORED reply the player should neither wait for them nor hear them twice: v1 turns the
+// throttle off and mutes the audio OUTPUT (never the DSP). The real implementation is in Rev3Rollback.cpp (Dolphin's throttler flag and
+// sound stream volume); tests inject a fake.
+class ResimHider
+{
+public:
+  virtual ~ResimHider() = default;
+  virtual void SetHidden(bool hidden) = 0;  // true: throttle off + mute; false: back to the user's settings. CPU thread.
+};
+
+// Follows RollbackSession::Resimulating() after every command (and at shutdown, with false): hides when it becomes true, restores when it
+// becomes false, i.e. at the reply of the last resimulated frame, when the session leaves, and when the module shuts down.
+class ResimHiding
+{
+public:
+  ResimHiding(ResimHider* hider, Sink& log) : m_hider(hider), m_log(log) {}
+  void Update(bool resimulating);
+  bool hidden() const { return m_hidden; }
+  u32 hides() const { return m_hides; }
+
+private:
+  ResimHider* m_hider;
+  Sink& m_log;
+  bool m_hidden = false;
+  u32 m_hides = 0;
+  bool m_noted = false;
+};
+
+// Rate limit of the per-event detail lines (M4): ROLLBACK / STALL / RESIM lines of the session are written in full for the first
+// LOG_FULL_LINES events of each kind; after that a window of LOG_WINDOW_FRAMES frames writes one `ROLLBACK depth_hist=..` summary line (with
+// the counts of ALL events of the window) instead, and only when it had left lines out. CHK, DESYNC, ERROR, GATE, LEAVE, SUMMARY are never
+// limited. The same numbers rate-limit SyncTest's RESTORE lines in a netplay run (Rev3Rollback.h).
+constexpr u32 LOG_FULL_LINES = 200;
+constexpr s32 LOG_WINDOW_FRAMES = 600;
 
 // ---- the session -----------------------------------------------------------------------------------------------------------
 class RollbackSession
@@ -334,6 +428,7 @@ private:
     u32 checksum = 0;
     bool has_fields = false;  // only check frames keep their fields
     FieldSet fields;
+    u8 lost = 0;              // the live state of the capturing call: 0 fine, 1 a fighter at health 0, 2 fighters not found (no snapshot)
   };
 
   struct OwnCheck
@@ -367,24 +462,38 @@ private:
   bool StepDrain(const Command& command, const Gate& gate, Reply* reply);
   bool StepResim(const Command& command, const Gate& gate, Reply* reply);
   bool DoRollback(const Command& command, s32 target, bool forced, Reply* reply);
-  bool FinishDrain(const Command& command, Reply* reply);
+  bool FinishDrain(const Command& command, const Gate& gate, Reply* reply);
+  bool FinishRelayout(const Command& command, const Gate& gate, Reply* reply);
   bool EndCall(s32 frame, const Reply& reply, Reply* out);
   bool Blocked(Block block);
   int TryArm(const Gate& gate);  // 0 = waiting, 1 = armed, 2 = refused
   void StartLockstep();
-  void EnterDrain(s32 frame, const Gate& gate);
-  void CaptureUsed(s32 frame, const Pad8& local, const Pad8& remote, bool predicted, const CaptureInfo& info);
+  void EnterDrain(s32 frame, const std::string& why, bool relayout);
+  void ScheduleClose(s32 final_frame, u8 lost);
+  void CaptureUsed(s32 frame, const Pad8& local, const Pad8& remote, bool predicted, const CaptureInfo* info, u8 lost);
   s32 FindMisprediction(s32 frame);
   void EndStall(bool hit_timeout);
 
   // ---- checksums
   void FinalizeChecks(s32 limit);
-  void RecordFinal(s32 frame, u32 value, const FieldSet* fields);
+  void RecordFinal(s32 frame, u32 value, const FieldSet* fields, bool live);
   void LockstepCheck(s32 frame);
   void CompareChecksums();
   void Desync(s32 frame, u32 own, u32 peer);
   DesyncDump BuildDump(s32 frame);
   void CompareDumps(const DesyncDump& peer);
+  void ExchangeRanges(s32 frame, bool live);
+  void CompareRanges(s32 frame);
+
+  // ---- rate-limited detail lines (LOG_FULL_LINES / LOG_WINDOW_FRAMES)
+  enum class Detail : u8
+  {
+    Rollback,
+    Stall,
+  };
+  bool DetailLine(Detail kind, const std::string& text);
+  void WindowTick(s32 frame);
+  void FlushWindow();
 
   // ---- messages and lifecycle
   void PumpMessages();
@@ -425,6 +534,14 @@ private:
   std::array<Used, RING> m_used{};
   bool m_postpone_counted = false; // the postponed counter was bumped for this call
 
+  // agreed close, local relayout / hold (see THE GATE RULE)
+  s32 m_close_at = -1;             // the frame both machines enter DRAIN at (scheduled from a final frame); -1 = none
+  std::string m_close_why;
+  bool m_relayout = false;         // the DRAIN in progress is a local relayout: it ends ARMED, not in LOCKSTEP
+  s32 m_relayout_frame = -1;       // the frame the latest relayout finished at (the same call must not start another)
+  bool m_hold = false;             // HOLD in progress (hardware busy)
+  u32 m_hold_run = 0;              // calls answered in this HOLD
+
   // resim
   bool m_resim = false;
   s32 m_resim_target = 0;
@@ -433,6 +550,7 @@ private:
   // stall
   bool m_stalled_this_call = false;  // this call was counted as a stall
   bool m_in_stall = false;           // a stall wait is running (EndStall not yet called)
+  bool m_stall_logged = false;       // the STALL start line of the stall in progress was written in full
   u64 m_stall_start_us = 0;
 
   // checksums
@@ -444,6 +562,29 @@ private:
   bool m_dump_pending = false;     // desync seen: waiting for the peer's dump to name the field
   DesyncDump m_own_dump;
   u32 m_dump_polls = 0;
+
+  // REV3_NET_RANGE_CRC
+  std::map<s32, std::vector<RangeCrc>> m_own_ranges;
+  std::map<s32, std::vector<RangeCrc>> m_peer_ranges;
+  u32 m_range_misses = 0;
+
+  // log rate limit
+  u32 m_detail_rollback = 0;       // ROLLBACK lines (and the RESIM lines that go with them) written in full
+  bool m_resim_logged = false;     // the ROLLBACK line of the resimulation in progress was written in full
+  u32 m_detail_stall = 0;
+  struct Window
+  {
+    bool begun = false;
+    s32 start = 0;
+    s32 last = 0;
+    u32 rollbacks = 0;
+    u32 stalls = 0;
+    u32 postponed = 0;
+    u32 forced = 0;
+    u32 suppressed = 0;
+    u64 stall_us = 0;
+    std::array<u32, MAX_ROLLBACK_CEILING + 2> depth{};
+  } m_win;
 
   std::function<void(s32, u32)> m_final_observer;
   SessionStats m_stats;

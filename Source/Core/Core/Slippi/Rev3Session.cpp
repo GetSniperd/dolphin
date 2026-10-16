@@ -14,7 +14,9 @@
 //   (with a permanently slow link every call stalls briefly and that must not end the session).
 //
 // FINAL FRAMES. Frame f is final when V >= f - 1: every remote pad below f is known and was the pad the game played, so the start state
-// of f cannot change any more. Only final frames are reported to the observer and, for f % 30 == 0, exchanged as checksums.
+// of f cannot change any more. Only final frames are reported to the observer and, for f % 30 == 0, exchanged as checksums. The gate's
+// CLOSE decision is taken on final frames too (THE GATE RULE in Rev3Session.h): the "lost" flag recorded with the capture of the first
+// final frame F that has one schedules the DRAIN for frame F + MAXR + 1 on both machines.
 
 #include "Core/Slippi/Rev3Session.h"
 
@@ -39,6 +41,12 @@ std::string Fmt(const char* format, ...)
   if (n < 0)
     return {};
   return std::string(buf, std::min<size_t>(static_cast<size_t>(n), sizeof(buf) - 1));
+}
+
+// What the live state of a call says about the fight: 0 nothing, 1 a fighter at health 0, 2 no fighters (nothing to snapshot).
+u8 LostKind(const Gate& gate)
+{
+  return !gate.fighters_found ? 2 : (gate.health_zero ? 1 : 0);
 }
 
 const Pad8 NEUTRAL_PAD{};  // all zero: buttons up, sticks and triggers at rest (PADStatus raw, sticks are signed and centred on 0)
@@ -138,6 +146,10 @@ constexpr u32 DUMP_MAGIC = 0x52334431;         // "R3D1"
 constexpr size_t MAX_DUMP_FRAMES = 64;
 constexpr size_t MAX_HELLO_ITEMS = 256;
 constexpr size_t MAX_FIELD_DIFFS_LOGGED = 20;
+constexpr u32 RANGE_MAGIC = 0x52335231;        // "R3R1"
+constexpr size_t MAX_RANGE_ENTRIES = 20000;
+constexpr size_t MAX_RANGE_DIFFS_LOGGED = 40;
+constexpr size_t RANGE_KEEP = 8;               // frames of range CRCs kept per side
 
 const char* RoleName(Role role)
 {
@@ -168,6 +180,20 @@ size_t DiffFields(const FieldSet& own, const FieldSet& peer, size_t limit, std::
     }
   }
   return count;
+}
+
+// All FIELD_COUNT fields of one player as "name=0xVALUE name=0xVALUE ..." (the desync log writes both sides' arrays for the frame).
+std::string FieldsText(const FieldSet& set, size_t player)
+{
+  std::string out;
+  out.reserve(FIELD_COUNT * 24);
+  char piece[64];
+  for (size_t i = 0; i < FIELD_COUNT; ++i)
+  {
+    snprintf(piece, sizeof(piece), "%s%s=0x%08X", i == 0 ? "" : " ", FIELDS[i].name, set.value[player][i]);
+    out += piece;
+  }
+  return out;
 }
 }  // namespace
 
@@ -425,6 +451,63 @@ bool ParseDesyncDump(const std::vector<u8>& bytes, DesyncDump* out)
   return true;
 }
 
+std::vector<u8> SerializeRangeCrc(const RangeCrcMsg& msg)
+{
+  Writer w;
+  w.U32(RANGE_MAGIC);
+  w.S32(msg.frame);
+  const size_t count = std::min(msg.ranges.size(), MAX_RANGE_ENTRIES);
+  w.U32(static_cast<u32>(count));
+  for (size_t i = 0; i < count; ++i)
+  {
+    w.U32(msg.ranges[i].start);
+    w.U32(msg.ranges[i].end);
+    w.U32(msg.ranges[i].crc);
+  }
+  return w.Take();
+}
+
+bool ParseRangeCrc(const std::vector<u8>& bytes, RangeCrcMsg* out)
+{
+  Reader r(bytes);
+  if (r.U32() != RANGE_MAGIC)
+    return false;
+  RangeCrcMsg m;
+  m.frame = r.S32();
+  const u32 count = r.U32();
+  if (count > MAX_RANGE_ENTRIES)
+    return false;
+  for (u32 i = 0; i < count && r.ok(); ++i)
+  {
+    RangeCrc e;
+    e.start = r.U32();
+    e.end = r.U32();
+    e.crc = r.U32();
+    m.ranges.push_back(e);
+  }
+  if (!r.ok() || !r.done())
+    return false;
+  *out = std::move(m);
+  return true;
+}
+
+void ResimHiding::Update(bool resimulating)
+{
+  if (m_hider == nullptr || resimulating == m_hidden)
+    return;
+  m_hidden = resimulating;
+  m_hider->SetHidden(resimulating);
+  if (resimulating)
+  {
+    ++m_hides;
+    if (!m_noted)
+    {
+      m_noted = true;
+      m_log.Line("NOTE resim hiding v1: throttle off + mute");
+    }
+  }
+}
+
 // ---- construction and small helpers ----------------------------------------------------------------------------------------------
 
 RollbackSession::RollbackSession(const Config& config, Transport& transport, SnapshotStore& store, Sink& sink, WaitFn wait)
@@ -523,18 +606,20 @@ bool RollbackSession::EndCall(s32 frame, const Reply& reply, Reply* out)
   return true;
 }
 
-void RollbackSession::CaptureUsed(s32 frame, const Pad8& local, const Pad8& remote, bool predicted, const CaptureInfo& info)
+// `info` null: the call had no fighters, so no snapshot and no checksum exist for the frame (only what it was played with and its flag).
+void RollbackSession::CaptureUsed(s32 frame, const Pad8& local, const Pad8& remote, bool predicted, const CaptureInfo* info, u8 lost)
 {
   Used& u = UsedAt(frame);
   u.frame = frame;
   u.local = local;
   u.remote = remote;
   u.predicted = predicted;
-  u.has_checksum = true;
-  u.checksum = info.checksum;
-  u.has_fields = frame % CHECK_INTERVAL == 0;
+  u.lost = lost;
+  u.has_checksum = info != nullptr;
+  u.checksum = info != nullptr ? info->checksum : 0;
+  u.has_fields = info != nullptr && frame % CHECK_INTERVAL == 0;
   if (u.has_fields)
-    u.fields = info.fields;
+    u.fields = info->fields;
 }
 
 // ---- the blocking wrapper ------------------------------------------------------------------------------------------------------
@@ -711,6 +796,8 @@ bool RollbackSession::StepInner(const Command& command, const Gate& gate, Reply*
     m_cur_frame = n;
     m_stalled_this_call = false;
     m_postpone_counted = false;
+    if (!m_resim)
+      WindowTick(n);
   }
 
   if (m_resim)
@@ -818,6 +905,11 @@ int RollbackSession::TryArm(const Gate& gate)
   m_armed_frame = n;
   m_verified = n - 1;
   m_finalized = n - 1;
+  m_close_at = -1;
+  m_close_why.clear();
+  m_relayout = false;
+  m_relayout_frame = -1;
+  m_hold = false;
   m_store.Clear();
   for (Used& u : m_used)
     u = Used{};
@@ -834,10 +926,46 @@ bool RollbackSession::StepArmed(const Command& command, const Gate& gate, Reply*
   const s32 n = m_cur_frame;
   const int maxr = m_cfg.max_rollback;
 
-  if (!gate.open)
+  // The agreed close: scheduled from a FINAL frame F for frame F + MAXR + 1, the same on both machines (THE GATE RULE). A live state, which
+  // may be a misprediction's, never closes anything: gate.fighters_found / gate.health_zero are only recorded, below.
+  if (m_close_at >= 0 && n >= m_close_at)
   {
-    EnterDrain(n, gate);
+    if (n > m_close_at)
+    {
+      ++m_stats.gate_late;
+      Line(Fmt("GATE close late: scheduled for frame %d, applied at frame %d (the peer may have closed at another frame)", m_close_at, n));
+    }
+    EnterDrain(n, m_close_why, false);
     return StepDrain(command, gate, reply);
+  }
+
+  // A local relayout: the snapshot set would change on this machine. Drain, install it, carry on ARMED (the peer notices a short stall).
+  if (gate.layout_pending && gate.fighters_found && n != m_relayout_frame)
+  {
+    EnterDrain(n, "snapshot set changed (local: the peer is not affected)", true);
+    return StepDrain(command, gate, reply);
+  }
+
+  // A local HOLD: the hardware has been busy for several calls. No frame is predicted while it lasts, so no rollback can become due while a
+  // disc read is in flight (a restore cannot rewind it); every call waits for the real pad of its own frame.
+  if (gate.hardware_hold)
+  {
+    if (!m_hold)
+    {
+      m_hold = true;
+      m_hold_run = 0;
+      ++m_stats.hw_holds;
+      Line(Fmt("GATE hold frame=%d why=hardware busy: no frame is predicted while it lasts (the gate stays open)", n));
+    }
+    if (Confirmed() < n)
+      return Blocked(Block::Lockstep);
+    ++m_hold_run;
+    ++m_stats.hold_calls;
+  }
+  else if (m_hold)
+  {
+    m_hold = false;
+    Line(Fmt("GATE hold end frame=%d held_calls=%u", n, m_hold_run));
   }
 
   // Stall rule: the frames R+1..N are predicted; never more than MAXR of them. (Before the scan, so that a pad that arrives while we
@@ -850,7 +978,8 @@ bool RollbackSession::StepArmed(const Command& command, const Gate& gate, Reply*
       m_in_stall = true;
       m_stall_start_us = m_net.Now();
       ++m_stats.stalls;
-      Line(Fmt("STALL start frame=%d R=%d predicted=%d maxr=%d", n, Confirmed(), n - Confirmed(), maxr));
+      ++m_win.stalls;
+      m_stall_logged = DetailLine(Detail::Stall, Fmt("STALL start frame=%d R=%d predicted=%d maxr=%d", n, Confirmed(), n - Confirmed(), maxr));
     }
     return Blocked(Block::Stall);
   }
@@ -860,6 +989,9 @@ bool RollbackSession::StepArmed(const Command& command, const Gate& gate, Reply*
   const s32 g = FindMisprediction(n);
   if (g >= 0)
   {
+    // The frames up to g are final now (everything below g is verified): say so BEFORE a rollback may run, or a run of consecutive
+    // rollbacks could keep a final frame from being declared and the scheduled close from reaching both machines in time.
+    FinalizeChecks(g);
     const bool quiet = gate.hardware_quiet;
     const bool forced = !quiet && n - g >= maxr;  // postponing once more would make the rollback deeper than MAXR
     if (quiet || forced)
@@ -868,8 +1000,22 @@ bool RollbackSession::StepArmed(const Command& command, const Gate& gate, Reply*
     {
       m_postpone_counted = true;
       ++m_stats.postponed;
-      Line(Fmt("ROLLBACK postponed frame=%d live=%d depth=%d (hardware busy)", g, n, n - g));
+      ++m_win.postponed;
+      DetailLine(Detail::Rollback, Fmt("ROLLBACK postponed frame=%d live=%d depth=%d (hardware busy)", g, n, n - g));
     }
+  }
+
+  const Pad8 local = LocalAt(n);
+  const u8 lost = LostKind(gate);
+  if (!gate.fighters_found)
+  {
+    // No fighters: nothing can be snapshotted, so a prediction for this frame could never be rolled back to. Play it with the real pad.
+    if (Confirmed() < n)
+      return Blocked(Block::Lockstep);
+    const Pad8 remote = RemoteAt(n);
+    CaptureUsed(n, local, remote, false, nullptr, lost);
+    FinalizeChecks(n);
+    return EndCall(n, MakeReply(local, remote, 0, n), reply);
   }
 
   CaptureInfo info;
@@ -879,12 +1025,11 @@ bool RollbackSession::StepArmed(const Command& command, const Gate& gate, Reply*
     LeaveSession("snapshot capture failed", true);
     return EndCall(n, EchoReply(command), reply);
   }
-  const Pad8 local = LocalAt(n);
   const bool known = n <= Confirmed();
   const Pad8 remote = known ? RemoteAt(n) : Predict();
   if (!known)
     ++m_stats.predicted_frames;
-  CaptureUsed(n, local, remote, !known, info);
+  CaptureUsed(n, local, remote, !known, &info, lost);
   FinalizeChecks(n);
   return EndCall(n, MakeReply(local, remote, 0, n), reply);
 }
@@ -935,11 +1080,18 @@ bool RollbackSession::DoRollback(const Command& command, s32 target, bool forced
     return true;
   }
   ++m_stats.rollbacks;
+  ++m_win.rollbacks;
   m_stats.max_depth = std::max(m_stats.max_depth, static_cast<u32>(depth));
-  ++m_stats.depth_hist[std::min<size_t>(static_cast<size_t>(depth), m_stats.depth_hist.size() - 1)];
+  const size_t bucket = std::min<size_t>(static_cast<size_t>(depth), m_stats.depth_hist.size() - 1);
+  ++m_stats.depth_hist[bucket];
+  ++m_win.depth[bucket];
   if (forced)
+  {
     ++m_stats.forced_hw;
-  Line(Fmt("ROLLBACK depth=%d frame=%d live=%d R=%d%s", depth, target, n, Confirmed(), forced ? " forced=hardware_busy" : ""));
+    ++m_win.forced;
+  }
+  m_resim_logged = DetailLine(
+      Detail::Rollback, Fmt("ROLLBACK depth=%d frame=%d live=%d R=%d%s", depth, target, n, Confirmed(), forced ? " forced=hardware_busy" : ""));
 
   // The pads FOR the target frame: the remote one is known (that is how the misprediction was found).
   const Pad8 local = LocalAt(target);
@@ -968,6 +1120,8 @@ bool RollbackSession::StepResim(const Command& command, const Gate& gate, Reply*
     Line(Fmt("ERROR RESIM expected frame %d, the game sent %d (restore not honoured?); back to lockstep", m_next_expected, m));
     m_resim = false;
     m_mode = Mode::LOCKSTEP;
+    m_relayout = false;
+    m_close_at = -1;
     m_store.Clear();
     m_expected_next = m;
     m_input_frame = -1;
@@ -980,10 +1134,19 @@ bool RollbackSession::StepResim(const Command& command, const Gate& gate, Reply*
     return Blocked(Block::DrainB);
 
   const Pad8 local = LocalAt(m);
-  const bool known = m <= Confirmed();
-  const Pad8 remote = known ? RemoteAt(m) : Predict();
+  const u8 lost = LostKind(gate);
+  Pad8 remote{};
+  bool known = m <= Confirmed();
   CaptureInfo info;
-  if (!m_store.Capture(m, command.sp, &info))
+  const bool captured = gate.fighters_found;
+  if (!captured)
+  {
+    // The corrected timeline has no fighters at this frame: nothing to snapshot, so it is played with the real pad only.
+    if (!known)
+      return Blocked(Block::Lockstep);
+  }
+  remote = known ? RemoteAt(m) : Predict();
+  if (captured && !m_store.Capture(m, command.sp, &info))
   {
     Line(Fmt("ERROR RESIM frame %d: snapshot capture failed", m));
     LeaveSession("snapshot capture failed during the resimulation", true);
@@ -994,27 +1157,42 @@ bool RollbackSession::StepResim(const Command& command, const Gate& gate, Reply*
   ++m_stats.resim_calls;
   if (!known)
     ++m_stats.predicted_frames;
-  CaptureUsed(m, local, remote, !known, info);
+  CaptureUsed(m, local, remote, !known, captured ? &info : nullptr, lost);
   m_next_expected = m + 1;
   if (!last)
     return EndCall(m, MakeReply(local, remote, 0, m), reply);
 
   // The second run of the call that was live when the rollback began: the resimulation is over.
   m_resim = false;
-  Line(Fmt("RESIM done frame=%d", m));
+  // The RESIM line goes with its ROLLBACK line (written or left out together: the budget counts rollbacks, not lines).
+  if (m_resim_logged)
+    Line(Fmt("RESIM done frame=%d", m));
+  else
+  {
+    ++m_win.suppressed;
+    ++m_stats.log_suppressed;
+  }
   if (drain)
-    return FinishDrain(command, reply);
+    return FinishDrain(command, gate, reply);
   return EndCall(m, MakeReply(local, remote, 0, m), reply);
 }
 
 // ---- DRAIN -----------------------------------------------------------------------------------------------------------------------
 
-void RollbackSession::EnterDrain(s32 frame, const Gate& gate)
+void RollbackSession::EnterDrain(s32 frame, const std::string& why, bool relayout)
 {
   m_mode = Mode::DRAIN;
+  m_relayout = relayout;
+  m_hold = false;
+  if (relayout)
+  {
+    ++m_stats.relayouts;
+    Line(Fmt("GATE relayout frame=%d why=%s", frame, why.c_str()));
+    return;
+  }
   m_arm_blocked = false;
   ++m_stats.gate_closes;
-  Line(Fmt("GATE close frame=%d why=%s", frame, gate.why != nullptr ? gate.why : ""));
+  Line(Fmt("GATE close frame=%d why=%s", frame, why.c_str()));
 }
 
 bool RollbackSession::StepDrain(const Command& command, const Gate& gate, Reply* reply)
@@ -1025,10 +1203,10 @@ bool RollbackSession::StepDrain(const Command& command, const Gate& gate, Reply*
   const s32 g = FindMisprediction(n);
   if (g >= 0)
     return DoRollback(command, g, !gate.hardware_quiet, reply);  // draining cannot wait for the hardware: a rollback is due now
-  return FinishDrain(command, reply);
+  return FinishDrain(command, gate, reply);
 }
 
-bool RollbackSession::FinishDrain(const Command& command, Reply* reply)
+bool RollbackSession::FinishDrain(const Command& command, const Gate& gate, Reply* reply)
 {
   const s32 n = m_cur_frame;
   if (Confirmed() < n)
@@ -1037,11 +1215,43 @@ bool RollbackSession::FinishDrain(const Command& command, Reply* reply)
   FinalizeChecks(n - 1);
   if (m_mode == Mode::OFFLINE)
     return EndCall(n, EchoReply(command), reply);
+  if (m_relayout)
+    return FinishRelayout(command, gate, reply);
   Line(Fmt("DRAIN done frame=%d", n));
   m_mode = Mode::LOCKSTEP;
+  m_close_at = -1;
+  m_close_why.clear();
   m_store.Clear();
   LockstepCheck(n);
   return EndCall(n, MakeReply(LocalAt(n), RemoteAt(n), 0, n), reply);
+}
+
+// The local drain is over: every remote pad up to this frame is confirmed and nothing is due. Install the new snapshot set and go on ARMED
+// with fresh slots. The peer never learns of it (it is the same stream of frames played with the same pads).
+bool RollbackSession::FinishRelayout(const Command& command, const Gate& gate, Reply* reply)
+{
+  const s32 n = m_cur_frame;
+  m_relayout = false;
+  m_relayout_frame = n;
+  if (gate.fighters_found)
+  {
+    if (!m_store.Relayout())
+    {
+      Line(Fmt("ERROR frame %d: the new snapshot set is not usable", n));
+      LeaveSession("snapshot set unusable after a relayout", true);
+      return EndCall(n, EchoReply(command), reply);
+    }
+    Line(Fmt("GATE relayout done frame=%d", n));
+  }
+  else
+  {
+    m_store.Clear();  // the fighters are gone: the close is on its way; the set is installed at the next arm
+  }
+  m_mode = Mode::ARMED;
+  for (Used& u : m_used)
+    u = Used{};
+  m_finalized = n - 1;
+  return StepArmed(command, gate, reply);
 }
 
 // ---- stall bookkeeping -----------------------------------------------------------------------------------------------------------
@@ -1055,7 +1265,16 @@ void RollbackSession::EndStall(bool hit_timeout)
   const u64 us = now >= m_stall_start_us ? now - m_stall_start_us : 0;
   m_stats.stall_us_total += us;
   m_stats.stall_us_max = std::max(m_stats.stall_us_max, us);
-  Line(Fmt("STALL %s frame=%d ms=%.1f R=%d", hit_timeout ? "timeout" : "end", m_cur_frame, static_cast<double>(us) / 1000.0, Confirmed()));
+  m_win.stall_us += us;
+  const std::string text =
+      Fmt("STALL %s frame=%d ms=%.1f R=%d", hit_timeout ? "timeout" : "end", m_cur_frame, static_cast<double>(us) / 1000.0, Confirmed());
+  if (hit_timeout || m_stall_logged)
+    Line(text);  // the end of a session: never limited; the end of a stall goes with its start line (written or left out together)
+  else
+  {
+    ++m_win.suppressed;
+    ++m_stats.log_suppressed;
+  }
 }
 
 // ---- checksums -------------------------------------------------------------------------------------------------------------------
@@ -1066,15 +1285,28 @@ void RollbackSession::FinalizeChecks(s32 limit)
   for (s32 f = m_finalized + 1; f <= vlimit && m_mode != Mode::OFFLINE; ++f)
   {
     const Used& u = UsedAt(f);
-    if (u.frame == f && u.has_checksum)
+    if (u.frame == f)
     {
-      if (m_final_observer)
-        m_final_observer(f, u.checksum);
-      if (f % CHECK_INTERVAL == 0)
-        RecordFinal(f, u.checksum, u.has_fields ? &u.fields : nullptr);
+      if (u.has_checksum)
+      {
+        if (m_final_observer)
+          m_final_observer(f, u.checksum);
+        if (f % CHECK_INTERVAL == 0)
+          RecordFinal(f, u.checksum, u.has_fields ? &u.fields : nullptr, false);
+      }
+      // THE GATE RULE: the first FINAL frame whose recorded state says "lost" schedules the close, for the same frame on both machines.
+      if (u.lost != 0 && m_close_at < 0 && (m_mode == Mode::ARMED || m_relayout))
+        ScheduleClose(f, u.lost);
     }
     m_finalized = f;
   }
+}
+
+void RollbackSession::ScheduleClose(s32 final_frame, u8 lost)
+{
+  m_close_at = final_frame + m_cfg.max_rollback + 1;
+  m_close_why = Fmt("final frame %d: %s", final_frame, lost == 2 ? "fighters not found" : "a fighter at health 0");
+  Line(Fmt("GATE close scheduled final_frame=%d effective_frame=%d why=%s", final_frame, m_close_at, m_close_why.c_str()));
 }
 
 void RollbackSession::LockstepCheck(s32 frame)
@@ -1083,10 +1315,11 @@ void RollbackSession::LockstepCheck(s32 frame)
     return;
   FieldSet fields;
   const u32 value = m_store.LiveChecksum(frame, &fields);
-  RecordFinal(frame, value, &fields);
+  RecordFinal(frame, value, &fields, true);
 }
 
-void RollbackSession::RecordFinal(s32 frame, u32 value, const FieldSet* fields)
+// `live`: the caller is at the hook call of `frame` itself (lockstep), so the live memory is that frame's start state.
+void RollbackSession::RecordFinal(s32 frame, u32 value, const FieldSet* fields, bool live)
 {
   m_own[frame] = OwnCheck{value, false};
   if (fields != nullptr)
@@ -1097,6 +1330,8 @@ void RollbackSession::RecordFinal(s32 frame, u32 value, const FieldSet* fields)
     m_own_fields.erase(m_own_fields.begin());
   m_send_chk_frame = frame;  // rides in every PAD packet from the next SendLocal on
   m_send_chk_value = value;
+  if (m_cfg.range_crc)
+    ExchangeRanges(frame, live);
   CompareChecksums();
 }
 
@@ -1161,25 +1396,70 @@ void RollbackSession::Desync(s32 frame, u32 own, u32 peer)
   LeaveSession("desync", true);
 }
 
+// Both sides' dumps are here: name the first frame whose 61-field arrays differ and the first field in it, and write the arrays of both sides
+// for that frame (all fields, both players), so the log alone is a complete bug report.
 void RollbackSession::CompareDumps(const DesyncDump& peer)
 {
   m_dump_pending = false;
-  for (const auto& theirs : peer.trace)
+  s32 last_equal = -1;
+  for (const auto& ours : m_own_dump.trace)  // ascending: the first difference found is the earliest
   {
-    for (const auto& ours : m_own_dump.trace)
+    const FieldSet* theirs = nullptr;
+    for (const auto& candidate : peer.trace)
+      if (candidate.first == ours.first)
+      {
+        theirs = &candidate.second;
+        break;
+      }
+    if (theirs == nullptr)
+      continue;
+    if (ours.second == *theirs)
     {
-      if (ours.first != theirs.first || ours.second == theirs.second)
-        continue;
-      std::vector<std::string> lines;
-      const size_t n = DiffFields(ours.second, theirs.second, 3, &lines);
-      Line(Fmt("DESYNC first_diff frame=%d fields_differing=%zu", ours.first, n));
-      for (const std::string& line : lines)
-        Line("  " + line);
-      return;
+      last_equal = ours.first;
+      continue;
     }
+    std::vector<std::string> lines;
+    const size_t n = DiffFields(ours.second, *theirs, 8, &lines);
+    std::string first_field = "(fighters found)";
+    u32 own_value = 0;
+    u32 peer_value = 0;
+    for (size_t p = 0; p < 2 && n != 0; ++p)
+    {
+      bool done = false;
+      for (size_t i = 0; i < FIELD_COUNT && ((ours.second.present & theirs->present) & (1u << p)) != 0; ++i)
+      {
+        if (ours.second.value[p][i] == theirs->value[p][i])
+          continue;
+        first_field = Fmt("p%zu.%s", p + 1, FIELDS[i].name);
+        own_value = ours.second.value[p][i];
+        peer_value = theirs->value[p][i];
+        done = true;
+        break;
+      }
+      if (done)
+        break;
+    }
+    Line(Fmt("DESYNC first_diff frame=%d field=%s own=0x%08X peer=0x%08X fields_differing=%zu last_equal_frame=%d", ours.first, first_field.c_str(),
+             own_value, peer_value, n, last_equal));
+    for (const std::string& line : lines)
+      Line("  " + line);
+    for (size_t p = 0; p < 2; ++p)
+    {
+      const unsigned player = static_cast<unsigned>(p + 1);
+      for (int side = 0; side < 2; ++side)
+      {
+        const FieldSet& set = side == 0 ? ours.second : *theirs;
+        const char* name = side == 0 ? "own" : "peer";
+        if ((set.present & (1u << p)) == 0)
+          Line(Fmt("DESYNC fields frame=%d side=%s player=%u not found", ours.first, name, player));
+        else
+          Line(Fmt("DESYNC fields frame=%d side=%s player=%u ", ours.first, name, player) + FieldsText(set, p));
+      }
+    }
+    return;
   }
-  Line(Fmt("DESYNC dump: no differing frame in the common trace (own %zu frames, peer %zu frames)", m_own_dump.trace.size(),
-           peer.trace.size()));
+  Line(Fmt("DESYNC dump: no differing frame in the common trace (own %zu frames, peer %zu frames, last equal frame %d)", m_own_dump.trace.size(),
+           peer.trace.size(), last_equal));
 }
 
 // ---- messages and lifecycle ----------------------------------------------------------------------------------------------------
@@ -1279,6 +1559,17 @@ void RollbackSession::HandleMessage(const Message& message)
       CompareDumps(dump);
     return;
   }
+  case MsgType::RangeCrc:
+  {
+    RangeCrcMsg msg;
+    if (!m_cfg.range_crc || m_mode == Mode::OFFLINE || !ParseRangeCrc(message.bytes, &msg))
+      return;  // only a run with REV3_NET_RANGE_CRC=1 listens; the other side's setting is no mismatch
+    m_peer_ranges[msg.frame] = std::move(msg.ranges);
+    while (m_peer_ranges.size() > RANGE_KEEP)
+      m_peer_ranges.erase(m_peer_ranges.begin());
+    CompareRanges(msg.frame);
+    return;
+  }
   case MsgType::Bye:
   {
     if (m_mode == Mode::OFFLINE)
@@ -1312,10 +1603,14 @@ void RollbackSession::LeaveSession(const std::string& why, bool tell_peer)
   if (!m_finished)
   {
     m_finished = true;
+    FlushWindow();
     SummaryLine("SUMMARY");
   }
   m_mode = Mode::OFFLINE;
   m_resim = false;
+  m_relayout = false;
+  m_hold = false;
+  m_close_at = -1;
   m_cur_frame = -1;
   m_block = Block::None;
   m_store.Clear();
@@ -1327,11 +1622,21 @@ void RollbackSession::SummaryLine(const char* tag)
   for (size_t d = 1; d < m_stats.depth_hist.size(); ++d)
     if (m_stats.depth_hist[d] != 0)
       hist += Fmt("%s%zu:%u", hist.empty() ? "" : ",", d, m_stats.depth_hist[d]);
+  std::string sim;
+  const NetSimStats ns = m_net.NetSimCounts();
+  if (ns.active)
+    sim = Fmt(" netsim_dropped=%u netsim_held=%u", ns.dropped, ns.held);
+  std::string ranges;
+  if (m_cfg.range_crc)
+    ranges = Fmt(" range_checks=%u range_diff_frames=%u", m_stats.range_checks, m_stats.range_diff_frames);
   Line(Fmt("%s mode=%s frame=%d calls=%u resim_calls=%u rollbacks=%u max_depth=%u depth_hist=[%s] predicted=%u stalls=%u stall_ms_max=%.1f "
-           "postponed=%u forced_hw=%u chk_ok=%u chk_bad=%u gate_opens=%u gate_closes=%u arm_refused=%u",
+           "postponed=%u forced_hw=%u hw_holds=%u hold_calls=%u relayouts=%u chk_ok=%u chk_bad=%u gate_opens=%u gate_closes=%u gate_late=%u "
+           "arm_refused=%u log_suppressed=%u%s%s",
            tag, ModeName(m_mode), m_expected_next, m_stats.calls, m_stats.resim_calls, m_stats.rollbacks, m_stats.max_depth, hist.c_str(),
            m_stats.predicted_frames, m_stats.stalls, static_cast<double>(m_stats.stall_us_max) / 1000.0, m_stats.postponed,
-           m_stats.forced_hw, m_stats.checks_ok, m_stats.checks_bad, m_stats.gate_opens, m_stats.gate_closes, m_stats.arm_refused));
+           m_stats.forced_hw, m_stats.hw_holds, m_stats.hold_calls, m_stats.relayouts, m_stats.checks_ok, m_stats.checks_bad,
+           m_stats.gate_opens, m_stats.gate_closes, m_stats.gate_late, m_stats.arm_refused, m_stats.log_suppressed, sim.c_str(),
+           ranges.c_str()));
 }
 
 void RollbackSession::Finish()
@@ -1339,6 +1644,121 @@ void RollbackSession::Finish()
   if (m_finished)
     return;
   m_finished = true;
+  FlushWindow();
   SummaryLine("SUMMARY final");
+}
+
+// ---- rate-limited detail lines -----------------------------------------------------------------------------------------------------
+// The counters of every event are kept exactly (SessionStats and the window); only the text of the lines past the first LOG_FULL_LINES of a
+// kind is replaced by one summary line per window of LOG_WINDOW_FRAMES frames.
+
+// True: the line was written. False: left out (past the first LOG_FULL_LINES of its kind), counted in the window.
+bool RollbackSession::DetailLine(Detail kind, const std::string& text)
+{
+  u32& written = kind == Detail::Stall ? m_detail_stall : m_detail_rollback;
+  if (written < LOG_FULL_LINES)
+  {
+    ++written;
+    Line(text);
+    return true;
+  }
+  ++m_win.suppressed;
+  ++m_stats.log_suppressed;
+  return false;
+}
+
+void RollbackSession::WindowTick(s32 frame)
+{
+  if (!m_win.begun)
+  {
+    m_win.begun = true;
+    m_win.start = frame;
+  }
+  else if (frame >= m_win.start + LOG_WINDOW_FRAMES)
+  {
+    FlushWindow();
+    m_win.begun = true;
+    m_win.start = frame;
+  }
+  m_win.last = frame;
+}
+
+void RollbackSession::FlushWindow()
+{
+  if (m_win.suppressed != 0)
+  {
+    std::string hist;
+    for (size_t d = 1; d < m_win.depth.size(); ++d)
+      if (m_win.depth[d] != 0)
+        hist += Fmt("%s%zu:%u", hist.empty() ? "" : ",", d, m_win.depth[d]);
+    Line(Fmt("ROLLBACK depth_hist=%s window=%d-%d rollbacks=%u stalls=%u stall_ms=%.1f postponed=%u forced_hw=%u lines_left_out=%u",
+             hist.empty() ? "none" : hist.c_str(), m_win.start, m_win.last, m_win.rollbacks, m_win.stalls,
+             static_cast<double>(m_win.stall_us) / 1000.0, m_win.postponed, m_win.forced, m_win.suppressed));
+  }
+  m_win = Window{};
+}
+
+// ---- REV3_NET_RANGE_CRC ------------------------------------------------------------------------------------------------------------
+
+void RollbackSession::ExchangeRanges(s32 frame, bool live)
+{
+  std::vector<RangeCrc> ranges;
+  if (!m_store.RangeCrcs(frame, live, &ranges))
+  {
+    if (++m_range_misses <= 3)
+      Line(Fmt("NOTE range_crc frame=%d: the snapshot ranges of that frame are not available (no slot, no ranges)", frame));
+    return;
+  }
+  RangeCrcMsg msg;
+  msg.frame = frame;
+  msg.ranges = ranges;
+  m_net.SendReliable(MsgType::RangeCrc, SerializeRangeCrc(msg));
+  m_own_ranges[frame] = std::move(ranges);
+  while (m_own_ranges.size() > RANGE_KEEP)
+    m_own_ranges.erase(m_own_ranges.begin());
+  CompareRanges(frame);
+}
+
+// Both sides' CRCs of the ranges at `frame` are here: name the ranges that differ. Never a desync (some ranges differ between two healthy
+// runs: volatile audio / picture memory); it is what tells which memory to look at when the field checksum fires.
+void RollbackSession::CompareRanges(s32 frame)
+{
+  const auto own_it = m_own_ranges.find(frame);
+  const auto peer_it = m_peer_ranges.find(frame);
+  if (own_it == m_own_ranges.end() || peer_it == m_peer_ranges.end())
+    return;
+  ++m_stats.range_checks;
+  std::map<std::pair<u32, u32>, std::pair<const RangeCrc*, const RangeCrc*>> merged;
+  for (const RangeCrc& r : own_it->second)
+    merged[{r.start, r.end}].first = &r;
+  for (const RangeCrc& r : peer_it->second)
+    merged[{r.start, r.end}].second = &r;
+  std::vector<std::string> lines;
+  size_t differing = 0;
+  for (const auto& entry : merged)
+  {
+    const RangeCrc* a = entry.second.first;
+    const RangeCrc* b = entry.second.second;
+    if (a != nullptr && b != nullptr && a->crc == b->crc)
+      continue;
+    ++differing;
+    if (lines.size() >= MAX_RANGE_DIFFS_LOGGED)
+      continue;
+    if (a != nullptr && b != nullptr)
+      lines.push_back(Fmt("  range 0x%08X-0x%08X own=0x%08X peer=0x%08X", entry.first.first, entry.first.second, a->crc, b->crc));
+    else
+      lines.push_back(Fmt("  range 0x%08X-0x%08X only on the %s side", entry.first.first, entry.first.second, a != nullptr ? "own" : "peer"));
+  }
+  if (differing != 0)
+  {
+    ++m_stats.range_diff_frames;
+    Line(Fmt("NOTE range_crc frame=%d ranges=%zu differing=%zu (no desync: information only)", frame, merged.size(), differing));
+    for (const std::string& line : lines)
+      Line(line);
+    if (differing > lines.size())
+      Line(Fmt("  ... and %zu more differing ranges", differing - lines.size()));
+  }
+  m_own_ranges.erase(own_it);
+  m_peer_ranges.erase(peer_it);
 }
 }  // namespace Rev3::Net

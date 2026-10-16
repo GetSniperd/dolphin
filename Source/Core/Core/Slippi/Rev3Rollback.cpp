@@ -23,6 +23,8 @@
 
 #include <picojson.h>
 
+#include "AudioCommon/AudioCommon.h"
+#include "AudioCommon/SoundStream.h"
 #include "Common/ChunkFile.h"
 #include "Common/CommonPaths.h"
 #include "Common/FileUtil.h"
@@ -1036,9 +1038,12 @@ bool SyncTest::Restore(const Slot& s, const Command& command, u32 to)
     return false;
   }
 
-  const bool log_it = m_restore_logs < MAX_RESTORE_LOGS;
-  const bool log_short = !log_it && m_restore_logs < MAX_SHORT_RESTORE_LOGS;
-  if (log_it)
+  // Classic policy (SyncTest): the first 10 restores log a begin and a done line, up to 30 a short one. Netplay policy
+  // (options.restore_log_full): that many result lines, then one summary per window of frames.
+  const bool net_policy = m_options.restore_log_full != 0;
+  const bool log_it = m_restore_logs < (net_policy ? m_options.restore_log_full : MAX_RESTORE_LOGS);
+  const bool log_short = !net_policy && !log_it && m_restore_logs < MAX_SHORT_RESTORE_LOGS;
+  if (log_it && m_restore_logs < MAX_RESTORE_LOGS)
     m_sink.Line(Format("RESTORE %u -> %u begin", command.frame, to));
 
   const u64 t0 = m_micros();
@@ -1101,6 +1106,83 @@ bool SyncTest::Restore(const Slot& s, const Command& command, u32 to)
   {
     ++m_restore_logs;
     m_sink.Line(Format("RESTORE %u -> %u us=%llu%s", command.frame, to, static_cast<unsigned long long>(us), tb_text.c_str()));
+  }
+  else if (net_policy)
+  {
+    NoteRestoreWindow(command.frame, us, icache_us);
+  }
+  return true;
+}
+
+void SyncTest::NoteRestoreWindow(u32 frame, u64 us, u64 icache_us)
+{
+  const u32 window = static_cast<u32>(std::max<s32>(1, m_options.restore_log_window));
+  if (!m_rwin.begun)
+  {
+    m_rwin.begun = true;
+    m_rwin.start = frame;
+  }
+  else if (frame >= m_rwin.start + window)
+  {
+    FlushRestoreWindow();
+    m_rwin.begun = true;
+    m_rwin.start = frame;
+  }
+  m_rwin.last = frame;
+  ++m_rwin.n;
+  m_rwin.us_total += us;
+  m_rwin.us_max = std::max(m_rwin.us_max, us);
+  m_rwin.icache_max = std::max(m_rwin.icache_max, icache_us);
+}
+
+void SyncTest::FlushRestoreWindow()
+{
+  if (m_rwin.n != 0)
+  {
+    m_sink.Line(Format("RESTORE summary frames=%u-%u n=%u us_mean=%.1f us_max=%llu icache_us_max=%llu", m_rwin.start, m_rwin.last, m_rwin.n,
+                       static_cast<double>(m_rwin.us_total) / static_cast<double>(m_rwin.n), static_cast<unsigned long long>(m_rwin.us_max),
+                       static_cast<unsigned long long>(m_rwin.icache_max)));
+  }
+  m_rwin = RestoreWindow{};
+}
+
+void SyncTest::NetFlushLog()
+{
+  FlushRestoreWindow();
+}
+
+bool SyncTest::NetRangeCrcs(u32 frame, bool live, std::vector<RangeHash>* out) const
+{
+  if (m_ranges.empty())
+    return false;
+  out->clear();
+  if (NetHas(frame))
+  {
+    const Slot& slot = m_ring[frame % m_ring.size()];
+    size_t offset = 0;
+    for (const Range& r : m_ranges)
+    {
+      const size_t len = r.end - r.start;
+      if (offset + len > slot.data.size())
+        return false;
+      RangeHash e;
+      e.start = r.start;
+      e.end = r.end;
+      e.crc = Common::ComputeCRC32(slot.data.data() + offset, len);
+      out->push_back(e);
+      offset += len;
+    }
+    return true;
+  }
+  if (!live)
+    return false;
+  for (const Range& r : m_ranges)
+  {
+    RangeHash e;
+    e.start = r.start;
+    e.end = r.end;
+    e.crc = MemoryCrc(m_memory, {r});
+    out->push_back(e);
   }
   return true;
 }
@@ -2521,6 +2603,7 @@ struct Module
   std::unique_ptr<FileLineWriter> pad_record;
   std::unique_ptr<FileLineWriter> trace;
   std::unique_ptr<DeterminismKit> kit;  // null = none of REV3_PAD_RECORD / REV3_PAD_SCRIPT / REV3_TRACE is usable
+  std::unique_ptr<Net::ResimHider> hider;  // a DolphinResimHider (defined further down); netplay runs only; hiding off when it goes
   std::unique_ptr<FileSink> net_sink;    // the net log (REV3_NET_LOG), netplay runs only
   std::unique_ptr<Net::NetModule> net;   // null = not a netplay run (or netplay unusable: the game then runs offline)
 };
@@ -2722,6 +2805,13 @@ bool BuildSyncTest(Module& module, Core::System& system, long k, bool net)
 
   std::string log_path;
   EnsureSink(module, &log_path);
+  // A netplay run writes everything (NOTE lines, ERROR lines, RESTORE lines) to the net log, the one file tools/rollback/phase4.py reads.
+  Sink& sink = (net && module.net_sink != nullptr) ? static_cast<Sink&>(*module.net_sink) : static_cast<Sink&>(*module.sink);
+  if (net)
+  {
+    options.restore_log_full = Net::LOG_FULL_LINES;
+    options.restore_log_window = Net::LOG_WINDOW_FRAMES;
+  }
 
   const std::string whitelist_path = GetEnv("REV3_WHITELIST");
   options.whitelist_path = whitelist_path.empty() ? "(none)" : whitelist_path;
@@ -2747,14 +2837,14 @@ bool BuildSyncTest(Module& module, Core::System& system, long k, bool net)
   if (options.adaptive && seed_missing)
   {
     error.clear();
-    module.sink->Line("NOTE no REV3_WHITELIST: the snapshot set is learned in the match (adaptive)");
+    sink.Line("NOTE no REV3_WHITELIST: the snapshot set is learned in the match (adaptive)");
   }
   if (!error.empty())
   {
     const std::string message = "Rev3 SyncTest: whitelist unusable (" + error + "); SyncTest is off";
-    module.sink->Line("ERROR " + message);
+    sink.Line("ERROR " + message);
     ERROR_LOG_FMT(SLIPPI, "{}", message);
-    module.sink->Osd(message);
+    sink.Osd(message);
     return false;
   }
 
@@ -2767,36 +2857,36 @@ bool BuildSyncTest(Module& module, Core::System& system, long k, bool net)
     if (!ReadTextFile(exclude_path, &exclude_text))
       error = "cannot read REV3_SYNCTEST_EXCLUDE " + exclude_path;
     else
-      ApplyExclusions(exclude_text, &ranges, *module.sink, &error, &user_exclusions, !options.adaptive,
+      ApplyExclusions(exclude_text, &ranges, sink, &error, &user_exclusions, !options.adaptive,
                        &ptr_exclusions);
     if (!error.empty())
     {
       const std::string message = "Rev3 SyncTest: exclude file unusable (" + error + "); SyncTest is off";
-      module.sink->Line("ERROR " + message);
+      sink.Line("ERROR " + message);
       ERROR_LOG_FMT(SLIPPI, "{}", message);
-      module.sink->Osd(message);
+      sink.Osd(message);
       return false;
     }
   }
 
   if (hook_bytes != 0)
   {
-    module.sink->Line(Format("NOTE removed %llu bytes of the hook region 0x%08X-0x%08X from the whitelist",
+    sink.Line(Format("NOTE removed %llu bytes of the hook region 0x%08X-0x%08X from the whitelist",
                              static_cast<unsigned long long>(hook_bytes), HOOK_REGION_START, HOOK_REGION_END));
   }
   if (hardware_exclude)
-    module.hardware = std::make_unique<DolphinHardware>(system, *module.sink);
-  module.synctest = std::make_unique<SyncTest>(options, std::move(ranges), *module.memory, *module.sink, std::function<u64()>(),
+    module.hardware = std::make_unique<DolphinHardware>(system, sink);
+  module.synctest = std::make_unique<SyncTest>(options, std::move(ranges), *module.memory, sink, std::function<u64()>(),
                                                module.hardware.get());
   module.synctest->SetUserExclusions(std::move(user_exclusions), std::move(ptr_exclusions));
   if (options.restore_timebase)
   {
-    module.sink->Line("NOTE timebase accessor: read SystemTimers::GetFakeTimeBase(); write CoreTiming::SetFakeTBStartValue(start + (value - now)) "
+    sink.Line("NOTE timebase accessor: read SystemTimers::GetFakeTimeBase(); write CoreTiming::SetFakeTBStartValue(start + (value - now)) "
                       "and PowerPCManager::WriteFullTimeBaseValue(value); decrementer and CoreTiming events untouched");
   }
   if (GetEnv("REV3_SYNCTEST_AUDIO_HW") == "0")
   {
-    module.sink->Line("NOTE audio hw rewind off (REV3_SYNCTEST_AUDIO_HW=0): memory only");
+    sink.Line("NOTE audio hw rewind off (REV3_SYNCTEST_AUDIO_HW=0): memory only");
   }
   else
   {
@@ -2806,7 +2896,7 @@ bool BuildSyncTest(Module& module, Core::System& system, long k, bool net)
   Core::System* const sys = &system;
   module.synctest->SetDspState([sys]() { return DescribeDsp(*sys); });
   if (!net)
-    module.sink->Osd(Format("Rev3 SyncTest on: K=%d, every %d frame(s), log %s", options.k, options.every, log_path.c_str()));
+    sink.Osd(Format("Rev3 SyncTest on: K=%d, every %d frame(s), log %s", options.k, options.every, log_path.c_str()));
   return true;
 }
 
@@ -2853,6 +2943,35 @@ Net::HelloInputs CollectHelloInputs(u32 stable_crc)
   return in;
 }
 
+// Hiding of resimulated frames, v1 (REV3.md "Netplay (M4)"): throttle off + audio OUTPUT muted, both only while the session resimulates.
+//   throttle  Core::SetIsThrottlerResimDisabled: its own flag, because the hotkey scheduler rewrites the user's temp-disable flag every loop.
+//   mute      the sound stream's volume goes to 0 (SoundStream::SetVolume; backends without volume control ignore it) and back to the
+//             user's setting (AudioCommon::UpdateSoundStream: volume, or 0 when the user has muted). The DSP is never paused or touched,
+//             so the emulated audio hardware keeps its timing and the next real frame sounds right.
+class DolphinResimHider final : public Net::ResimHider
+{
+public:
+  explicit DolphinResimHider(Core::System& system) : m_system(system) {}
+  ~DolphinResimHider() override { SetHidden(false); }
+
+  void SetHidden(bool hidden) override
+  {
+    Core::SetIsThrottlerResimDisabled(hidden);
+    if (hidden)
+    {
+      if (SoundStream* stream = m_system.GetSoundStream(); stream != nullptr)
+        stream->SetVolume(0);
+    }
+    else
+    {
+      AudioCommon::UpdateSoundStream(m_system);
+    }
+  }
+
+private:
+  Core::System& m_system;
+};
+
 // REV3_NET_ROLE is set: a netplay run (REV3.md "Netplay (M3)"). SyncTest is off in this mode; the snapshot machinery (SyncTest's network
 // mode) is only built when REV3_NET_ROLLBACK=1. Everything that goes wrong is logged to the Rev3 log and the net log and the game then
 // runs offline (the reply echoes the pads).
@@ -2880,8 +2999,6 @@ void InitializeNet(Module& module, Core::System& system)
   }
   if (!GetEnv("REV3_SYNCTEST").empty() && GetEnv("REV3_SYNCTEST") != "0")
     log.Line("NOTE REV3_SYNCTEST is ignored in a netplay run (REV3_NET_ROLE is set)");
-  if (!options.netsim.empty())
-    log.Line("NOTE REV3_NETSIM=" + options.netsim + " is not implemented before M4; ignored");
 
   // The ranges START_CHECK compares (optional); their file's CRC goes into HELLO so both sides use the same file.
   std::vector<Range> stable_ranges;
@@ -2913,6 +3030,8 @@ void InitializeNet(Module& module, Core::System& system)
     return Core::GetState(*sys) == Core::State::Stopping || sys->GetCPU().GetState() == CPU::State::PowerDown;
   };
   env.hello = CollectHelloInputs(stable_crc);
+  module.hider = std::make_unique<DolphinResimHider>(system);
+  env.hider = module.hider.get();
   module.net = std::make_unique<Net::NetModule>(options, env, *module.memory, module.hardware.get(), module.synctest.get(),
                                                 std::move(stable_ranges), log);
 }
@@ -3013,17 +3132,19 @@ void Shutdown()
     module.net->Shutdown();  // BYE to the peer, SUMMARY, stats, network thread joined
     module.net.reset();
   }
-  module.net_sink.reset();
+  module.hider.reset();  // hiding off (a no-op when the session already restored it)
   if (module.kit != nullptr)
     module.kit->Finish();
   module.kit.reset();  // before the memory it reads
   module.pad_record.reset();
   module.trace.reset();
-  if (module.synctest != nullptr)
+  // A netplay run's SyncTest writes into the net log, whose SUMMARY is the session's: no Finish() there (it would write a second one).
+  if (module.synctest != nullptr && module.net_sink == nullptr)
     module.synctest->Finish();
   module.synctest.reset();
   module.audio.reset();
   module.hardware.reset();
+  module.net_sink.reset();  // after everything that logs into it
   module.memory.reset();
   module.sink.reset();
   module.initialized = false;  // the next command reads the environment again and appends to the log

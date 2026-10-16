@@ -209,7 +209,7 @@ std::vector<u8> EncodeReliable(MsgType type, u32 sequence, const std::vector<u8>
 
 bool DecodeReliable(const u8* data, size_t size, MsgType* type, u32* sequence, std::vector<u8>* payload)
 {
-  if (size < RELIABLE_HEADER_BYTES || data[0] < static_cast<u8>(MsgType::Hello) || data[0] > static_cast<u8>(MsgType::Bye))
+  if (size < RELIABLE_HEADER_BYTES || data[0] < static_cast<u8>(MsgType::Hello) || data[0] > static_cast<u8>(MsgType::RangeCrc))
     return false;
   *type = static_cast<MsgType>(data[0]);
   *sequence = GetU32(data + 1);
@@ -363,6 +363,14 @@ NetOptions ParseNetOptions(const GetEnvFn& get_env)
     o.rollback = true;
   else if (!rollback.empty() && rollback != "0")
     o.warnings.push_back("REV3_NET_ROLLBACK=" + rollback + " is neither 0 nor 1; using 0 (lockstep only)");
+  v = o.busy_calls;
+  ReadNumber(get_env, "REV3_NET_BUSY", 0, 1000, &v, &o.warnings);
+  o.busy_calls = static_cast<u32>(v);
+  const std::string range_crc = get_env("REV3_NET_RANGE_CRC");
+  if (range_crc == "1")
+    o.range_crc = true;
+  else if (!range_crc.empty() && range_crc != "0")
+    o.warnings.push_back("REV3_NET_RANGE_CRC=" + range_crc + " is neither 0 nor 1; using 0");
   o.log_path = get_env("REV3_NET_LOG");
   o.stable_path = get_env("REV3_NET_STABLE");
   o.netsim = get_env("REV3_NETSIM");
@@ -405,6 +413,41 @@ Hello BuildHello(const HelloInputs& in, Role role, int delay)
 
 // ---- the arm gate -------------------------------------------------------------------------------------------------------------
 
+void GateTracker::Close()
+{
+  m_open = false;
+  m_prepared = false;
+  m_quiet_streak = 0;  // the next opening needs a fresh quiet stretch
+  m_busy_streak = 0;
+  m_release_streak = 0;
+  m_holding = false;
+}
+
+GateDecision GateTracker::UpdateArmed(const GateInputs& in)
+{
+  GateDecision d;
+  d.open = true;
+  d.why = "armed";
+  d.hardware_quiet = !in.hardware_busy;
+  d.layout_pending = in.set_pending;
+  if (in.hardware_busy)
+  {
+    ++m_busy_streak;
+    m_release_streak = 0;
+  }
+  else
+  {
+    m_busy_streak = 0;
+    ++m_release_streak;
+  }
+  if (m_cfg.hold_calls != 0 && m_busy_streak >= m_cfg.hold_calls)
+    m_holding = true;
+  else if (m_holding && m_release_streak >= HOLD_RELEASE_CALLS)
+    m_holding = false;  // released only after a few quiet calls, so a flickering read does not toggle the hold every frame
+  d.hold = m_holding;
+  return d;
+}
+
 GateDecision GateTracker::Update(const GateInputs& in, const std::function<bool()>& prepare)
 {
   GateDecision d;
@@ -428,18 +471,8 @@ GateDecision GateTracker::Update(const GateInputs& in, const std::function<bool(
 
   if (m_open)
   {
-    // Once open the gate only closes for the reasons of the plan (fighters lost, a fighter at health 0) or because the snapshot set has to
-    // change; a disc read in flight only postpones rollbacks (hardware_quiet).
-    if (in.health_zero)
-      d.why = "health 0";
-    else if (in.set_pending)
-      d.why = "snapshot set changed";
-    if (d.why[0] != '\0')
-    {
-      m_open = false;
-      m_prepared = false;
-      return d;
-    }
+    // Only reached if the caller keeps feeding Update() after the gate opened: the session decides the close (final frames only, THE GATE
+    // RULE in Rev3Session.h) and the caller then calls Close(); UpdateArmed() carries the local conditions meanwhile.
     d.open = true;
     d.why = "open";
     return d;

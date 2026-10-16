@@ -14,8 +14,11 @@
 //                    adaptive set, hardware cuts, JIT invalidation and audio hardware rewind as the self test, plus a field trace of the last 64
 //                    frames for desync dumps. Without a SyncTest (lockstep only) it still answers the live checksums.
 //   NetModule        everything a netplay run needs per 0xA0 command: starts the transport and the RollbackSession at the first command (which
-//                    must be frame 0), evaluates the arm gate, blocks while the session waits (WaitFn: condition variable + stop check, so
-//                    closing the window never hangs), writes the net log.
+//                    must be frame 0), evaluates the arm gate and the per-call fighter flags, blocks while the session waits (WaitFn:
+//                    condition variable + stop check, so closing the window never hangs), hides resimulated frames (ResimHiding: throttle
+//                    off + mute, v1), writes the net log.
+//   REV3_NETSIM      (M4) EnetTransport holds every received message through a NetSim (Rev3NetSim.h) before it is processed: delay, jitter,
+//                    loss of PAD / ACK packets; the ENet connect handshake is not touched.
 //
 // HOW IT FITS IN
 //   Rev3Rollback.cpp (HandleCommand) creates a NetModule when REV3_NET_ROLE is set and hands it every command after the determinism kit has
@@ -41,6 +44,7 @@
 #include "Core/Slippi/Rev3Session.h"
 
 struct _ENetHost;
+struct _ENetPeer;
 
 namespace Rev3::Net
 {
@@ -55,6 +59,7 @@ public:
     std::string peer_host;
     u16 peer_port = 2627;
     u32 connect_timeout_ms = 120000;
+    NetSimConfig netsim;  // REV3_NETSIM; inactive = messages are processed as they arrive
   };
 
   // Starts connecting at once (the network thread runs from here on). `sink` is only used on the calling (CPU) thread: network events are
@@ -72,6 +77,7 @@ public:
   void WaitActivity(u32 ms);
   u64 RttUs() const;
   u32 BadPackets() const;
+  NetSimStats NetSimCounts() const override;
 
   // Transport
   void SendLocal(s32 frame, const Pad8& pad, s32 checksum_frame, u32 checksum) override;
@@ -92,6 +98,8 @@ private:
   };
 
   void ThreadMain();
+  // Processes one received datagram payload (PAD / ACK / reliable), from the network thread; `peer` is where an ACK goes back to.
+  void HandleReceived(_ENetPeer* peer, const u8* data, size_t size);
   void Wake();
   void PushEvent(const std::string& text);  // network thread or CPU thread; written to the sink by Pump()
   void FlushEvents();
@@ -112,6 +120,7 @@ private:
   u32 m_next_sequence = 0;
   std::vector<Outgoing> m_out;
   std::vector<std::string> m_events;
+  NetSimStats m_sim_stats;  // copy of the network thread's NetSim counters (under m_mutex)
   // The resolved peer address (ENet's, network byte order host); set before the thread starts.
   u32 m_peer_host_net = 0;
   u16 m_peer_port_net = 0;
@@ -133,6 +142,8 @@ public:
   u32 StableCrc() override;
   bool Fields(s32 frame, FieldSet* out) const override;
   void Clear() override;
+  bool Relayout() override;
+  bool RangeCrcs(s32 frame, bool live, std::vector<RangeCrc>* out) override;
 
   // Adds the live fighters' fields to the trace without a snapshot (lockstep calls: a desync dump then has every frame).
   void RecordLive(s32 frame);
@@ -158,6 +169,7 @@ struct NetEnvironment
 {
   std::function<bool()> stopping;  // true once the emulator is shutting down (a blocked wait must end)
   HelloInputs hello;               // everything the Dolphin side knows; the module adds the hook CRC at the first command
+  ResimHider* hider = nullptr;     // v1 hiding of resimulated frames (throttle off + mute); null = none. Not owned.
 };
 
 class NetModule
@@ -171,6 +183,7 @@ public:
 
   // True while the session is re-running frames after a RESTORED reply (the determinism kit neither records nor traces those calls).
   bool Resimulating() const;
+  bool ResimHidden() const { return m_hiding.hidden(); }
   // One 0xA0 command in (the pads already substituted by the kit), the reply out. Blocks while the session waits for the peer.
   Reply OnCommand(const Command& command);
   // Leaves the session (BYE to the peer), writes the final lines, stops the network thread. Idempotent.
@@ -178,7 +191,7 @@ public:
 
 private:
   void Start(const Command& command);
-  Gate EvaluateGate();
+  Gate EvaluateGate(Mode mode, bool resimulating);
   bool HealthZero() const;
   bool Wait(const std::function<bool()>& pred, u32 timeout_ms);
 
@@ -193,6 +206,7 @@ private:
   bool m_started = false;
   bool m_shut_down = false;
   GateTracker m_gate_tracker;
+  ResimHiding m_hiding;
   Gate m_last_gate;
   std::unique_ptr<EnetTransport> m_transport;
   std::unique_ptr<SyncTestStore> m_store;

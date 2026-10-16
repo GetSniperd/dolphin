@@ -93,6 +93,15 @@ public:
   void Line(const std::string& text) override { lines.push_back(text); }
   void Osd(const std::string& text) override { osd.push_back(text); }
 
+  size_t Count(const std::string& needle) const
+  {
+    size_t n = 0;
+    for (const std::string& l : lines)
+      if (l.find(needle) != std::string::npos)
+        ++n;
+    return n;
+  }
+
   bool Contains(const std::string& needle) const
   {
     for (const std::string& l : lines)
@@ -2908,6 +2917,106 @@ TEST(Rev3Rollback, NetModeStatsLineIsOneNoteLine)
   const std::string line = rig.test.NetStatsLine();
   EXPECT_EQ(line.rfind("NOTE snapshot stats restores=1 ", 0), 0u) << line;
   EXPECT_EQ(line.find('\n'), std::string::npos);
+}
+
+TEST(Rev3Rollback, NetModeRestoreLinesAreLimitedThenSummarisedPerWindow)
+{
+  SyncTestOptions options = Options(6);
+  options.restore_log_full = 3;    // netplay policy: 3 result lines in full ...
+  options.restore_log_window = 10; // ... then one `RESTORE summary` per 10 frames
+  NetRig rig(options, NetSeed());
+  for (u32 f = 1000; f < 1003; ++f)
+  {
+    rig.Observe(f);
+    rig.Advance(f);
+  }
+  ASSERT_TRUE(rig.test.NetPrepareArm());
+  for (u32 f = 1003; f < 1043; ++f)  // 40 restores, one per frame
+  {
+    rig.Observe(f);
+    ASSERT_TRUE(rig.Capture(f));
+    ASSERT_TRUE(rig.test.NetRestore(f));
+    rig.Advance(f);
+  }
+  EXPECT_EQ(rig.test.Stats().restores, 40u);
+  EXPECT_EQ(rig.sink.Count("RESTORE 10"), 6u);  // 3 x (begin + result line)
+  EXPECT_EQ(rig.sink.Count(" begin"), 3u);
+  EXPECT_GE(rig.sink.Count("RESTORE summary frames="), 3u);
+  rig.test.NetFlushLog();
+  // Every restore past the third is in exactly one summary.
+  u32 total = 0;
+  for (const std::string& line : rig.sink.lines)
+  {
+    const size_t at = line.find("RESTORE summary ");
+    if (at == std::string::npos)
+      continue;
+    unsigned n = 0;
+    ASSERT_EQ(sscanf(line.c_str() + line.find(" n="), " n=%u", &n), 1) << line;
+    EXPECT_LE(n, 10u) << line;
+    total += n;
+  }
+  EXPECT_EQ(total, 37u);
+  const size_t before = rig.sink.lines.size();
+  rig.test.NetFlushLog();  // nothing pending: no empty summary
+  EXPECT_EQ(rig.sink.lines.size(), before);
+}
+
+TEST(Rev3Rollback, TheClassicRestorePolicyIsUnchangedWithoutTheNetOption)
+{
+  NetRig rig(Options(6), NetSeed());
+  for (u32 f = 1000; f < 1003; ++f)
+  {
+    rig.Observe(f);
+    rig.Advance(f);
+  }
+  ASSERT_TRUE(rig.test.NetPrepareArm());
+  for (u32 f = 1003; f < 1053; ++f)
+  {
+    rig.Observe(f);
+    ASSERT_TRUE(rig.Capture(f));
+    ASSERT_TRUE(rig.test.NetRestore(f));
+    rig.Advance(f);
+  }
+  EXPECT_EQ(rig.sink.Count(" begin"), 10u);        // the first 10 in full
+  EXPECT_EQ(rig.sink.Count("RESTORE summary"), 0u);
+}
+
+TEST(Rev3Rollback, NetRangeCrcsReportEachRangeAsItWasAtTheCaptureOrAsItIsNow)
+{
+  NetRig rig(Options(6), NetSeed());
+  for (u32 f = 1000; f < 1003; ++f)
+  {
+    rig.Observe(f);
+    rig.Advance(f);
+  }
+  ASSERT_TRUE(rig.test.NetPrepareArm());
+  rig.Observe(1003);
+  ASSERT_TRUE(rig.Capture(1003));
+
+  std::vector<RangeHash> slot, live;
+  ASSERT_TRUE(rig.test.NetRangeCrcs(1003, false, &slot));
+  ASSERT_EQ(slot.size(), rig.test.Ranges().size());
+  for (size_t i = 0; i < slot.size(); ++i)
+  {
+    EXPECT_EQ(slot[i].start, rig.test.Ranges()[i].start);
+    EXPECT_EQ(slot[i].end, rig.test.Ranges()[i].end);
+  }
+  ASSERT_TRUE(rig.test.NetRangeCrcs(1999, true, &live));  // a frame without a slot: the live memory (nothing has changed since the capture)
+  EXPECT_EQ(live.size(), slot.size());
+  for (size_t i = 0; i < slot.size(); ++i)
+    EXPECT_EQ(live[i].crc, slot[i].crc) << i;
+  EXPECT_FALSE(rig.test.NetRangeCrcs(1999, false, &live));  // no slot and not asked for the live state
+
+  rig.Advance(1003);  // the game moves on: the slot keeps the old bytes, the live memory changed
+  std::vector<RangeHash> slot_after, live_after;
+  ASSERT_TRUE(rig.test.NetRangeCrcs(1003, false, &slot_after));
+  ASSERT_TRUE(rig.test.NetRangeCrcs(1999, true, &live_after));
+  for (size_t i = 0; i < slot.size(); ++i)
+    EXPECT_EQ(slot_after[i].crc, slot[i].crc) << i;
+  size_t changed = 0;
+  for (size_t i = 0; i < slot.size(); ++i)
+    changed += live_after[i].crc != slot[i].crc ? 1 : 0;
+  EXPECT_GT(changed, 0u);
 }
 
 TEST(Rev3Rollback, ReadFighterFieldsIsWhatTheChecksumIsMadeOf)

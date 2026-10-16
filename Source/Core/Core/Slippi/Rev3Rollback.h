@@ -179,6 +179,14 @@ bool ApplyExclusions(const std::string& json_text, std::vector<Range>* ranges, S
 // Sorts by start and merges overlapping or touching ranges.
 std::vector<Range> MergeRanges(std::vector<Range> ranges);
 
+// A range and the CRC-32 (zlib, init 0) of its bytes (REV3_NET_RANGE_CRC, SyncTest::NetRangeCrcs).
+struct RangeHash
+{
+  u32 start = 0;
+  u32 end = 0;  // exclusive
+  u32 crc = 0;
+};
+
 // ---- the fighter checksum fields (rev3-mod rbchecksum.py FIELDS, FIELDS_VERSION 1) ---------------------------------------------
 constexpr u32 TEAMS_ADDR = 0x8038FE50;     // four team pointers; team 0 -> player 1, team 1 -> player 2
 constexpr size_t FIELD_COUNT = 61;
@@ -282,6 +290,9 @@ struct SyncTestOptions
   std::string whitelist_path;     // only printed in the header line
   u32 arm_commands = 600;         // arm after this many consecutive hook calls with both fighters found (ignored with arm_by_pad)
   bool arm_by_pad = false;        // arm / disarm on P1's Z press (edge) while fighters are present
+  u32 restore_log_full = 0;       // 0: the classic RESTORE log policy (10 in full, up to 30 short lines). N > 0 (netplay): N restores log one
+                                  // result line each, then one `RESTORE summary` line per restore_log_window frames
+  s32 restore_log_window = 600;   // frames per RESTORE summary line (netplay policy)
   bool noop = false;              // capture then restore the same frame every frame; no comparisons
   bool invalidate_code = true;    // call GuestMemory::InvalidateCode for every restored range
   bool restore_timebase = false;  // REV3_SYNCTEST_TB=1: store the time base in each snapshot and set it back on restore
@@ -419,6 +430,11 @@ public:
   size_t NetSlotCount() const { return m_ring.size(); }
   // "NOTE snapshot stats ..." (restores, restore / icache / audio times, postponed reads); written at shutdown.
   std::string NetStatsLine() const;
+  // Writes the pending RESTORE summary window (options.restore_log_full policy); call before the final stats at shutdown.
+  void NetFlushLog();
+  // REV3_NET_RANGE_CRC: the CRC of each snapshot range (m_ranges) as it was at the start of `frame`: from the frame's slot, or from live
+  // memory when `live` (the caller is at that frame's own hook call). False: no slot and not live, or the set is empty.
+  bool NetRangeCrcs(u32 frame, bool live, std::vector<RangeHash>* out) const;
 
 private:
   struct Slot
@@ -522,6 +538,18 @@ private:
   bool m_prev_z = false;     // Z was down on the previous command
   bool m_z_pending = false;  // a Z press not yet acted on (acted on outside a resimulation)
   u32 m_restore_logs = 0;    // RESTORE lines written (the first 10 in full, restores 11..30 as one short line)
+  struct RestoreWindow       // the netplay policy: restores since the last RESTORE summary line
+  {
+    bool begun = false;
+    u32 start = 0;
+    u32 last = 0;
+    u32 n = 0;
+    u64 us_total = 0;
+    u64 us_max = 0;
+    u64 icache_max = 0;
+  } m_rwin;
+  void NoteRestoreWindow(u32 frame, u64 us, u64 icache_us);
+  void FlushRestoreWindow();
   std::function<std::string()> m_dsp_state;
   AudioHardware* m_audio = nullptr;  // null = memory only
   size_t m_audio_bytes = 0;          // size of the latest audio state (it varies a little: the HLE mail queue)

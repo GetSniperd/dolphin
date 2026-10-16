@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdarg>
+#include <cstdint>
 #include <cstdio>
 #include <utility>
 
@@ -18,6 +19,7 @@
 #include "Common/ENet.h"
 #include "Common/Hash.h"
 #include "Common/Timer.h"
+#include "Core/Slippi/Rev3NetSim.h"
 
 namespace Rev3::Net
 {
@@ -178,6 +180,42 @@ u64 EnetTransport::Now() const
   return Common::Timer::NowUs();
 }
 
+NetSimStats EnetTransport::NetSimCounts() const
+{
+  std::lock_guard<std::mutex> lock(m_mutex);
+  return m_sim_stats;
+}
+
+// One received datagram payload, on the network thread (with REV3_NETSIM: when the simulator releases it).
+void EnetTransport::HandleReceived(ENetPeer* peer, const u8* data, size_t size)
+{
+  if (size >= 1 && (data[0] == WIRE_PAD || data[0] == WIRE_PAD_ACK))
+  {
+    std::vector<u8> reply;
+    {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      m_link.OnPacket(data, size, Common::Timer::NowUs(), &reply);
+      m_activity = true;
+    }
+    m_cv.notify_all();
+    if (!reply.empty())
+      SendPacket(peer, CHANNEL_ACK, reply, ENET_PACKET_FLAG_UNSEQUENCED);
+    return;
+  }
+  MsgType type = MsgType::Bye;
+  u32 sequence = 0;
+  std::vector<u8> payload;
+  if (DecodeReliable(data, size, &type, &sequence, &payload))
+  {
+    {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      m_inbox.Add(type, sequence, std::move(payload));
+      m_activity = true;
+    }
+    m_cv.notify_all();
+  }
+}
+
 void EnetTransport::SendLocal(s32 frame, const Pad8& pad, s32 checksum_frame, u32 checksum)
 {
   {
@@ -258,6 +296,10 @@ void EnetTransport::ThreadMain()
   u32 attempts = 0;
   const u64 start_ms = Common::Timer::NowMs();
   u64 next_attempt_ms = start_ms;
+  // REV3_NETSIM: every received message waits here until its release time. The ENet connect handshake is below this layer.
+  std::unique_ptr<NetSim> sim;
+  if (m_cfg.netsim.Active())
+    sim = std::make_unique<NetSim>(m_cfg.netsim, m_cfg.role == Role::Host ? 0u : 1u);
 
   const auto notify = [this] {
     {
@@ -309,8 +351,16 @@ void EnetTransport::ThreadMain()
       }
     }
 
+    // With a simulation running the wait ends when the earliest held message is due.
+    u32 wait_ms = SERVICE_MS;
+    if (sim != nullptr && !sim->Empty())
+    {
+      const u64 now_us = Common::Timer::NowUs();
+      const u64 due_us = sim->NextDueUs();
+      wait_ms = due_us <= now_us ? 0 : static_cast<u32>(std::min<u64>(SERVICE_MS, (due_us - now_us + 999) / 1000));
+    }
     ENetEvent event;
-    int result = enet_host_service(m_host, &event, SERVICE_MS);
+    int result = enet_host_service(m_host, &event, wait_ms);
     while (result > 0)
     {
       switch (event.type)
@@ -344,33 +394,13 @@ void EnetTransport::ThreadMain()
       {
         const u8* data = event.packet->data;
         const size_t size = event.packet->dataLength;
-        if (size >= 1 && (data[0] == WIRE_PAD || data[0] == WIRE_PAD_ACK))
+        if (sim != nullptr)
         {
-          std::vector<u8> reply;
-          {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_link.OnPacket(data, size, Common::Timer::NowUs(), &reply);
-            m_activity = true;
-          }
-          m_cv.notify_all();
-          if (!reply.empty())
-            SendPacket(event.peer, CHANNEL_ACK, reply, ENET_PACKET_FLAG_UNSEQUENCED);
+          const bool droppable = size >= 1 && (data[0] == WIRE_PAD || data[0] == WIRE_PAD_ACK);
+          sim->Submit(Common::Timer::NowUs(), droppable, static_cast<u64>(reinterpret_cast<uintptr_t>(event.peer)), std::vector<u8>(data, data + size));
         }
         else
-        {
-          MsgType type = MsgType::Bye;
-          u32 sequence = 0;
-          std::vector<u8> payload;
-          if (DecodeReliable(data, size, &type, &sequence, &payload))
-          {
-            {
-              std::lock_guard<std::mutex> lock(m_mutex);
-              m_inbox.Add(type, sequence, std::move(payload));
-              m_activity = true;
-            }
-            m_cv.notify_all();
-          }
-        }
+          HandleReceived(event.peer, data, size);
         enet_packet_destroy(event.packet);
         break;
       }
@@ -398,6 +428,20 @@ void EnetTransport::ThreadMain()
       m_state.store(ConnState::Failed);
       notify();
       break;
+    }
+    if (sim != nullptr)
+    {
+      u64 tag = 0;
+      std::vector<u8> bytes;
+      const u64 now_us = Common::Timer::NowUs();
+      while (sim->PopDue(now_us, &tag, &bytes))
+      {
+        ENetPeer* const peer = reinterpret_cast<ENetPeer*>(static_cast<uintptr_t>(tag));
+        if (std::find(peers.begin(), peers.end(), peer) != peers.end())  // the connection it came over may be gone by now
+          HandleReceived(peer, bytes.data(), bytes.size());
+      }
+      std::lock_guard<std::mutex> lock(m_mutex);
+      m_sim_stats = sim->stats();
     }
   }
 
@@ -517,12 +561,40 @@ void SyncTestStore::Clear()
     m_sync->NetClear();
 }
 
+// The snapshot set changed on this machine only: install it exactly like an arm does (hardware cuts re-checked, all 61 fields of both
+// fighters verified to be inside it).
+bool SyncTestStore::Relayout()
+{
+  return m_sync != nullptr && m_sync->NetPrepareArm();
+}
+
+// REV3_NET_RANGE_CRC: the snapshot ranges (SyncTest's set); before the first arm, or in a lockstep-only run, the REV3_NET_STABLE ranges.
+bool SyncTestStore::RangeCrcs(s32 frame, bool live, std::vector<RangeCrc>* out)
+{
+  if (m_sync != nullptr && frame >= 0 && m_sync->NetRangeCrcs(static_cast<u32>(frame), live, out))
+    return true;
+  if (!live || m_stable.empty())
+    return false;
+  out->clear();
+  for (const Range& r : m_stable)
+  {
+    RangeCrc e;
+    e.start = r.start;
+    e.end = r.end;
+    e.crc = MemoryCrc(m_memory, {r});
+    out->push_back(e);
+  }
+  return true;
+}
+
 // ---- (3) NetModule -----------------------------------------------------------------------------------------------------------------
 
 NetModule::NetModule(const NetOptions& options, const NetEnvironment& env, GuestMemory& memory, HardwareView* hardware, SyncTest* synctest,
                      std::vector<Range> stable_ranges, Sink& net_log)
     : m_options(options), m_env(env), m_memory(memory), m_hardware(hardware), m_sync(synctest), m_stable(std::move(stable_ranges)),
-      m_log(net_log), m_gate_tracker(GateConfig{options.rollback && synctest != nullptr, options.arm_calls, options.quiet_calls})
+      m_log(net_log),
+      m_gate_tracker(GateConfig{options.rollback && synctest != nullptr, options.arm_calls, options.quiet_calls, options.busy_calls}),
+      m_hiding(env.hider, net_log)
 {
   if (m_sync == nullptr)
     m_options.rollback = false;
@@ -587,6 +659,23 @@ void NetModule::Start(const Command& command)
   net.peer_host = m_options.peer.host;
   net.peer_port = m_options.peer.port;
   net.connect_timeout_ms = m_options.connect_timeout_ms;
+  if (!m_options.netsim.empty())
+  {
+    std::string error;
+    if (!ParseNetSim(m_options.netsim, &net.netsim, &error))
+    {
+      m_log.Line("ERROR NET REV3_NETSIM=" + m_options.netsim + ": " + error + "; no simulation (the run is NOT the test that was asked for)");
+      net.netsim = NetSimConfig();
+    }
+    else if (net.netsim.Active())
+    {
+      m_log.Line("NET netsim " + NetSimText(net.netsim));
+    }
+    else
+    {
+      m_log.Line("NOTE REV3_NETSIM=" + m_options.netsim + " has no delay, jitter or loss: nothing is simulated");
+    }
+  }
   m_transport = std::make_unique<EnetTransport>(net, m_log);
   if (!m_transport->Usable())
   {
@@ -603,11 +692,14 @@ void NetModule::Start(const Command& command)
   config.max_rollback = m_options.max_rollback;
   config.barrier_timeout_ms = m_options.connect_timeout_ms;
   config.wait_timeout_ms = m_options.wait_timeout_ms;
+  config.range_crc = m_options.range_crc;
   config.hello = BuildHello(hello_inputs, m_options.role, m_options.delay);
   m_log.Line(Fmt("NET start role=%s listen=%u peer=%s delay=%d rollback=%d maxr=%d gate=arm:%u,quiet:%u game=%s build=%s",
                  RoleText(m_options.role), static_cast<unsigned>(m_options.listen_port), m_transport->PeerText().c_str(), m_options.delay,
                  m_options.rollback ? 1 : 0, m_options.max_rollback, m_options.arm_calls, m_options.quiet_calls,
                  hello_inputs.game_id.c_str(), hello_inputs.build.c_str()));
+  if (m_options.range_crc)
+    m_log.Line("NOTE REV3_NET_RANGE_CRC=1: the CRCs of the snapshot ranges are exchanged at every checksum frame (testing only; differences are logged, never a desync)");
   m_session = std::make_unique<RollbackSession>(
       config, *m_transport, *m_store, m_log, [this](const std::function<bool()>& pred, u32 timeout_ms) { return Wait(pred, timeout_ms); });
   m_log.Line("NET waiting for the peer: the game is held at frame 0 until both machines are connected and their HELLOs match");
@@ -628,22 +720,49 @@ bool NetModule::HealthZero() const
   return false;
 }
 
-Gate NetModule::EvaluateGate()
+// The gate of one hook call. Every call carries the live-state flags of the fighters (the session records them with the capture of the frame and
+// decides on final frames only, Rev3Session.h THE GATE RULE). The rest depends on the session's mode and, being derived from the live state or
+// from this machine's hardware, is read on normal calls only; a resimulated call reuses the last one.
+Gate NetModule::EvaluateGate(Mode mode, bool resimulating)
 {
-  Gate gate;
-  gate.why = "rollback off";
+  Gate gate = resimulating ? m_last_gate : Gate();
+  if (!resimulating)
+    gate.why = "rollback off";
   if (!m_options.rollback || m_sync == nullptr)
     return gate;
+
+  gate.fighters_found = m_sync->NetFightersFound();
+  gate.health_zero = HealthZero();
+  if (resimulating)
+    return gate;
+
   GateInputs in;
-  in.fighters_found = m_sync->NetFightersFound();
+  in.fighters_found = gate.fighters_found;
   in.hardware_busy = m_hardware != nullptr && m_hardware->DiscReadInFlight();
-  in.health_zero = HealthZero();
+  in.health_zero = gate.health_zero;
   in.learning_done = m_sync->LearningDone();
   in.set_pending = m_sync->NetLayoutPending();
-  in.may_prepare = m_session->mode() == Mode::LOCKSTEP;
-  const GateDecision decision = m_gate_tracker.Update(in, [this] { return m_sync->NetPrepareArm(); });
+  in.may_prepare = mode == Mode::LOCKSTEP;
+  GateDecision decision;
+  switch (mode)
+  {
+  case Mode::ARMED:
+    decision = m_gate_tracker.UpdateArmed(in);  // the close is the session's (final frames); only the local conditions come from here
+    break;
+  case Mode::DRAIN:
+    decision.hardware_quiet = !in.hardware_busy;
+    decision.why = "drain";
+    break;
+  case Mode::LOCKSTEP:
+  case Mode::CONNECTING:
+  case Mode::OFFLINE:
+    decision = m_gate_tracker.Update(in, [this] { return m_sync->NetPrepareArm(); });
+    break;
+  }
   gate.open = decision.open;
   gate.hardware_quiet = decision.hardware_quiet;
+  gate.hardware_hold = decision.hold;
+  gate.layout_pending = decision.layout_pending;
   gate.why = decision.why;
   return gate;
 }
@@ -664,16 +783,18 @@ Reply NetModule::OnCommand(const Command& command)
   const Mode before = m_session->mode();
   if (m_sync != nullptr)
     m_sync->NetObserve(command, resim);
-  Gate gate = m_last_gate;
-  if (!resim)
-  {
-    if (before == Mode::LOCKSTEP)
-      m_store->RecordLive(static_cast<s32>(command.frame));  // the start-of-frame fields, for a desync dump taken in lockstep
-    gate = EvaluateGate();
-    m_last_gate = gate;
-  }
+  if (!resim && before == Mode::LOCKSTEP && m_store != nullptr)
+    m_store->RecordLive(static_cast<s32>(command.frame));  // the start-of-frame fields, for a desync dump taken in lockstep
+  const Gate gate = EvaluateGate(before, resim);
+  m_last_gate = gate;
   const Reply reply = m_session->OnCommand(command, gate);
   const Mode after = m_session->mode();
+  // An armed stretch that ended (DRAIN done): the tracker must see the gate shut to open it again later.
+  if (after == Mode::LOCKSTEP && (before == Mode::ARMED || before == Mode::DRAIN))
+    m_gate_tracker.Close();
+  // v1 hiding: the reply of a rollback starts the resimulation (throttle off + mute); the reply of its last frame, or the session
+  // leaving, ends it.
+  m_hiding.Update(m_session->Resimulating());
   if (before == Mode::CONNECTING && after != Mode::CONNECTING && after != Mode::OFFLINE)
   {
     m_log.Line(Fmt("NET connected to %s: %s, input delay %d, %s", m_transport->PeerText().c_str(), RoleText(m_options.role), m_session->delay(),
@@ -689,6 +810,7 @@ void NetModule::Shutdown()
   if (m_shut_down)
     return;
   m_shut_down = true;
+  m_hiding.Update(false);  // never leave the throttle off or the sound muted behind
   if (m_session != nullptr)
   {
     if (m_session->mode() != Mode::OFFLINE)
@@ -696,7 +818,10 @@ void NetModule::Shutdown()
     m_session->Finish();
   }
   if (m_sync != nullptr && m_started && m_session != nullptr)
+  {
+    m_sync->NetFlushLog();
     m_log.Line(m_sync->NetStatsLine());
+  }
   if (m_transport != nullptr)
   {
     m_log.Line(Fmt("NET closing: rtt_us=%llu bad_packets=%u", static_cast<unsigned long long>(m_transport->RttUs()), m_transport->BadPackets()));
