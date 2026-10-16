@@ -592,7 +592,7 @@ TEST(Rev3NetLink, M4OptionsHaveDefaultsAndCanBeSet)
 {
   NetOptions o = ParseNetOptions(EnvOf({{"REV3_NET_ROLE", "host"}, {"REV3_NET_PEER", "1.2.3.4:5"}}));
   ASSERT_TRUE(o.ok);
-  EXPECT_EQ(o.busy_calls, 3u);
+  EXPECT_EQ(o.busy_calls, 1u);
   EXPECT_FALSE(o.range_crc);
   EXPECT_TRUE(o.netsim.empty());
   o = ParseNetOptions(EnvOf({{"REV3_NET_ROLE", "host"},
@@ -607,7 +607,7 @@ TEST(Rev3NetLink, M4OptionsHaveDefaultsAndCanBeSet)
   EXPECT_TRUE(o.warnings.empty());
   o = ParseNetOptions(EnvOf({{"REV3_NET_ROLE", "host"}, {"REV3_NET_PEER", "1.2.3.4:5"}, {"REV3_NET_BUSY", "5000"}, {"REV3_NET_RANGE_CRC", "maybe"}}));
   ASSERT_TRUE(o.ok);
-  EXPECT_EQ(o.busy_calls, 3u);
+  EXPECT_EQ(o.busy_calls, 1u);
   EXPECT_FALSE(o.range_crc);
   EXPECT_EQ(o.warnings.size(), 2u);
 }
@@ -943,6 +943,23 @@ TEST(Rev3NetLink, ADiscReadWhileArmedOnlyPostponesRollbacksUntilItIsSustained)
   EXPECT_FALSE(t.UpdateArmed(Good()).hold);
   // ... and it needs a sustained read again.
   EXPECT_FALSE(t.UpdateArmed(busy).hold);
+}
+
+TEST(Rev3NetLink, TheDefaultHoldStartsAtTheFirstBusyCallSoNoFrameIsPredictedWhileAReadIsInFlight)
+{
+  GateConfig cfg = Cfg(1, 0);  // hold_calls left at its default
+  EXPECT_EQ(cfg.hold_calls, 1u);
+  GateTracker t(cfg);
+  ASSERT_TRUE(t.Update(Good(), nullptr).open);
+  EXPECT_FALSE(t.UpdateArmed(Good()).hold);
+  GateInputs busy = Good();
+  busy.hardware_busy = true;
+  const GateDecision d = t.UpdateArmed(busy);  // the very first busy call
+  EXPECT_TRUE(d.hold);
+  EXPECT_FALSE(d.hardware_quiet);  // and a rollback due now still waits for the read to end
+  EXPECT_TRUE(d.open);
+  EXPECT_TRUE(t.UpdateArmed(Good()).hold);   // released only after HOLD_RELEASE_CALLS quiet calls
+  EXPECT_FALSE(t.UpdateArmed(Good()).hold);
 }
 
 TEST(Rev3NetLink, HoldCanBeSwitchedOff)

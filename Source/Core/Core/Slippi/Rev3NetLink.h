@@ -166,7 +166,8 @@ struct NetOptions
   std::string log_path;    // REV3_NET_LOG ("" = User\Logs\rev3_net_<role>.log)
   std::string stable_path; // REV3_NET_STABLE: {"ranges":[...]} whose CRC is compared at arm time (START_CHECK); "" = none
   std::string netsim;      // REV3_NETSIM (Rev3NetSim.h): delay_ms=..,jitter_ms=..,loss_pct=..,seed=.. ; "" = off
-  u32 busy_calls = 3;      // REV3_NET_BUSY: consecutive armed calls with a disc read in flight that start a HOLD (predict nothing); 0 = never
+  u32 busy_calls = 1;      // REV3_NET_BUSY: consecutive armed calls with a disc read in flight that start a HOLD (predict nothing); 0 = never. 1 = from the first busy call,
+                           // so that no frame is predicted while a read is in flight (a slot captured with a read in flight cannot be a rollback target)
   bool range_crc = false;  // REV3_NET_RANGE_CRC=1 (testing only): exchange the CRCs of the snapshot ranges at every checksum frame
   // M5 (REV3.md "Netplay (M5)"). Local to a machine (not part of HELLO) except the MAXR itself.
   PaceConfig pace;                 // REV3_NET_PACE=0|1 (default 1), REV3_NET_PACE_T1_US, REV3_NET_PACE_HARD_MAX_US, REV3_NET_PACE_SLICE_US, REV3_NET_PACE_GENTLE_PERMILLE
@@ -216,7 +217,7 @@ struct GateConfig
   bool rollback = false;  // false: the gate never opens
   u32 arm_calls = 600;
   u32 quiet_calls = 60;
-  u32 hold_calls = 3;     // armed calls in a row with the hardware busy before a HOLD starts (0 = never)
+  u32 hold_calls = 1;     // armed calls in a row with the hardware busy before a HOLD starts (0 = never); 1 = the first busy call: no frame is predicted while a read is in flight
 };
 
 struct GateInputs

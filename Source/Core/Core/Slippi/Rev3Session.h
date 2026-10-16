@@ -326,6 +326,9 @@ public:
   // M4, REV3_NET_RANGE_CRC=1 (testing only). CRC-32 of each snapshot range as it was at the start of `frame`: from the frame's slot, or, when
   // `live` (the caller is at that frame's own hook call), from live memory. False: not available.
   virtual bool RangeCrcs(s32 /*frame*/, bool /*live*/, std::vector<RangeCrc>* /*out*/) { return false; }
+  // False when the slot of `frame` was captured with a disc read in flight (hardware / IOS or the game's own DVD library): restoring it would leave
+  // the game waiting for a read that already finished, so the session never rolls back to such a slot while an earlier clean one exists.
+  virtual bool Clean(s32 /*frame*/) const { return true; }
   // Called before every SUMMARY line (also the final one): the store may write its own lines first (the `NOTE learned summary` line of the
   // snapshot machinery) and returns fields appended to the SUMMARY line (restore verify counters, resimulation hiding counters), with a
   // leading space, or "".
@@ -437,6 +440,9 @@ struct SessionStats
   u64 stall_us_max = 0;
   u32 postponed = 0;                  // rollbacks postponed because hardware was busy
   u32 forced_hw = 0;                  // rollbacks done while busy because postponing would have exceeded MAXR (or in DRAIN)
+  u32 io_dirty_targets = 0;           // rollbacks whose target slot had been captured with a disc read in flight
+  u32 io_redirected = 0;              // ... of which went to the newest earlier clean slot instead (more frames resimulated)
+  u32 io_no_clean_slot = 0;           // ... and of which found no clean slot in the ring: restored anyway (a desync risk, logged loudly)
   u32 hw_holds = 0;                   // times a sustained busy hardware made this side predict nothing (HOLD)
   u32 hold_calls = 0;                 // calls answered with the real remote pad because of a HOLD
   u32 relayouts = 0;                  // local drains that installed a changed snapshot set and carried on ARMED
@@ -604,6 +610,9 @@ private:
   bool StepDrain(const Command& command, const Gate& gate, Reply* reply);
   bool StepResim(const Command& command, const Gate& gate, Reply* reply);
   bool DoRollback(const Command& command, s32 target, bool forced, Reply* reply);
+  // The frame to restore for a misprediction at `g`: g itself, or the newest earlier frame whose slot was captured with no disc read in flight when
+  // g's own slot was not (SnapshotStore::Clean). Counts and logs both cases.
+  s32 ChooseCleanTarget(s32 g);
   bool FinishDrain(const Command& command, const Gate& gate, Reply* reply);
   bool FinishRelayout(const Command& command, const Gate& gate, Reply* reply);
   bool EndCall(s32 frame, const Reply& reply, Reply* out);

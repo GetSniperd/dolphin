@@ -171,6 +171,8 @@ the save, load and event re-scheduling every frame without any rollback.
 
 ### Disc read gate
 
+(Netplay: the same idea, extended, in "Busy hardware" under Netplay (M4): the game's DVD library view and slots captured during a read.)
+
 Rev3 streams BGM from disc during fights (nw4r StrmPlayer::LoadStreamData -> DVDReadPrio, synchronous, on a sound task thread, into
 the 16 KB buffer at 0x80404860). On a Wii that read goes through IOS `/dev/di`, whose destination the snapshot cannot cut out. So a
 rollback (and a noop restore) is postponed while a disc read is in flight: DI register TSTART set (0x0C00601C, and 0x0D00601C on a
@@ -596,7 +598,7 @@ long match, and a desync report that names the first wrong field. Files: `Slippi
 | variable | default | meaning |
 |---|---|---|
 | `REV3_NETSIM=delay_ms=80,jitter_ms=30,loss_pct=5,seed=1` | unset = off | the network simulator (below). Any subset of keys, any order; unset keys are 0, `seed` defaults to 1. A bad value is `ERROR NET REV3_NETSIM=...` in the net log and **no** simulation (the run is not the test that was asked for) |
-| `REV3_NET_BUSY=n` | 3 | consecutive armed calls with a disc read in flight before a HOLD starts (below); 0 = never hold. 0..1000. Local to a machine, not part of HELLO |
+| `REV3_NET_BUSY=n` | 1 | consecutive armed calls with a disc read in flight before a HOLD starts (below; 1 = from the first busy call, was 3 until the dirty-slot fix); 0 = never hold. 0..1000. Local to a machine, not part of HELLO |
 | `REV3_NET_RANGE_CRC=1` | 0 | testing only: both sides exchange the CRC of every snapshot range at each checksum frame (below). Both machines should set it; one side without it simply gets no comparison |
 
 ### REV3_NETSIM
@@ -661,13 +663,32 @@ that they happen; a mutation that follows the live state makes the tests fail.
 
 A rollback while a disc read is in flight can't rewind the read, so in M3 it was postponed until it would exceed MAXR and then **forced**
 (`forced=hardware_busy` on the ROLLBACK line). M4 stops that from happening in normal play without changing the shared mode: after
-`REV3_NET_BUSY` (3) armed calls in a row with a disc read in flight the machine starts a **HOLD**: it predicts nothing while the read lasts
+`REV3_NET_BUSY` (1, the first busy call) armed calls in a row with a disc read in flight the machine starts a **HOLD**: it predicts nothing while the read lasts
 (each call waits for the real remote pad of its own frame, `GATE hold frame=..`), so no rollback can become due while the hardware is busy. The
 HOLD ends after 2 calls without a read (`GATE hold end frame=.. held_calls=..`). A misprediction made before the hold is still postponed
 while the depth allows, as before. The gate itself stays open for the peer: a HOLD is invisible on the wire, it is only a machine that
 waits for pads more often. `SUMMARY` counts `hw_holds`, `hold_calls`, `postponed`, `forced_hw`; a `forced_hw` that is not 0 in normal play is a bug report. This
 is the one place where the brief's "close the gate on sustained busy hardware" is done as "hold" instead: a close must be the same on both
 machines, and the peer cannot see our disc.
+
+**Busy means two views (since the dirty-slot fix).** A disc read counts as in flight when the hardware / IOS says so (`HardwareView::DiscReadInFlight`: DI TSTART or
+the IOS /dev/di device busy) OR the game's own DVD library does: the u32 at `0x8049D870` (`executing`, decompiled dvd.c: `stateReady` 0x802D32D4 sets it to 0 when the
+queue is empty or to the popped command block, and to `0x80460520` (DummyCommandBlock) while a command's callback runs; `DVDReadAbsAsyncPrio` 0x802D458C starts
+`stateReady` only while it is 0) is a pointer other than 0 / the dummy block (`SyncTest::GameDvdBusy`). Both feed the gate (HOLD, quiet) and every capture.
+
+**Dirty slots.** D's freeze at the match end (net_d2_r5, bfb8716): CPU idle, the main thread in `DVDCancel` (stopping the BGM stream) waiting on the DVD thread queue, the stream
+loader in `DVDReadPrio`: the game's DVD library believed a read was executing that IOS no longer had. A rollback had restored a frame captured while a stream read was in flight
+(issued before the slot, completed before the restore), so its completion never came again and every later DVD command queued behind it. The restore-time check (`io_postponed`) cannot see
+that: the hardware is idle at restore time. So: (1) every capture records `io_dirty` (either view; `NOTE slot of frame f captured with a disc read in flight (hardware=.. game_dvd=..)`
+for the first 5); (2) a slot with `io_dirty` is never a rollback target while an earlier clean slot is in the ring: `RollbackSession::ChooseCleanTarget` takes the newest earlier clean
+slot (`ROLLBACK redirected frame=g -> f`; the frames in between are verified and are resimulated with the pads they were played with; the depth grows by the difference), and with no clean
+slot it restores the dirty one anyway and writes `WARNING ROLLBACK frame=g: its slot was captured with a disc read in flight and no earlier slot in the ring is clean` (a desync / freeze
+risk, counted); (3) the HOLD starts at the first busy call (`REV3_NET_BUSY=1`), so no frame is predicted while a read is in flight and a dirty slot is practically never a misprediction.
+SyncTest cannot redirect (its ring is K + 1 slots): a restore of a dirty slot is skipped (`io_dirty_skipped`). SUMMARY lines (net: the session's, then the store's note; SyncTest: its own) carry
+`io_redirected=.. io_no_clean_slot=..` (session) and ` io_dirty_slots=.. io_dirty_hw=.. io_dirty_game=.. io_dirty_skipped=..` (snapshot machinery; `io_dirty_game` counts captures where only
+the game view saw the read). Residual: a rollback that is FORCED while a read is in flight (depth reached MAXR) restores into a game whose library may already have moved on; `forced_hw` must stay 0.
+Tests: `Rev3Session.ARollbackWhoseSlotWasCaptured*`, `TheRedirectSkips*`, `WithNoCleanSlotInTheRing*`, `CleanSlotsRollBack*`; `Rev3Rollback.TheGamesDvdLibraryView*`, `NetModeRecordsWhetherADiscRead*`,
+`TheHardwareViewMarksSlotsDirtyToo`, `SyncTestDoesNotRestoreASlotCaptured*`, `TheGameViewPostpones*`; `Rev3NetLink.TheDefaultHoldStartsAtTheFirstBusyCall*`.
 
 ### Log volume
 

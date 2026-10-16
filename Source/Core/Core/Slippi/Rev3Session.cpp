@@ -1193,9 +1193,35 @@ s32 RollbackSession::FindMisprediction(s32 frame)
   return -1;
 }
 
+// A slot captured while a disc read was in flight describes a game that waits for a completion. Restored after that read has finished, the game would
+// wait forever (every later DVD command queues behind the read it believes is executing: D's freeze at the match end, DVDCancel on the BGM stream). So
+// the rollback goes back to the newest earlier slot that is clean and resimulates the frames in between with the pads they were played with (they are
+// verified: everything below the misprediction is confirmed and correct). With no clean slot in the ring there is no safe target: the rollback is
+// done anyway (the alternative is a desync), counted in io_no_clean_slot and logged as a WARNING.
+s32 RollbackSession::ChooseCleanTarget(s32 g)
+{
+  if (m_store.Clean(g))
+    return g;
+  ++m_stats.io_dirty_targets;
+  for (s32 f = g - 1; f >= 0 && m_store.Has(f); --f)
+  {
+    if (!m_store.Clean(f))
+      continue;
+    ++m_stats.io_redirected;
+    DetailLine(Detail::Rollback, Fmt("ROLLBACK redirected frame=%d -> %d: the slot of frame %d was captured with a disc read in flight", g, f, g));
+    return f;
+  }
+  ++m_stats.io_no_clean_slot;
+  Line(Fmt("WARNING ROLLBACK frame=%d: its slot was captured with a disc read in flight and no earlier slot in the ring is clean; restoring it anyway "
+           "(the game may wait for a read that already finished) io_no_clean_slot=%u",
+           g, m_stats.io_no_clean_slot));
+  return g;
+}
+
 bool RollbackSession::DoRollback(const Command& command, s32 target, bool forced, Reply* reply)
 {
   const s32 n = m_cur_frame;
+  target = ChooseCleanTarget(target);
   const s32 depth = n - target;
   m_resim_start_us = m_net.Now();  // the cost of a rollback = restore + K re-run frames, measured from here to the end of the resimulation
   m_resim_depth = depth;
@@ -1972,11 +1998,12 @@ void RollbackSession::SummaryLine(const char* tag)
   const std::string store_note = m_store.SummaryNote();  // may write the `NOTE learned summary` line, so before the SUMMARY line below
   Line(Fmt("%s mode=%s frame=%d calls=%u resim_calls=%u rollbacks=%u max_depth=%u depth_hist=[%s] predicted=%u stalls=%u stall_ms_max=%.1f "
            "postponed=%u forced_hw=%u hw_holds=%u hold_calls=%u relayouts=%u chk_ok=%u chk_bad=%u gate_opens=%u gate_closes=%u gate_late=%u "
-           "arm_refused=%u log_suppressed=%u%s%s%s",
+           "arm_refused=%u log_suppressed=%u io_redirected=%u io_no_clean_slot=%u%s%s%s",
            tag, ModeName(m_mode), m_expected_next, m_stats.calls, m_stats.resim_calls, m_stats.rollbacks, m_stats.max_depth, hist.c_str(),
            m_stats.predicted_frames, m_stats.stalls, static_cast<double>(m_stats.stall_us_max) / 1000.0, m_stats.postponed,
            m_stats.forced_hw, m_stats.hw_holds, m_stats.hold_calls, m_stats.relayouts, m_stats.checks_ok, m_stats.checks_bad,
-           m_stats.gate_opens, m_stats.gate_closes, m_stats.gate_late, m_stats.arm_refused, m_stats.log_suppressed, sim.c_str(),
+           m_stats.gate_opens, m_stats.gate_closes, m_stats.gate_late, m_stats.arm_refused, m_stats.log_suppressed, m_stats.io_redirected,
+           m_stats.io_no_clean_slot, sim.c_str(),
            ranges.c_str(), m5.c_str()) +
        store_note);
 }

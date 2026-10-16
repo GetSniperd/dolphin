@@ -5124,7 +5124,7 @@ TEST(Rev3Rollback, NetPrepareArmNamesPagesLearnedSinceTheLastArm)
   const size_t summaries = rig.sink.Count("NOTE learned summary");
   rig.test.NetSummaryNote();
   EXPECT_EQ(rig.sink.Count("NOTE learned summary"), summaries);
-  EXPECT_EQ(note, "");  // no verify, no hiding: nothing to append
+  EXPECT_EQ(note, " io_dirty_slots=0 io_dirty_hw=0 io_dirty_game=0 io_dirty_skipped=0");  // no verify, no hiding: only the disc read counters
 }
 
 TEST(Rev3Rollback, NetModeLearnedSummaryIsWrittenEvenWhenNothingWasLearned)
@@ -5438,4 +5438,128 @@ TEST(Rev3Rollback, TheHideCountersGoIntoTheNetSummaryNote)
   rig.game.Mem().SetU32(HIDE_ITERATIONS_ADDR, 42);
   const std::string note = rig.test.NetSummaryNote();
   EXPECT_NE(note.find(" hide_protocol=3 hide_flags=1 hide_writes=0 hidden_iterations=42 skipped_sounds=0"), std::string::npos) << note;
+}
+
+// ---- slots captured during a disc read are never rollback targets ----------------------------------------------------------------------
+
+namespace
+{
+constexpr u32 DVD_BLOCK = 0x80415640;  // some command block the game's DVD library is executing
+}
+
+TEST(Rev3Rollback, TheGamesDvdLibraryViewIsReadFromTheExecutingPointer)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTest test(Options(2), game.Ranges(), game.Mem(), sink, FakeClock());
+  EXPECT_FALSE(test.GameDvdBusy());                          // 0: idle
+  game.Mem().SetU32(DVD_EXECUTING_ADDR, DVD_DUMMY_BLOCK);
+  EXPECT_FALSE(test.GameDvdBusy());                          // the dummy block: between two commands
+  game.Mem().SetU32(DVD_EXECUTING_ADDR, 0x12345678);
+  EXPECT_FALSE(test.GameDvdBusy());                          // not a pointer into MEM1 / MEM2: not the DVD library's
+  game.Mem().SetU32(DVD_EXECUTING_ADDR, DVD_BLOCK);
+  EXPECT_TRUE(test.GameDvdBusy());
+  EXPECT_TRUE(test.DiscBusy());
+}
+
+TEST(Rev3Rollback, NetModeRecordsWhetherADiscReadWasInFlightAtEveryCapture)
+{
+  NetRig rig(Options(6), NetSeed());
+  u32 f = 1000;
+  for (; f < 1010; ++f)
+  {
+    rig.Observe(f);
+    rig.Advance(f);
+  }
+  rig.Observe(f);
+  ASSERT_TRUE(rig.test.NetPrepareArm());
+  for (; f < 1016; ++f)
+  {
+    if (f != 1010)
+      rig.Observe(f);
+    // frame 1012: the game's DVD library has a command executing; frame 1014: only the hardware view would say so (not wired here)
+    rig.game.Mem().SetU32(DVD_EXECUTING_ADDR, (f == 1012 || f == 1013) ? DVD_BLOCK : 0);
+    ASSERT_TRUE(rig.Capture(f));
+    rig.Advance(f);
+  }
+  for (u32 g = 1010; g < 1016; ++g)
+    EXPECT_EQ(rig.test.NetClean(g), !(g == 1012 || g == 1013)) << g;
+  EXPECT_TRUE(rig.test.NetClean(5)) << "no slot: nothing to call dirty";
+  EXPECT_EQ(rig.test.Stats().io_dirty_slots, 2u);
+  EXPECT_EQ(rig.test.Stats().io_dirty_game, 2u);
+  EXPECT_EQ(rig.test.Stats().io_dirty_hw, 0u);
+  EXPECT_TRUE(rig.sink.Contains("NOTE slot of frame 1012 captured with a disc read in flight (hardware=0 game_dvd=1)"));
+  const std::string note = rig.test.NetSummaryNote();
+  EXPECT_NE(note.find(" io_dirty_slots=2 io_dirty_hw=0 io_dirty_game=2 io_dirty_skipped=0"), std::string::npos) << note;
+  EXPECT_NE(rig.test.NetStatsLine().find(" io_dirty_slots=2 "), std::string::npos);
+  // A new capture of the same frame (a resimulation) replaces the record.
+  rig.game.Mem().SetU32(DVD_EXECUTING_ADDR, 0);
+  rig.Observe(1016);
+  ASSERT_TRUE(rig.Capture(1013));
+  EXPECT_TRUE(rig.test.NetClean(1013));
+  EXPECT_FALSE(rig.test.NetClean(1012));
+  // A slot that is overwritten or cleared is not dirty any more.
+  rig.test.NetClear();
+  EXPECT_TRUE(rig.test.NetClean(1012));
+}
+
+TEST(Rev3Rollback, TheHardwareViewMarksSlotsDirtyToo)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  FakeHardware hw;
+  SyncTest test(Options(2), game.Ranges(), game.Mem(), sink, FakeClock(), &hw);
+  for (int i = 0; i < 80; ++i)
+    game.Frame(test);
+  hw.disc_busy = true;
+  for (int i = 0; i < 4; ++i)
+    game.Frame(test);
+  EXPECT_EQ(test.Stats().io_dirty_slots, 4u);
+  EXPECT_EQ(test.Stats().io_dirty_hw, 4u);
+  EXPECT_EQ(test.Stats().io_dirty_game, 0u);
+}
+
+TEST(Rev3Rollback, SyncTestDoesNotRestoreASlotCapturedDuringADiscRead)
+{
+  // K = 2, every frame: with the disc busy for 3 frames the slots of those frames are dirty. Once idle again the rollbacks that would restore
+  // them are skipped (no earlier slot exists in SyncTest's ring), the others run, and nothing mismatches.
+  FakeGame game(false);
+  FakeSink sink;
+  FakeHardware hw;
+  SyncTest test(Options(2), game.Ranges(), game.Mem(), sink, FakeClock(), &hw);
+  for (int i = 0; i < 100; ++i)
+    game.Frame(test);
+  while (test.Resimulating())
+    game.Frame(test);
+  hw.disc_busy = true;
+  for (int i = 0; i < 3; ++i)
+    game.Frame(test);
+  hw.disc_busy = false;
+  const u32 rollbacks = test.Stats().rollbacks;
+  for (int i = 0; i < 40; ++i)
+    game.Frame(test);
+  EXPECT_GE(test.Stats().io_dirty_skipped, 1u);
+  EXPECT_LE(test.Stats().io_dirty_skipped, 3u);
+  EXPECT_GT(test.Stats().rollbacks, rollbacks + 5);
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u);
+  EXPECT_FALSE(sink.Contains("ERROR"));
+  test.Finish();
+  EXPECT_TRUE(LinesContain(sink, "SUMMARY final", " io_dirty_slots=3 io_dirty_hw=3 io_dirty_game=0 io_dirty_skipped="));
+}
+
+TEST(Rev3Rollback, TheGameViewPostponesSyncTestRollbacksLikeTheHardwareView)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTest test(Options(2), game.Ranges(), game.Mem(), sink, FakeClock());
+  for (int i = 0; i < 100; ++i)
+    game.Frame(test);
+  while (test.Resimulating())
+    game.Frame(test);
+  const u32 rollbacks = test.Stats().rollbacks;
+  game.Mem().SetU32(DVD_EXECUTING_ADDR, DVD_BLOCK);
+  for (int i = 0; i < 10; ++i)
+    game.Frame(test);
+  EXPECT_EQ(test.Stats().rollbacks, rollbacks);
+  EXPECT_EQ(test.Stats().io_postponed, 10u);
 }

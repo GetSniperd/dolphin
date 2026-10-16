@@ -230,6 +230,7 @@ public:
     ++relayouts;
     return relayout_ok;
   }
+  bool Clean(s32 frame) const override { return dirty.count(frame) == 0; }
 
   struct Slot
   {
@@ -240,6 +241,7 @@ public:
   size_t capacity;
   std::map<s32, Slot> slots;
   std::map<s32, FieldSet> trace;
+  std::set<s32> dirty;        // frames whose slot was "captured with a disc read in flight" (Clean() is false)
   std::vector<s32> restored;  // every Restore() in order
   u32 captures = 0;
   u32 clears = 0;
@@ -1680,6 +1682,91 @@ TEST(Rev3Session, ARollbackNeverRunsWhileTheHardwareIsHeldBusyUnlessItIsForced)
   ASSERT_TRUE(rig.TryFrame(LocalPad(13), Open(), &r));
   EXPECT_EQ(r.flags, REPLY_FLAG_RESTORED);
   EXPECT_EQ(r.frame, 10u);
+}
+
+TEST(Rev3Session, ARollbackWhoseSlotWasCapturedDuringADiscReadGoesToTheNewestEarlierCleanSlot)
+{
+  // D's freeze at the match end: a restore to a frame captured while a stream read was in flight leaves the game's DVD library waiting for a
+  // completion that already happened. The session restores the newest earlier clean slot instead and resimulates the frames in between.
+  Rig rig(Role::Host, 0, 5);
+  rig.ReadyToArm(10);
+  rig.Frame(LocalPad(10), Open());
+  rig.Frame(LocalPad(11), Open());
+  rig.Frame(LocalPad(12), Open());
+  rig.store.dirty = {11};
+  rig.net.Deliver(10, RemotePadScript(9));  // frame 10 was predicted right
+  rig.net.Deliver(11, P(0xA1));             // frame 11 was not
+  Reply r;
+  ASSERT_TRUE(rig.TryFrame(LocalPad(13), Open(), &r));
+  EXPECT_EQ(r.flags, REPLY_FLAG_RESTORED);
+  EXPECT_EQ(r.frame, 10u) << "frame 11's slot is dirty: back to frame 10";
+  ASSERT_EQ(rig.store.restored.size(), 1u);
+  EXPECT_EQ(rig.store.restored[0], 10);
+  EXPECT_EQ(rig.session->stats().io_dirty_targets, 1u);
+  EXPECT_EQ(rig.session->stats().io_redirected, 1u);
+  EXPECT_EQ(rig.session->stats().io_no_clean_slot, 0u);
+  EXPECT_EQ(rig.session->stats().max_depth, 3u) << "13 - 10: one frame more than the misprediction needed";
+  EXPECT_TRUE(rig.sink.Has("ROLLBACK redirected frame=11 -> 10"));
+  for (s32 f = 11; f <= 13; ++f)
+    rig.Frame(LocalPad(f), Open());
+  EXPECT_FALSE(rig.sink.Has("ERROR"));
+  EXPECT_TRUE(rig.session->mode() == Mode::ARMED);
+  EXPECT_FALSE(rig.session->Resimulating());
+}
+
+TEST(Rev3Session, TheRedirectSkipsEveryDirtySlotInARow)
+{
+  Rig rig(Role::Host, 0, 5);
+  rig.ReadyToArm(10);
+  for (s32 f = 10; f <= 13; ++f)
+    rig.Frame(LocalPad(f), Open());
+  rig.store.dirty = {11, 12};
+  rig.net.Deliver(10, RemotePadScript(9));
+  rig.net.Deliver(11, RemotePadScript(9));
+  rig.net.Deliver(12, P(0xA1));  // frame 12 mispredicted; its slot and frame 11's are dirty
+  Reply r;
+  ASSERT_TRUE(rig.TryFrame(LocalPad(14), Open(), &r));
+  EXPECT_EQ(r.flags, REPLY_FLAG_RESTORED);
+  EXPECT_EQ(r.frame, 10u);
+  EXPECT_EQ(rig.session->stats().io_redirected, 1u);
+  EXPECT_EQ(rig.session->stats().io_dirty_targets, 1u);
+}
+
+TEST(Rev3Session, WithNoCleanSlotInTheRingTheRollbackStillRunsAndIsCountedAndWarnedAbout)
+{
+  Rig rig(Role::Host, 0, 5);
+  rig.ReadyToArm(10);
+  rig.Frame(LocalPad(10), Open());
+  rig.Frame(LocalPad(11), Open());
+  rig.Frame(LocalPad(12), Open());
+  rig.store.dirty = {10, 11, 12};
+  rig.net.Deliver(10, RemotePadScript(9));
+  rig.net.Deliver(11, P(0xA1));
+  Reply r;
+  ASSERT_TRUE(rig.TryFrame(LocalPad(13), Open(), &r));
+  EXPECT_EQ(r.flags, REPLY_FLAG_RESTORED);
+  EXPECT_EQ(r.frame, 11u) << "nothing clean to go back to: the misprediction's own slot, as before";
+  EXPECT_EQ(rig.session->stats().io_dirty_targets, 1u);
+  EXPECT_EQ(rig.session->stats().io_redirected, 0u);
+  EXPECT_EQ(rig.session->stats().io_no_clean_slot, 1u);
+  EXPECT_TRUE(rig.sink.Has("WARNING ROLLBACK frame=11: its slot was captured with a disc read in flight and no earlier slot in the ring is clean"));
+  EXPECT_TRUE(rig.session->mode() == Mode::ARMED);
+}
+
+TEST(Rev3Session, CleanSlotsRollBackExactlyWhereTheyDidAndTheSummaryCarriesTheCounters)
+{
+  Rig rig(Role::Host, 0, 5);
+  rig.ReadyToArm(10);
+  rig.Frame(LocalPad(10), Open());
+  rig.Frame(LocalPad(11), Open());
+  rig.net.Deliver(10, P(0xA1));
+  Reply r;
+  ASSERT_TRUE(rig.TryFrame(LocalPad(12), Open(), &r));
+  EXPECT_EQ(r.frame, 10u);
+  EXPECT_EQ(rig.session->stats().io_dirty_targets, 0u);
+  EXPECT_FALSE(rig.sink.Has("redirected"));
+  rig.session->Finish();
+  EXPECT_TRUE(rig.sink.Has("io_redirected=0 io_no_clean_slot=0"));
 }
 
 TEST(Rev3Session, ALocalRelayoutDrainsRollsBackAndCarriesOnArmed)

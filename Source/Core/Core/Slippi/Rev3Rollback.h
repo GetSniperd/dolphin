@@ -177,6 +177,14 @@ bool ParseWhitelist(const std::string& json_text, std::vector<Range>* ranges, st
 constexpr u32 HOOK_REGION_START = 0x80002400;
 constexpr u32 HOOK_REGION_END = 0x80002A00;  // exclusive
 
+// The game's own view of a disc read: the DVD library (RVL SDK dvd.c, 0x802D32D4 stateReady / 0x802D458C DVDReadAbsAsyncPrio, decompiled US main.dol)
+// keeps the command it is executing in `executing` (DAT_8049D870): 0 when idle (DVDReadAbsAsyncPrio starts stateReady only when it is 0), a pointer to
+// the command block while a command executes, DVD_DUMMY_BLOCK for the moment between a command's end and the next stateReady (its callback runs then).
+// A restore to a state where this is a real block while the hardware / IOS no longer has that command leaves the library waiting for a completion
+// that never comes: every later DVD command queues behind it (a freeze at match end, D's net_d2_r5 run: DVDCancel on the BGM stream).
+constexpr u32 DVD_EXECUTING_ADDR = 0x8049D870;
+constexpr u32 DVD_DUMMY_BLOCK = 0x80460520;  // DAT_80460520: DummyCommandBlock, `executing` while no real command runs
+
 // Removes [lo, hi) from every range (a range around it is split in two, one inside it disappears). Returns the bytes removed.
 u64 SubtractRange(std::vector<Range>* ranges, u32 lo, u32 hi);
 
@@ -807,6 +815,10 @@ struct SyncTestStats
   u64 scans = 0;
   u32 pages_learned_armed = 0;    // pages added to the set while armed
   u32 io_postponed = 0;           // rollbacks postponed because a disc read was in flight
+  u32 io_dirty_slots = 0;         // captures made with a disc read in flight (the slot is never a rollback target) ...
+  u32 io_dirty_hw = 0;            // ... of which the hardware / IOS view saw the read
+  u32 io_dirty_game = 0;          // ... of which the game's DVD library has a command executing
+  u32 io_dirty_skipped = 0;       // SyncTest: rollbacks not made because the slot to restore was dirty (no earlier slot exists to take instead)
   u32 audio_restores = 0;         // restores that also put the audio hardware back
   u64 audio_us_total = 0;         // time of those audio restores (state load + event re-scheduling)
   u64 audio_us_max = 0;
@@ -883,6 +895,12 @@ public:
   bool AudioHardwareOn() const { return m_audio != nullptr; }
 
   const SyncTestStats& Stats() const { return m_stats; }
+  // True while the game's DVD library has a command executing (DVD_EXECUTING_ADDR, see there).
+  bool GameDvdBusy() const;
+  // A disc read is in flight now, as the hardware / IOS or the game's DVD library see it. Used by the netplay gate (HOLD, quiet) and the captures.
+  bool DiscBusy();
+  // Netplay: false when the slot of `frame` exists and was captured with a disc read in flight (it must not be a rollback target).
+  bool NetClean(u32 frame) const;
   bool Active() const { return m_armed; }  // armed (a fight, past the arm delay or toggled on by Z)
   const std::vector<Range>& Ranges() const { return m_ranges; }  // the current snapshot ranges (whitelist minus exclusions)
   bool Resimulating() const { return m_resim; }
@@ -928,6 +946,8 @@ public:
   // empty). Writes the `NOTE learned summary` line first when the learned pages changed since the last one, so every SUMMARY of a netplay
   // run is preceded by it. The session reaches this through SnapshotStore::SummaryNote.
   std::string NetSummaryNote();
+  // " io_dirty_slots=.. io_dirty_hw=.. io_dirty_game=.. io_dirty_skipped=.." (leading space): the disc read bookkeeping of the captures.
+  std::string IoStatsFields() const;
   // Sets the hiding flags object whose counters NetSummaryNote reports (netplay: the session's ResimHiding writes the flags itself). Not owned.
   void SetHideCounters(const ResimHideFlags* hide) { m_hide_counters = hide; }
   // Writes the pending RESTORE summary window (options.restore_log_full policy); call before the final stats at shutdown.
@@ -955,6 +975,8 @@ private:
     std::array<u32, 2> fighter_addr{};                      // player 1 / 2 fighter struct addresses
     std::array<std::array<u8, FIELD_BYTES>, 2> fields{};    // raw field bytes per player
     std::array<PadBytes, 2> inputs{};
+    bool io_dirty = false;                                  // a disc read was in flight when this slot was captured (hardware / IOS or the game's DVD library):
+                                                            // restoring it would leave the game waiting for a completion that has already happened
     bool timebase_valid = false;
     u64 timebase = 0;                                       // emulated time base at capture (only with restore_timebase)
     struct Audio

@@ -1577,6 +1577,21 @@ bool SyncTest::Capture(Slot& slot, const Command& command, const std::array<u32,
     Error(Format("frame %u: cannot read the stack window at 0x%08X", command.frame, command.sp));
     return false;
   }
+  // Was a disc read in flight at this moment? A slot captured with one is never a rollback target (see DVD_EXECUTING_ADDR).
+  {
+    const bool hw = m_hardware != nullptr && m_hardware->DiscReadInFlight();
+    const bool game = GameDvdBusy();
+    slot.io_dirty = hw || game;
+    if (slot.io_dirty)
+    {
+      ++m_stats.io_dirty_slots;
+      m_stats.io_dirty_hw += hw ? 1 : 0;
+      m_stats.io_dirty_game += game ? 1 : 0;
+      if (m_stats.io_dirty_slots <= MAX_IO_POSTPONE_LOGS)
+        m_sink.Line(Format("NOTE slot of frame %u captured with a disc read in flight (hardware=%d game_dvd=%d): not a rollback target", command.frame, hw ? 1 : 0,
+                           game ? 1 : 0));
+    }
+  }
   // Restore verify: a full copy of guest memory at this very moment, for the frames a restore may land on (a failed copy is logged by the
   // verifier and only means this frame is not verified).
   if (m_verify != nullptr && m_verify->WantsShadow(command.frame))
@@ -1933,9 +1948,35 @@ void SyncTest::EfCheck(const char* when, u32 from, u32 to)
 
 // A restore under a disc read in flight would rewind memory the read is about to fill (or has half filled) from inside IOS HLE,
 // where it cannot be cut out of the snapshot: the rollback waits until the DI is idle. Counted in SUMMARY io_postponed.
+bool SyncTest::GameDvdBusy() const
+{
+  u8 raw[4];
+  if (!m_memory.Read(DVD_EXECUTING_ADDR, raw, sizeof(raw)))
+    return false;
+  const u32 executing = ReadBE32(raw);
+  return executing != 0 && executing != DVD_DUMMY_BLOCK && PointerOk(executing);
+}
+
+bool SyncTest::DiscBusy()
+{
+  return (m_hardware != nullptr && m_hardware->DiscReadInFlight()) || GameDvdBusy();
+}
+
+bool SyncTest::NetClean(u32 frame) const
+{
+  const Slot& s = m_ring[frame % m_ring.size()];
+  return !(s.valid && s.frame == frame && s.io_dirty);
+}
+
+std::string SyncTest::IoStatsFields() const
+{
+  return Format(" io_dirty_slots=%u io_dirty_hw=%u io_dirty_game=%u io_dirty_skipped=%u", m_stats.io_dirty_slots, m_stats.io_dirty_hw, m_stats.io_dirty_game,
+                m_stats.io_dirty_skipped);
+}
+
 bool SyncTest::DiscReadPostpones(u32 frame)
 {
-  if (m_hardware == nullptr || !m_hardware->DiscReadInFlight())
+  if (!DiscBusy())
     return false;
   ++m_stats.io_postponed;
   if (m_stats.io_postponed <= MAX_IO_POSTPONE_LOGS)
@@ -1985,6 +2026,12 @@ Reply SyncTest::Normal(const Command& command, const std::array<u32, 2>& fighter
   const bool due = n >= m_first_n + k && n % static_cast<u32>(m_options.every) == 0;
   if (due && DiscReadPostpones(n))
     return Echo(command);  // the capture above stays valid as a later rollback target
+  if (due && SlotFor(n - k).io_dirty)
+  {
+    // The slot was captured with a disc read in flight: SyncTest restores exactly K frames back and has no earlier slot to take instead.
+    ++m_stats.io_dirty_skipped;
+    return Echo(command);
+  }
   if (due && Restore(SlotFor(n - k), command, n - k))
   {
     const u32 target = n - k;
@@ -2167,7 +2214,7 @@ void SyncTest::SummaryLine(const char* tag)
                      m_stats.audio_restores != 0 ? static_cast<double>(m_stats.audio_us_total) / m_stats.audio_restores : 0.0,
                      static_cast<unsigned long long>(m_stats.audio_us_max), m_stats.ef_checks, m_stats.ef_bad, m_stats.ef_bad_before,
                      m_stats.layout_refused, m_stats.late_learn_rollbacks) +
-              VerifyStatsFields() + (m_hide != nullptr ? m_hide->SummaryFields() : std::string()));
+              IoStatsFields() + VerifyStatsFields() + (m_hide != nullptr ? m_hide->SummaryFields() : std::string()));
 }
 
 // Pages that entered the set after the first arm: the part of `after` that `before` lacks goes to the all-time list (merged) and to the
@@ -2900,13 +2947,13 @@ std::string SyncTest::NetStatsLine() const
                 m_stats.sp_mismatches, static_cast<unsigned long long>(m_stats.scans), mean(m_stats.scan_us_total, m_stats.scans),
                 static_cast<unsigned long long>(m_stats.scan_us_max), m_stats.ef_checks, m_stats.ef_bad, m_stats.ef_bad_before,
                 m_stats.layout_refused, m_stats.late_learn_rollbacks) +
-         VerifyStatsFields();
+         IoStatsFields() + VerifyStatsFields();
 }
 
 std::string SyncTest::NetSummaryNote()
 {
   LearnedSummaryLine();  // only when the learned pages changed since the last such line
-  std::string text = VerifyStatsFields();
+  std::string text = IoStatsFields() + VerifyStatsFields();
   if (m_verify != nullptr)
     text += Format(" verify_pages_added=%u", m_stats.verify_pages_added);
   if (m_hide_counters != nullptr)

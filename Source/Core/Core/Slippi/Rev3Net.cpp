@@ -515,6 +515,12 @@ bool SyncTestStore::Capture(s32 frame, u32 sp, CaptureInfo* info)
   return true;
 }
 
+// False: the slot of `frame` was captured with a disc read in flight (hardware / IOS view or the game's DVD library), see SnapshotStore::Clean.
+bool SyncTestStore::Clean(s32 frame) const
+{
+  return m_sync == nullptr || frame < 0 || m_sync->NetClean(static_cast<u32>(frame));
+}
+
 bool SyncTestStore::Has(s32 frame) const
 {
   return m_sync != nullptr && frame >= 0 && m_sync->NetHas(static_cast<u32>(frame));
@@ -783,7 +789,9 @@ Gate NetModule::EvaluateGate(Mode mode, bool resimulating)
 
   GateInputs in;
   in.fighters_found = gate.fighters_found;
-  in.hardware_busy = m_hardware != nullptr && m_hardware->DiscReadInFlight();
+  // Busy = a disc read in flight as the hardware / IOS see it OR as the game's own DVD library does (a command executing): a frame played in
+  // either state could later be restored into a game that waits for a completion that has already happened.
+  in.hardware_busy = (m_hardware != nullptr && m_hardware->DiscReadInFlight()) || m_sync->GameDvdBusy();
   in.health_zero = gate.health_zero;
   in.learning_done = m_sync->LearningDone();
   in.set_pending = m_sync->NetLayoutPending();
