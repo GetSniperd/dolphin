@@ -663,6 +663,21 @@ TEST(Rev3NetLink, M5PacingOptionsHaveDefaultsAndCanBeSet)
   EXPECT_EQ(o.warnings.size(), 5u);
 }
 
+TEST(Rev3NetLink, PadMirrorIsOffUnlessRequested)
+{
+  NetOptions o = ParseNetOptions(EnvOf({{"REV3_NET_ROLE", "guest"}, {"REV3_NET_PEER", "1.2.3.4:5"}}));
+  ASSERT_TRUE(o.ok);
+  EXPECT_FALSE(o.pad_mirror);
+  o = ParseNetOptions(EnvOf({{"REV3_NET_ROLE", "guest"}, {"REV3_NET_PEER", "1.2.3.4:5"}, {"REV3_PAD_MIRROR", "1"}}));
+  ASSERT_TRUE(o.ok);
+  EXPECT_TRUE(o.pad_mirror);
+  EXPECT_TRUE(o.warnings.empty());
+  o = ParseNetOptions(EnvOf({{"REV3_NET_ROLE", "guest"}, {"REV3_NET_PEER", "1.2.3.4:5"}, {"REV3_PAD_MIRROR", "yes"}}));
+  ASSERT_TRUE(o.ok);
+  EXPECT_FALSE(o.pad_mirror);
+  EXPECT_EQ(o.warnings.size(), 1u);
+}
+
 TEST(Rev3NetLink, BadRoleOrPeerIsRefusedWithAReason)
 {
   NetOptions o = ParseNetOptions(EnvOf({{"REV3_NET_ROLE", "spectator"}, {"REV3_NET_PEER", "1.2.3.4:5"}}));

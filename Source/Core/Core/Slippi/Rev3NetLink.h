@@ -173,6 +173,7 @@ struct NetOptions
   PaceConfig pace;                 // REV3_NET_PACE=0|1 (default 1), REV3_NET_PACE_T1_US, REV3_NET_PACE_HARD_MAX_US, REV3_NET_PACE_SLICE_US, REV3_NET_PACE_GENTLE_PERMILLE
   bool maxr_adapt = false;         // REV3_NET_MAXR_ADAPT=1: the stall rule's limit follows the measured cost of resimulation (off by default)
   u32 maxr_budget_us = 14000;      // REV3_NET_MAXR_BUDGET_US: resimulation of K frames should cost less than this at its p95 (microseconds)
+  bool pad_mirror = false;         // REV3_PAD_MIRROR=1 (guest only; the session ignores it on the host): the local pad is the newest confirmed remote pad. Local to a machine
 };
 using GetEnvFn = std::function<std::string(const char*)>;  // "" for unset
 NetOptions ParseNetOptions(const GetEnvFn& get_env);

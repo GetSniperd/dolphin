@@ -745,6 +745,7 @@ void NetModule::Start(const Command& command)
   config.pace = m_options.pace;
   config.maxr_adapt = m_options.maxr_adapt;
   config.maxr_budget_us = m_options.maxr_budget_us;
+  config.pad_mirror = m_options.pad_mirror;  // the session ignores it on the host (and says so)
   config.hello = BuildHello(hello_inputs, m_options.role, m_options.delay);
   m_log.Line(Fmt("NET start role=%s listen=%u peer=%s delay=%d rollback=%d maxr=%d gate=arm:%u,quiet:%u game=%s build=%s",
                  RoleText(m_options.role), static_cast<unsigned>(m_options.listen_port), m_transport->PeerText().c_str(), m_options.delay,

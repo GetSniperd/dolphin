@@ -412,6 +412,10 @@ struct Config
   bool range_crc = false;             // REV3_NET_RANGE_CRC=1: exchange the CRCs of the snapshot ranges at every checksum frame (testing only)
   PaceConfig pace;                    // M5: pacing (REV3_NET_PACE and friends)
   bool maxr_adapt = false;            // M5, REV3_NET_MAXR_ADAPT=1: the stall rule uses MAXR_eff <= max_rollback, lowered when resimulation gets slow
+  bool pad_mirror = false;            // REV3_PAD_MIRROR=1, GUEST ONLY (ignored for the host, noted in the log): the guest's local pad is the newest
+                                      // confirmed remote (host) pad instead of its own controller, so one person driving the host window moves both
+                                      // players' cursors (soak.py record-menu). Local to a machine (not in HELLO): the pad is sent like any other, so the
+                                      // two sides still agree on what the game gets
   u32 maxr_budget_us = 14000;         // M5, adaptive MAXR: the resimulation of K frames should cost less than this at its p95 (microseconds; ~ one 60 Hz
                                       // frame of 16.7 ms minus the live frame's own work)
   Hello hello;                        // this side's HELLO (role and delay are filled in from this config when the session starts)
@@ -477,6 +481,10 @@ struct SessionStats
   int maxr_eff = 0;                   // the stall rule's current limit (= max_rollback unless adaptive)
   int maxr_eff_min = 0;
   u32 maxr_changes = 0;
+  // Local pad diagnostics (the guest-pad-neutral case of D's first record-menu, Oct 16): what this machine's own controller delivered
+  u32 local_active = 0;               // fresh calls whose stored local pad was not neutral (buttons, sticks or triggers); with a mirror: the mirrored pad
+  u32 local_mirrored = 0;             // fresh calls whose local pad was the mirrored remote pad (REV3_PAD_MIRROR)
+  std::array<u32, 5> local_err{};     // the raw local port's err byte (+10) per fresh call: [0] 0 (data), [1] -1 (no controller), [2] -2 (not ready), [3] -3 (transfer, reuse), [4] any other value
 };
 
 // ---- hiding the resimulated frames, v1 (M4) ---------------------------------------------------------------------------------
@@ -605,7 +613,7 @@ private:
   Pad8 RemoteAt(s32 frame) const;
   Pad8 Predict() const;
   Pad8 LocalAt(s32 frame) const;
-  void StoreLocal(const Command& command, s32 frame);
+  void StoreLocal(const Command& command, s32 frame, bool in_menu);
   Reply MakeReply(const Pad8& local, const Pad8& remote, u32 flags, s32 frame) const;
   Reply EchoReply(const Command& command) const;
   Used& UsedAt(s32 frame) { return m_used[static_cast<size_t>(frame) % RING]; }
@@ -683,6 +691,9 @@ private:
   s32 m_input_frame = -1;     // the frame whose local pad was already stored and sent
   Pad8 m_last_local{};
   std::array<PadSlot, RING> m_local{};
+  bool m_local_first_logged = false;  // the `LOCAL first input` line was written
+  bool m_local_hint_logged = false;   // the explanation on the first `NOTE local pad neutral` line was written
+  u64 m_local_ref_us = 0;             // Now() of the last non-neutral local pad, of the last neutral NOTE, or of the first call, whichever is newest (0 = not set yet)
 
   // hello
   bool m_hello_sent = false;

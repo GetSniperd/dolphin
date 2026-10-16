@@ -867,6 +867,136 @@ TEST(Rev3Session, PadErrTransferReusesAndNoControllerIsNeutral)
   EXPECT_TRUE(rig.net.sent.back().pad == Pad8{});  // neutral
 }
 
+// ---- local pad diagnostics and the guest's pad mirror (D's first record-menu, Oct 16: the guest's pad was neutral for 7972 frames) ----------
+
+TEST(Rev3Session, MirrorGuestPlaysTheNewestConfirmedHostPadAndSendsItToTheHost)
+{
+  Rig rig(Role::Guest, 2);
+  rig.cfg.pad_mirror = true;
+  rig.Rebuild();
+  EXPECT_TRUE(rig.sink.Has("NOTE pad mirror on"));
+  rig.Handshake();
+  // The host's pads for frames 0..4 (frames 0 and 1 are the neutral delay frames).
+  rig.net.Deliver(0, Pad8{});
+  rig.net.Deliver(1, Pad8{});
+  rig.net.Deliver(2, P(0x01, 0x11));
+  Reply r = rig.Frame(P(0x66, 0x77), Closed());  // call 0: the guest's own controller (0x66..) is NOT used
+  ASSERT_EQ(rig.net.sent.size(), 2u + 1u);       // the two neutral delay frames, then frame 2
+  EXPECT_EQ(rig.net.sent[2].frame, 2);
+  EXPECT_TRUE(rig.net.sent[2].pad == P(0x01, 0x11)) << "newest confirmed host pad (frame 2)";
+  EXPECT_TRUE(SanitizePad(r.pads[0]) == Pad8{});  // frame 0: host neutral, guest neutral (the delay)
+  rig.net.Deliver(3, P(0x02));
+  rig.net.Deliver(4, P(0x03, 0x33));
+  rig.Frame(P(0x66), Closed());  // call 1 sends frame 3 with the newest confirmed host pad = frame 4
+  EXPECT_EQ(rig.net.sent[3].frame, 3);
+  EXPECT_TRUE(rig.net.sent[3].pad == P(0x03, 0x33));
+  EXPECT_EQ(rig.session->stats().local_mirrored, 2u);
+  EXPECT_EQ(rig.session->stats().local_active, 2u);
+  // The reply of frame 2 carries the mirrored pad on game port 1 and the host's own pad on port 0.
+  const Reply r2 = rig.Frame(P(0x66), Closed());
+  EXPECT_TRUE(SanitizePad(r2.pads[0]) == P(0x01, 0x11));
+  EXPECT_TRUE(SanitizePad(r2.pads[1]) == P(0x01, 0x11));  // the same pad: both players' cursors move together
+  EXPECT_EQ(rig.sink.Count("LOCAL first input"), 1u);
+  EXPECT_TRUE(rig.sink.Has("LOCAL first input frame=0 pad=0111000000000000 err=0 (mirrored from the host)")) << rig.sink.Dump();
+}
+
+TEST(Rev3Session, MirrorBeforeAnyHostPadIsNeutralAndTheHostIgnoresTheMirror)
+{
+  Rig guest(Role::Guest, 2);
+  guest.cfg.pad_mirror = true;
+  guest.Rebuild();
+  guest.Handshake();
+  guest.net.Deliver(0, Pad8{});
+  guest.net.Deliver(1, Pad8{});
+  guest.Frame(P(0x66), Closed());
+  EXPECT_TRUE(guest.net.sent.back().pad == Pad8{});  // nothing from the host yet beyond the delay frames
+  EXPECT_EQ(guest.session->stats().local_active, 0u);
+  EXPECT_FALSE(guest.sink.Has("LOCAL first input"));
+
+  Rig host(Role::Host, 0);
+  host.cfg.pad_mirror = true;
+  host.Rebuild();
+  EXPECT_TRUE(host.sink.Has("ignored on the host"));
+  EXPECT_FALSE(host.sink.Has("NOTE pad mirror on"));
+  host.Handshake();
+  host.net.Deliver(0, P(0x55));
+  const Reply rh = host.Frame(P(0x66), Closed());
+  EXPECT_TRUE(SanitizePad(rh.pads[0]) == P(0x66));  // the host's pad is its own controller
+  EXPECT_EQ(host.session->stats().local_mirrored, 0u);
+}
+
+TEST(Rev3Session, LocalPadDiagnosticsCountActiveFramesAndTheErrBytes)
+{
+  Rig rig(Role::Guest, 0);
+  rig.Handshake();
+  const auto call = [&rig](s32 f, const Pad8& pad, u8 err) {
+    rig.net.Deliver(f, Pad8{});
+    Command c = rig.Cmd(f, pad);
+    c.pads[0][10] = err;
+    Reply r;
+    ASSERT_TRUE(rig.session->Step(c, Closed(), &r));
+  };
+  call(0, Pad8{}, 0x00);       // connected, nothing pressed
+  call(1, Pad8{}, 0x00);
+  call(2, P(0x01), 0x00);      // first input
+  call(3, P(0x01), 0xFF);      // no controller: neutral whatever the block holds
+  call(4, P(0x02), 0xFE);      // not ready: neutral
+  call(5, P(0x09), 0xFD);      // transfer error: the previous local pad (neutral, from frame 4)
+  call(6, P(0x04), 0x05);      // any other value: the pad as it is
+  const SessionStats& st = rig.session->stats();
+  EXPECT_EQ(st.local_err[0], 3u);
+  EXPECT_EQ(st.local_err[1], 1u);
+  EXPECT_EQ(st.local_err[2], 1u);
+  EXPECT_EQ(st.local_err[3], 1u);
+  EXPECT_EQ(st.local_err[4], 1u);
+  EXPECT_EQ(st.local_active, 2u);  // frames 2 and 6
+  EXPECT_EQ(st.local_mirrored, 0u);
+  EXPECT_EQ(rig.sink.Count("LOCAL first input"), 1u);
+  EXPECT_TRUE(rig.sink.Has("LOCAL first input frame=2 pad=0100000000000000 err=0")) << rig.sink.Dump();
+  rig.session->Finish();
+  EXPECT_TRUE(rig.sink.Has("local_active=2 local_mirrored=0 err_hist=[3,1,1,1,1]")) << rig.sink.Dump();
+}
+
+TEST(Rev3Session, ANeutralLocalPadInTheMenusIsNotedOnceEveryTenSeconds)
+{
+  Rig rig(Role::Guest, 0);
+  rig.Handshake();
+  Gate menu = Closed();
+  menu.fighters_found = false;
+  const auto call = [&](s32 f, const Pad8& pad, const Gate& gate) {
+    rig.net.Deliver(f, Pad8{});
+    Reply r;
+    ASSERT_TRUE(rig.session->Step(rig.Cmd(f, pad), gate, &r));
+  };
+  rig.net.now_us = 1000000;
+  call(0, Pad8{}, menu);
+  rig.net.now_us = 10900000;  // 9.9 s after the first call
+  call(1, Pad8{}, menu);
+  EXPECT_EQ(rig.sink.Count("NOTE local pad neutral for 10 s"), 0u);
+  rig.net.now_us = 11000000;
+  call(2, Pad8{}, menu);
+  EXPECT_EQ(rig.sink.Count("NOTE local pad neutral for 10 s"), 1u);
+  EXPECT_TRUE(rig.sink.Has("(err=0; err_hist=[3,0,0,0,0]")) << rig.sink.Dump();
+  EXPECT_TRUE(rig.sink.Has("keyboard focus"));  // the explanation is on the first note
+  rig.net.now_us = 15000000;
+  call(3, Pad8{}, menu);
+  EXPECT_EQ(rig.sink.Count("NOTE local pad neutral for 10 s"), 1u);  // once per 10 s
+  rig.net.now_us = 21000000;
+  call(4, Pad8{}, menu);
+  EXPECT_EQ(rig.sink.Count("NOTE local pad neutral for 10 s"), 2u);
+  EXPECT_EQ(rig.sink.Count("keyboard focus"), 1u);
+  // Input resets the timer; a neutral pad in a fight (fighters found) is not noted.
+  call(5, P(0x01), menu);
+  rig.net.now_us = 30900000;
+  call(6, Pad8{}, menu);
+  EXPECT_EQ(rig.sink.Count("NOTE local pad neutral for 10 s"), 2u);
+  rig.net.now_us = 60000000;
+  call(7, Pad8{}, Closed());
+  rig.net.now_us = 71000000;
+  call(8, Pad8{}, Closed());
+  EXPECT_EQ(rig.sink.Count("NOTE local pad neutral for 10 s"), 2u);
+}
+
 TEST(Rev3Session, LockstepWaitsForTheRemotePadOfEveryFrame)
 {
   Rig rig(Role::Host, 0);

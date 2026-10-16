@@ -44,6 +44,8 @@ std::string Fmt(const char* format, ...)
   return std::string(buf, std::min<size_t>(static_cast<size_t>(n), sizeof(buf) - 1));
 }
 
+constexpr u64 LOCAL_NEUTRAL_NOTE_US = 10000000;  // a neutral local pad in the menus is noted every this long (microseconds, 10 s)
+
 // What the live state of a call says about the fight: 0 nothing, 1 a fighter at health 0, 2 no fighters (nothing to snapshot).
 u8 LostKind(const Gate& gate)
 {
@@ -624,12 +626,19 @@ RollbackSession::RollbackSession(const Config& config, Transport& transport, Sna
   m_cfg.delay = std::max(0, std::min(m_cfg.delay, MAX_DELAY));
   m_delay = m_cfg.delay;
   m_cfg.hello.role = m_cfg.role;
+  if (m_cfg.pad_mirror && m_cfg.role != Role::Guest)
+  {
+    m_cfg.pad_mirror = false;
+    m_sink.Line("NOTE REV3_PAD_MIRROR is for the guest only: ignored on the host");
+  }
   m_cfg.hello.delay = static_cast<u32>(m_delay);
   m_maxr_eff = m_cfg.max_rollback;
   m_stats.maxr_eff = m_maxr_eff;
   m_stats.maxr_eff_min = m_maxr_eff;
   Line(Fmt("SESSION start role=%s delay=%d maxr=%d pace=%s maxr_adapt=%s", RoleName(m_cfg.role), m_delay, m_cfg.max_rollback,
            m_cfg.pace.enabled ? "on" : "off", m_cfg.maxr_adapt ? "on" : "off"));
+  if (m_cfg.pad_mirror)
+    Line("NOTE pad mirror on (REV3_PAD_MIRROR=1): this side's local pad is the newest confirmed host pad, its own controller is not read");
 }
 
 void RollbackSession::Line(const std::string& text)
@@ -667,7 +676,7 @@ Pad8 RollbackSession::LocalAt(s32 frame) const
   return slot.frame == frame ? slot.pad : NEUTRAL_PAD;
 }
 
-void RollbackSession::StoreLocal(const Command& command, s32 frame)
+void RollbackSession::StoreLocal(const Command& command, s32 frame, bool in_menu)
 {
   // PADRead's return value is a bit mask of the ports with data (Rev3 normally returns 0x80000000 = port 0; D's pad record, Oct 16),
   // not an error code, so it cannot tell a failed read. The port's PADStatus err byte (+10) does: PAD_ERR_TRANSFER (-3) means the block
@@ -675,8 +684,16 @@ void RollbackSession::StoreLocal(const Command& command, s32 frame)
   // PAD_ERR_NOT_READY (-2) mean no input (neutral). (Until Oct 16 any non-zero return was taken as a failure, so every local pad was
   // neutral and neither loopback window reacted to the controller.)
   const int err = static_cast<std::int8_t>(command.pads[0][10]);
+  ++m_stats.local_err[err == 0 ? 0 : (err == -1 ? 1 : (err == -2 ? 2 : (err == -3 ? 3 : 4)))];
   Pad8 pad;
-  if (err == -3 || command.pad_return == -3)
+  if (m_cfg.pad_mirror)
+  {
+    // REV3_PAD_MIRROR (guest only): the newest remote pad that is known for sure (neutral until the host's first pads arrive). The pad goes out
+    // like any other local pad, so the host receives exactly what the guest's game plays; replays of the reply record stay exact.
+    pad = Predict();
+    ++m_stats.local_mirrored;
+  }
+  else if (err == -3 || command.pad_return == -3)
     pad = m_last_local;
   else if (err == -1 || err == -2)
     pad = NEUTRAL_PAD;
@@ -689,6 +706,41 @@ void RollbackSession::StoreLocal(const Command& command, s32 frame)
   slot.pad = pad;
   m_input_frame = frame;
   m_net.SendLocal(target, pad, m_send_chk_frame, m_send_chk_value);
+
+  // Diagnostics: is this machine's pad doing anything? (D, Oct 16: the guest's pad was neutral for 7972 frames and nothing in the logs said why.)
+  const u64 now = m_net.Now();
+  if (m_local_ref_us == 0)
+    m_local_ref_us = now == 0 ? 1 : now;
+  if (pad != NEUTRAL_PAD)
+  {
+    ++m_stats.local_active;
+    m_local_ref_us = now == 0 ? 1 : now;
+    if (!m_local_first_logged)
+    {
+      m_local_first_logged = true;
+      std::string hex;
+      for (u8 b : pad)
+        hex += Fmt("%02x", static_cast<unsigned>(b));
+      Line(Fmt("LOCAL first input frame=%d pad=%s err=%d%s", frame, hex.c_str(), err, m_cfg.pad_mirror ? " (mirrored from the host)" : ""));
+    }
+  }
+  else if (!in_menu)
+  {
+    m_local_ref_us = now == 0 ? 1 : now;  // a fight with no input is not what this note is for
+  }
+  else if (now - m_local_ref_us >= LOCAL_NEUTRAL_NOTE_US)
+  {
+    m_local_ref_us = now;
+    Line(Fmt("NOTE local pad neutral for %llu s (err=%d; err_hist=[%u,%u,%u,%u,%u] = err 0,-1,-2,-3,other; local_active=%u)%s",
+             static_cast<unsigned long long>(LOCAL_NEUTRAL_NOTE_US / 1000000), err, m_stats.local_err[0], m_stats.local_err[1],
+             m_stats.local_err[2], m_stats.local_err[3], m_stats.local_err[4], m_stats.local_active,
+             m_local_hint_logged ? ""
+                                 : (m_cfg.pad_mirror
+                                        ? " - mirror on: the host's pad is neutral too, click the HOST window and press keys"
+                                        : " - err 0 = the controller is connected but nothing is pressed (the render window has no keyboard focus, or the "
+                                          "pad is not mapped); err -1 = no controller on SI port 0 (SIDevice0 is not a standard controller)")));
+    m_local_hint_logged = true;
+  }
 }
 
 Reply RollbackSession::MakeReply(const Pad8& local, const Pad8& remote, u32 flags, s32 frame) const
@@ -930,7 +982,7 @@ bool RollbackSession::StepInner(const Command& command, const Gate& gate, Reply*
     return StepResim(command, gate, reply);
 
   if (m_input_frame != n)
-    StoreLocal(command, n);
+    StoreLocal(command, n, !gate.fighters_found);
 
   switch (m_mode)
   {
@@ -2001,12 +2053,13 @@ void RollbackSession::SummaryLine(const char* tag)
   const std::string store_note = m_store.SummaryNote();  // may write the `NOTE learned summary` line, so before the SUMMARY line below
   Line(Fmt("%s mode=%s frame=%d calls=%u resim_calls=%u rollbacks=%u max_depth=%u depth_hist=[%s] predicted=%u stalls=%u stall_ms_max=%.1f "
            "postponed=%u forced_hw=%u hw_holds=%u hold_calls=%u relayouts=%u chk_ok=%u chk_bad=%u gate_opens=%u gate_closes=%u gate_late=%u "
-           "arm_refused=%u log_suppressed=%u io_redirected=%u io_no_clean_slot=%u%s%s%s",
+           "arm_refused=%u log_suppressed=%u io_redirected=%u io_no_clean_slot=%u local_active=%u local_mirrored=%u err_hist=[%u,%u,%u,%u,%u]%s%s%s",
            tag, ModeName(m_mode), m_expected_next, m_stats.calls, m_stats.resim_calls, m_stats.rollbacks, m_stats.max_depth, hist.c_str(),
            m_stats.predicted_frames, m_stats.stalls, static_cast<double>(m_stats.stall_us_max) / 1000.0, m_stats.postponed,
            m_stats.forced_hw, m_stats.hw_holds, m_stats.hold_calls, m_stats.relayouts, m_stats.checks_ok, m_stats.checks_bad,
            m_stats.gate_opens, m_stats.gate_closes, m_stats.gate_late, m_stats.arm_refused, m_stats.log_suppressed, m_stats.io_redirected,
-           m_stats.io_no_clean_slot, sim.c_str(),
+           m_stats.io_no_clean_slot, m_stats.local_active, m_stats.local_mirrored, m_stats.local_err[0], m_stats.local_err[1],
+           m_stats.local_err[2], m_stats.local_err[3], m_stats.local_err[4], sim.c_str(),
            ranges.c_str(), m5.c_str()) +
        store_note);
   const std::string after = m_store.AfterSummaryLine();
