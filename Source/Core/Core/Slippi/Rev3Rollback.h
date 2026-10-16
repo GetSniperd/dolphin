@@ -40,6 +40,9 @@
 //   REV3_SYNCTEST_ADAPTIVE=0 do not learn the snapshot set in the running match (default 1: adaptive, see below)
 //   REV3_SYNCTEST_SCAN_SLICES=N  adaptive: every hook call hashes 1/N of all 4 KB pages of MEM1 + MEM2 (default 16)
 //   REV3_SYNCTEST_LEARN=N    adaptive: scan cycles that must complete with fighters present before SyncTest may arm (default 20)
+//   REV3_EF_POOL=0           do not force the nw4r::ef (effect / particle) pool into the snapshot at arm (default 1, see "THE EFFECT POOL")
+//   REV3_SNAPSHOT_INCLUDE=path   JSON, same entries as REV3_SYNCTEST_EXCLUDE ({"start","end"} or {"ptr","size"}): always in the snapshot
+//   REV3_EFCHECK=N|all|0     list consistency check of the effect system after the first N restores (default 200; all = every restore)
 //   SyncTest only runs once armed (both fighters found through the TEAMS pointers); menus and loading screens are never
 //   rolled back. See REV3.md for what a clean run looks like.
 //
@@ -64,6 +67,14 @@
 //   SyncTest arms only after LEARN full scan cycles; a page outside the set that changes later on a non-resimulated frame is
 //   added (layout rebuilt, history cleared). Resimulated frames are never scanned and a restore resets the baseline of the pages
 //   it rewrote, so rolling back cannot teach it anything.
+//
+// THE EFFECT POOL (REV3_EF_POOL, default on; REV3.md "Effect pool")
+//   Rev3's nw4r::ef effect system (hit sparks, dust, particles) keeps every Effect / Emitter / ParticleManager / Particle in object
+//   pools carved out of ONE block the game allocates at start-up, linked into intrusive lists (nw4r::ut::List). The page tracker only
+//   adds a page after it saw it change, up to one scan cycle late, so a particle allocated into a never-touched page of that block
+//   within the rolled-back window was not restored while the list heads pointing at it were: a cyclic list and a hook command that
+//   never came again (the main thread spun in ParticleManager::Calc). So at arm the whole block (found through the EffectSystem
+//   singleton, FindEfPool below) is put into the snapshot set, and after a restore the lists are walked (CheckEfLists, EFCHECK lines).
 //
 // THE AUDIO HARDWARE (REV3_SYNCTEST_AUDIO_HW, default on)
 //   The audio runs on its own hardware clock (AI DMA every ~5 ms, DSP mail / interrupt handshakes, sound threads woken by them).
@@ -183,6 +194,14 @@ bool ApplyExclusions(const std::string& json_text, std::vector<Range>* ranges, S
 // Sorts by start and merges overlapping or touching ranges.
 std::vector<Range> MergeRanges(std::vector<Range> ranges);
 
+// REV3_SNAPSHOT_INCLUDE: parses `json_text` with the very entry formats ApplyExclusions takes ({"start","end"} ranges and pointer based
+// {"ptr","size","note"} entries) but for the opposite purpose: the regions are forced INTO the snapshot set when SyncTest (or a netplay
+// session) arms. Fixed ranges go to *fixed, pointer entries to *ptrs (the u32 at `ptr` is read at arm and [value, value + size) is
+// included). Logs one "NOTE include user 0xSTART-0xEND (n bytes)" / "NOTE include ptr entry ..." line per entry to `sink`. False (and
+// the outputs untouched) when the JSON is bad or empty; *error says why. The cuts (hook region, REV3_SYNCTEST_EXCLUDE, hardware) still win.
+bool LoadInclusions(const std::string& json_text, Sink& sink, std::vector<Range>* fixed, std::vector<PtrExclusion>* ptrs,
+                    std::string* error);
+
 // ---- the fighter checksum fields (rev3-mod rbchecksum.py FIELDS, FIELDS_VERSION 1) ---------------------------------------------
 constexpr u32 TEAMS_ADDR = 0x8038FE50;     // four team pointers; team 0 -> player 1, team 1 -> player 2
 constexpr size_t FIELD_COUNT = 61;
@@ -267,6 +286,86 @@ public:
   virtual u32 InterruptBits() = 0;
   virtual void SetInterruptBits(u32 bits) = 0;
 };
+
+// ---- nw4r::ef effect pool (REV3_EF_POOL, REV3_EFCHECK) ------------------------------------------------------------------------
+// Rev3 links the nw4r effect library (EffectSystem, Effect, Emitter, ParticleManager, Particle; symbols in the decomp, libnw4r_ef.a).
+// Everything below is read from the decomp (addresses of the RNEEDA build), nothing is copied from the game.
+//
+// Allocation (decomp zz_80186fd8_ @ 0x80186fd8 -> zz_801895d8_ @ 0x801895d8, the memorymanagertmp.h template of nw4r):
+//   block = zz_80170620_(size + 0xC60) from the game heap, stored in the global 0x8049CFB0 (DAT_8049cfb0);
+//   mm = block (a 0x3C-byte MemoryManager, vtable 0x8035E470) is placement-constructed at the START of the block, then
+//   mm.heap = [block + 0x40, block + 0x40 + size) is a free-list heap (mHeapStart / mHeapEnd at mm + 0x24 / + 0x28), and the object
+//   pools are allocated out of that heap through mm's vtable slot +0x60: Effect[n] (0xA0 bytes each), Emitter[n] (0x154), ParticleManager[n]
+//   (0xBC, 256 of them) and Particle[n] (0xE4, 2500 of them), each with a 0x24-byte ObjectPool object (free list + in-use list, ut::List
+//   offset 0). So ALL ef objects live in [mm, mm + 0x40 + size), and the handle table the game keeps for them (0x101 words, global
+//   0x8049CFC4) directly follows the heap, inside the same allocation (block + size + 0xC60 is the allocation's end).
+//   The EffectSystem singleton is the static 0x803D9588 (EffectSystem::GetInstance @ 0x801A9C18 returns it): word 0 is the mm pointer
+//   (zz_80189590_ @ 0x80189590 stores it and calls EffectSystem::Initialize @ 0x801A9C24), the CreationQueue sits at +0x10 and
+//   +0xC014 / +0xC018 are the activity-group count and the ActivityList[group] array (0x1C bytes each, allocated from mm's heap too).
+//
+// Lists (nw4r::ut::List = {head +0, tail +4, u16 count +8, u16 offset +0xA}; the link of a node is {prev, next} at node + offset):
+//   ActivityList[g]: effects (offset 0x14) at +0, closing effects at +0xC;  Effect: emitters at +0x24, closing at +0x30 (offset 0x14);
+//   Emitter: particle managers at +0xC0, closing at +0xCC;  ParticleManager: particles at +0x38, closing at +0x44.
+//   ParticleManager::Calc @ 0x801B5E50 (5444 bytes) walks the particles list with `node = *(node + offset + 4)` (offset = the u16 at
+//   pm + 0x42) until it reads 0; its loop head is LAB_801b72dc and the PC the frozen guest stood at (0x801B72D8) is next to it, so a
+//   list that is cyclic or leads into stale memory never ends. The element counts of the Effect / Emitter pools are arguments of
+//   zz_80186fd8_ that the decomp does not show; they are read from the manager at run time (FindEfPool logs them).
+constexpr u32 EF_SYSTEM_ADDR = 0x803D9588;       // EffectSystem singleton (DAT_803d9588)
+constexpr u32 EF_SYSTEM_BYTES = 0xC070;          // its size: fields up to +0xC064, rounded (the CreationQueue is inside)
+constexpr u32 EF_BLOCK_GLOBAL = 0x8049CFB0;      // u32: the allocation (== mm)
+constexpr u32 EF_HANDLE_TABLE_GLOBAL = 0x8049CFC4;  // u32: the 0x101-word handle table (just behind the heap, inside the allocation)
+constexpr u32 EF_HANDLE_TABLE_BYTES = 0x101 * 4;
+constexpr u32 EF_HANDLE_POOL_GLOBALS[2] = {0x8049CFBC, 0x8049CFC0};  // u32: two small fixed pools {free, first, n, payload, nodes...}
+constexpr u32 EF_BLOCK_TAIL = 0xC20;             // allocation bytes after the heap end (size + 0xC60 - (0x40 + size))
+constexpr u32 EF_POOL_MAX_BYTES = 0x2000000;     // sanity limit for the heap size (the real one is about 1 MB)
+// MemoryManager fields (word index * 4).
+constexpr u32 EF_MM_COUNTS[4] = {0x04, 0x0C, 0x14, 0x1C};  // effects, emitters, particle managers, particles
+constexpr u32 EF_MM_POOLS[4] = {0x08, 0x10, 0x18, 0x20};   // their ObjectPool pointers
+constexpr u32 EF_MM_HEAP_START = 0x24;
+constexpr u32 EF_MM_HEAP_END = 0x28;
+constexpr u32 EF_CHECK_LIST_CAP = 10000;         // nodes walked per list before it counts as cyclic
+constexpr u32 EF_CHECK_TOTAL_CAP = 40000;        // nodes walked in one check (the four pools hold a few thousand objects)
+constexpr u32 EF_CHECK_MAX_GROUPS = 64;          // activity groups the check accepts (the game uses 3)
+
+struct EfPool
+{
+  u32 mm = 0;                    // the MemoryManager (== start of the allocation)
+  u32 heap_start = 0;
+  u32 heap_end = 0;
+  std::array<u32, 4> counts{};   // effects, emitters, particle managers, particles (pool sizes)
+  Range main;                    // the allocation, page aligned: [mm, heap_end + EF_BLOCK_TAIL)
+  std::vector<Range> ranges;     // everything to force in, page aligned and merged (main + instance + handle table / pools)
+  u32 bytes = 0;                 // total bytes of `ranges`
+  std::string detail;            // human readable: what the extras are, what could not be added
+};
+
+// Reads the EffectSystem singleton and computes the ranges that hold all ef objects (see above). False and *why when the effect system
+// is not set up (mm pointer 0, unreadable, implausible heap); then nothing is forced. The extras (instance, handle table, handle
+// pools) are added when they validate and described in `detail`.
+bool FindEfPool(const GuestMemory& memory, EfPool* out, std::string* why);
+
+struct EfCheckResult
+{
+  bool ran = false;     // false: the effect system is not set up (nothing to check)
+  bool ok = true;
+  u32 lists = 0;        // lists walked
+  u32 nodes = 0;        // nodes walked
+  std::array<u32, 4> objects{};  // effects, emitters, particle managers, particles visited
+  std::string list;     // the failing list ("particles@pm=0x9220F100")
+  u32 list_addr = 0;    // its ut::List address
+  u32 node = 0;         // the offending node (0: the list header itself)
+  std::string why;
+};
+
+// Walks the ef lists from the EffectSystem singleton (activity lists -> effects -> emitters -> particle managers -> particles, plus the
+// four object pools' free / in-use lists) and verifies for each list: head / tail / count agree about emptiness, every node is a 4-byte
+// aligned pointer inside the ef heap, prev links match, the walk ends at the tail after exactly `count` nodes, and it ends within
+// `list_cap` nodes (EF_CHECK_LIST_CAP). The first failure stops the walk. Read only.
+EfCheckResult CheckEfLists(const GuestMemory& memory, u32 list_cap = EF_CHECK_LIST_CAP);
+
+// The `ef ...` lines of the freeze dump (without the DUMP prefix): the EffectSystem pointer, the manager, the heads of every group's
+// lists and pools, and the result of CheckEfLists. Read only; safe on an unset effect system.
+std::vector<std::string> EfDumpLines(const GuestMemory& memory);
 
 class Sink
 {
@@ -409,7 +508,12 @@ struct SyncTestOptions
   bool adaptive = true;           // REV3_SYNCTEST_ADAPTIVE: learn the snapshot set in the running match (see the top of this file)
   u32 scan_slices = 16;           // REV3_SYNCTEST_SCAN_SLICES: each hook call hashes 1/scan_slices of all pages (1..4096)
   u32 learn_cycles = 20;          // REV3_SYNCTEST_LEARN: full scan cycles (scan_slices calls each) needed before arming
+  bool ef_pool = true;            // REV3_EF_POOL: force the nw4r::ef pool into the snapshot set at arm (FindEfPool)
+  u32 ef_check_restores = 200;    // REV3_EFCHECK: restores (count, not frames) that get the ef list check before / after the write-back;
+                                  // 0 = off, EF_CHECK_ALL = every restore. 200 restores = 200 checks of a few thousand reads each (microseconds)
 };
+
+constexpr u32 EF_CHECK_ALL = 0xFFFFFFFFu;  // SyncTestOptions::ef_check_restores: check every restore
 
 // ---- page tracker (adaptive snapshot set) ------------------------------------------------------------------------------------
 constexpr u32 PAGE_SIZE = 0x1000;
@@ -466,6 +570,11 @@ struct SyncTestStats
   u32 audio_restores = 0;         // restores that also put the audio hardware back
   u64 audio_us_total = 0;         // time of those audio restores (state load + event re-scheduling)
   u64 audio_us_max = 0;
+  u32 ef_checks = 0;              // ef list checks after a restore
+  u32 ef_bad = 0;                 // of those, how many found a broken list (and before a restore, see ef_bad_before)
+  u32 ef_bad_before = 0;          // checks before a restore that found a broken list (the game's own state was already bad)
+  u32 layout_refused = 0;         // restores refused because the snapshot was taken under another snapshot layout
+  u32 late_learn_rollbacks = 0;   // rollbacks done within one scan cycle before pages were learned (those pages were not rewound)
 };
 
 class SyncTest
@@ -482,6 +591,14 @@ public:
   // first command (the layout is rebuilt; nothing is logged).
   // `pointers`: REV3_SYNCTEST_EXCLUDE entries read from guest memory when SyncTest arms and at every exclusion re-check.
   void SetUserExclusions(std::vector<Range> exclusions, std::vector<PtrExclusion> pointers = {});
+
+  // REV3_SNAPSHOT_INCLUDE entries (LoadInclusions): forced into the set at every arm, together with the ef pool (options.ef_pool). Fixed
+  // ranges are included as given, pointer entries are read when arming. Call before the first command (nothing is logged here).
+  void SetUserInclusions(std::vector<Range> fixed, std::vector<PtrExclusion> pointers = {});
+  // The ranges forced into the set at the latest arm (ef pool + user entries, before the cuts), merged.
+  const std::vector<Range>& ForcedRanges() const { return m_forced; }
+  const EfPool& EfPoolInfo() const { return m_ef; }
+  bool EfPoolFound() const { return m_ef_found; }
 
   // One command in, one reply out. All work (reads, snapshots, restores, logging) happens inside this call.
   Reply OnCommand(const Command& command);
@@ -516,6 +633,7 @@ private:
   struct Slot
   {
     bool valid = false;
+    u32 layout_gen = 0;                                     // m_layout_gen at the capture: the data has that layout
     u32 frame = 0;
     u32 sp = 0;
     u32 stack_len = 0;
@@ -557,7 +675,13 @@ private:
   // Logs the coverage lines; returns the smaller of the two players' in-snapshot field counts.
   size_t LogFieldCoverage(const std::array<u32, 2>& fighters, const char* when);
   // The snapshot set from its parts: seed + dynamic pages + fighters + stack window, minus hook region, user and hardware cuts.
-  std::vector<Range> ComputeRanges() const;
+  std::vector<Range> ComputeRanges() const { return ComputeRanges(m_forced); }
+  std::vector<Range> ComputeRanges(const std::vector<Range>& forced) const;
+  // Re-reads the ef pool and the user inclusions (arm time) into m_forced and logs what was found: `NOTE ef pool 0x..-0x.. bytes=..` or
+  // `NOTE ef pool not found: <why>`, the extras, `NOTE include ptr ..`, and how many bytes the forced ranges add to the set.
+  void ResolveInclusions();
+  // The ef list check around a restore (options.ef_check_restores): `when` = "before" / "after". Logs EFCHECK lines.
+  void EfCheck(const char* when, u32 from, u32 to);
   void LearnWhileArmed(u32 added);
   bool Arm(const Command& command, const std::array<u32, 2>& fighters);
   // "0xSTART-0xEND" of the current snapshot range that holds [addr, addr + 4); empty when none does.
@@ -570,6 +694,16 @@ private:
   std::vector<Range> m_seed;    // the whitelist (after the hook region cut)
   std::vector<Range> m_ranges;  // the current snapshot ranges = ComputeRanges() at the last rebuild
   std::vector<Range> m_user_exclusions;
+  std::vector<Range> m_include_fixed;           // REV3_SNAPSHOT_INCLUDE ranges
+  std::vector<PtrExclusion> m_include_ptrs;     // REV3_SNAPSHOT_INCLUDE pointer entries (resolved at arm)
+  std::vector<Range> m_forced;                  // resolved at the latest arm: ef pool + the user entries, merged
+  EfPool m_ef;
+  bool m_ef_found = false;
+  u32 m_ef_checks_done = 0;                     // restores that got the check (limit: options.ef_check_restores)
+  u32 m_ef_bad_logs = 0;
+  u32 m_ef_ok_logs = 0;
+  u32 m_layout_gen = 0;                         // bumped by every RebuildLayout; a snapshot of another generation is never restored
+  u32 m_last_restore_call = 0;                  // m_armed_calls at the latest restore (late-learn detection)
   struct PtrState
   {
     PtrExclusion entry;

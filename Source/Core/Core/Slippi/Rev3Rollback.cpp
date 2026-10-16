@@ -341,6 +341,33 @@ u64 SubtractRange(std::vector<Range>* ranges, u32 lo, u32 hi)
   return removed;
 }
 
+namespace
+{
+// The entries of an exclusion / inclusion list: {"start","end"} ranges into *fixed, {"ptr","size"} entries into *pointers.
+bool ParseEntries(const picojson::array& list, std::vector<Range>* fixed, std::vector<PtrExclusion>* pointers, std::string* error)
+{
+  for (size_t i = 0; i < list.size(); ++i)
+  {
+    const picojson::value& item = list[i];
+    if (item.is<picojson::object>() && item.contains("ptr"))
+    {
+      PtrExclusion e;
+      if (!ParsePtrItem(item, i, &e, error))
+        return false;
+      pointers->push_back(e);
+    }
+    else
+    {
+      Range r;
+      if (!ParseRangeItem(item, i, &r, error))
+        return false;
+      fixed->push_back(r);
+    }
+  }
+  return true;
+}
+}  // namespace
+
 bool ApplyExclusions(const std::string& json_text, std::vector<Range>* ranges, Sink& sink, std::string* error,
                      std::vector<Range>* parsed, bool require_nonempty, std::vector<PtrExclusion>* ptrs)
 {
@@ -353,24 +380,8 @@ bool ApplyExclusions(const std::string& json_text, std::vector<Range>* ranges, S
     return false;
   std::vector<Range> exclusions;
   std::vector<PtrExclusion> pointer_entries;
-  for (size_t i = 0; i < list->size(); ++i)
-  {
-    const picojson::value& item = (*list)[i];
-    if (item.is<picojson::object>() && item.contains("ptr"))
-    {
-      PtrExclusion e;
-      if (!ParsePtrItem(item, i, &e, error))
-        return false;
-      pointer_entries.push_back(e);
-    }
-    else
-    {
-      Range r;
-      if (!ParseRangeItem(item, i, &r, error))
-        return false;
-      exclusions.push_back(r);
-    }
-  }
+  if (!ParseEntries(*list, &exclusions, &pointer_entries, error))
+    return false;
   if (exclusions.empty() && pointer_entries.empty())
   {
     *error = "the exclusion list has no ranges";
@@ -406,6 +417,36 @@ bool ApplyExclusions(const std::string& json_text, std::vector<Range>* ranges, S
     *parsed = std::move(exclusions);
   if (ptrs != nullptr)
     *ptrs = std::move(pointer_entries);
+  return true;
+}
+
+bool LoadInclusions(const std::string& json_text, Sink& sink, std::vector<Range>* fixed, std::vector<PtrExclusion>* ptrs,
+                    std::string* error)
+{
+  std::string scratch;
+  if (error == nullptr)
+    error = &scratch;
+  picojson::value root;
+  const picojson::array* list = nullptr;
+  if (!ParseRangeArray(json_text, &root, &list, error))
+    return false;
+  std::vector<Range> ranges;
+  std::vector<PtrExclusion> pointer_entries;
+  if (!ParseEntries(*list, &ranges, &pointer_entries, error))
+    return false;
+  if (ranges.empty() && pointer_entries.empty())
+  {
+    *error = "the inclusion list has no ranges";
+    return false;
+  }
+  for (const Range& r : ranges)
+    sink.Line(Format("NOTE include user 0x%08X-0x%08X (%u bytes, forced into the snapshot when it arms)", r.start, r.end, r.end - r.start));
+  for (const PtrExclusion& e : pointer_entries)
+  {
+    sink.Line(Format("NOTE include ptr entry 0x%08X size=0x%X note=%s (resolved when the snapshot arms)", e.ptr, e.size, e.note.c_str()));
+  }
+  *fixed = std::move(ranges);
+  *ptrs = std::move(pointer_entries);
   return true;
 }
 
@@ -651,9 +692,14 @@ void SyncTest::SetUserExclusions(std::vector<Range> exclusions, std::vector<PtrE
 // page the tracker found + both fighter structs (fighter .. +0x1800, so all 61 FIELDS are always covered) + the hook stack window
 // (as of arming), merged into sorted ranges. Always minus the hook region, the user's exclusions and every hardware exclusion seen
 // so far (the cuts win over everything that was added).
-std::vector<Range> SyncTest::ComputeRanges() const
+std::vector<Range> SyncTest::ComputeRanges(const std::vector<Range>& forced) const
 {
   std::vector<Range> all = m_seed;
+  // Forced inclusions (ef pool, REV3_SNAPSHOT_INCLUDE) join before the cuts, so the cuts still win. The classic set keeps its file order
+  // (overlaps saved twice) unless something is forced, then it is merged like the adaptive one.
+  all.insert(all.end(), forced.begin(), forced.end());
+  if (!m_options.adaptive && !forced.empty())
+    all = MergeRanges(std::move(all));
   if (m_options.adaptive)
   {
     m_tracker.AppendDynamicRanges(&all);
@@ -694,9 +740,89 @@ bool SameRanges(const std::vector<Range>& a, const std::vector<Range>& b)
 }
 }  // namespace
 
+void SyncTest::SetUserInclusions(std::vector<Range> fixed, std::vector<PtrExclusion> pointers)
+{
+  m_include_fixed = std::move(fixed);
+  m_include_ptrs = std::move(pointers);
+}
+
+namespace
+{
+u64 SumBytes(const std::vector<Range>& ranges)
+{
+  u64 total = 0;
+  for (const Range& r : ranges)
+    total += r.end - r.start;
+  return total;
+}
+}  // namespace
+
+// Arm time: the regions that must be in the snapshot whatever the page tracker has seen. (1) The nw4r::ef pool, found through the
+// EffectSystem singleton (FindEfPool). (2) The REV3_SNAPSHOT_INCLUDE entries: fixed ranges as given, pointer entries by reading the u32.
+// Replaces m_forced (a match may allocate the pool elsewhere than the last one). Logs what was found; `NOTE ef pool` carries the main range
+// and its bytes. The set is NOT rebuilt here: the caller computes it right after.
+void SyncTest::ResolveInclusions()
+{
+  std::vector<Range> forced = m_include_fixed;
+  m_ef = EfPool();
+  m_ef_found = false;
+  if (m_options.ef_pool)
+  {
+    std::string why;
+    if (FindEfPool(m_memory, &m_ef, &why))
+    {
+      m_ef_found = true;
+      m_sink.Line(Format("NOTE ef pool 0x%08X-0x%08X bytes=%u", m_ef.main.start, m_ef.main.end, m_ef.main.end - m_ef.main.start));
+      m_sink.Line(Format("NOTE ef pool total bytes=%u ranges=%zu mm=0x%08X heap=0x%08X-0x%08X effects=%u emitters=%u particle_managers=%u "
+                         "particles=%u",
+                         m_ef.bytes, m_ef.ranges.size(), m_ef.mm, m_ef.heap_start, m_ef.heap_end, m_ef.counts[0], m_ef.counts[1],
+                         m_ef.counts[2], m_ef.counts[3]));
+      if (!m_ef.detail.empty())
+        m_sink.Line("NOTE ef pool extras: " + m_ef.detail);
+      forced.insert(forced.end(), m_ef.ranges.begin(), m_ef.ranges.end());
+    }
+    else
+    {
+      m_sink.Line("NOTE ef pool not found: " + why);
+    }
+  }
+  else
+  {
+    m_sink.Line("NOTE ef pool off (REV3_EF_POOL=0)");
+  }
+  for (const PtrExclusion& p : m_include_ptrs)
+  {
+    u8 word[4];
+    u32 value = 0;
+    const bool read = m_memory.Read(p.ptr, word, 4);
+    if (read)
+      value = ReadBE32(word);
+    if (!read || value == 0 || !PointerOk(value))
+    {
+      m_sink.Line(Format("NOTE include ptr 0x%08X skipped: %s (value 0x%08X)", p.ptr,
+                         !read ? "cannot read the pointer" : (value == 0 ? "pointer is 0" : "pointer is outside MEM1 / MEM2"), value));
+      continue;
+    }
+    const u32 end = static_cast<u32>(std::min<u64>(static_cast<u64>(value) + p.size, RegionEnd(value)));
+    m_sink.Line(Format("NOTE include ptr 0x%08X -> 0x%08X-0x%08X (%u bytes) note=%s", p.ptr, value, end, end - value, p.note.c_str()));
+    forced.push_back({value, end});
+  }
+  m_forced = MergeRanges(std::move(forced));
+  if (!m_forced.empty())
+  {
+    // What the forcing adds: the set with and without it, after the same cuts.
+    const u64 without = SumBytes(ComputeRanges({}));
+    const u64 with = SumBytes(ComputeRanges(m_forced));
+    m_sink.Line(Format("NOTE forced include: ranges=%zu bytes=%llu; the snapshot set grows by %llu bytes (%llu -> %llu, before the hardware cuts)",
+                       m_forced.size(), static_cast<unsigned long long>(SumBytes(m_forced)), static_cast<unsigned long long>(with - without),
+                       static_cast<unsigned long long>(without), static_cast<unsigned long long>(with)));
+  }
+}
+
 // Recomputes the offsets and buffer sizes for the current m_ranges. Every slot is invalidated: its data has the old layout.
 void SyncTest::RebuildLayout()
 {
+  ++m_layout_gen;
   m_range_offsets.clear();
   m_ranges_bytes = 0;
   for (const Range& r : m_ranges)
@@ -921,6 +1047,7 @@ bool SyncTest::Capture(Slot& slot, const Command& command, const std::array<u32,
 
   slot.timebase_valid = m_options.restore_timebase && m_memory.ReadTimeBase(&slot.timebase);
   slot.valid = true;
+  slot.layout_gen = m_layout_gen;
   slot.frame = command.frame;
   slot.sp = command.sp;
   slot.stack_len = stack_len;
@@ -1019,6 +1146,15 @@ bool SyncTest::Restore(const Slot& s, const Command& command, u32 to)
     Error(Format("frame %u: no snapshot of frame %u to restore", command.frame, to));
     return false;
   }
+  if (s.layout_gen != m_layout_gen || s.data.size() != m_snapshot_bytes)
+  {
+    // Belt and braces: RebuildLayout invalidates every slot, so this cannot happen today. A snapshot taken under another layout holds
+    // other ranges (or none of the pages learned since), and writing it back range by range would scramble memory.
+    ++m_stats.layout_refused;
+    Error(Format("frame %u: the snapshot of frame %u was taken under another snapshot layout (gen %u, now %u); not restoring", command.frame,
+                 to, s.layout_gen, m_layout_gen));
+    return false;
+  }
   if (s.sp != command.sp)
   {
     // The hook's saved registers live at sp..sp+0x200; restoring them under a different sp would hand the hook garbage.
@@ -1035,6 +1171,9 @@ bool SyncTest::Restore(const Slot& s, const Command& command, u32 to)
   // Freeze dump: the hardware and the software flags that wait on it, right before the write-back (the first 10 restores).
   if (log_it && m_dump != nullptr)
     m_sink.Line(m_dump->RestoreHwLine(command.frame, to, false));
+
+  // The ef lists as the game left them, just before they are overwritten (the first options.ef_check_restores restores).
+  EfCheck("before", command.frame, to);
 
   const u64 t0 = m_micros();
   size_t offset = 0;
@@ -1083,6 +1222,10 @@ bool SyncTest::Restore(const Slot& s, const Command& command, u32 to)
   if (log_it && m_dump != nullptr)
     m_sink.Line(m_dump->RestoreHwLine(command.frame, to, true));
 
+  // The ef lists after the write-back: the same checker, this time on the rewound state (the one the game resumes from).
+  EfCheck("after", command.frame, to);
+  m_last_restore_call = m_armed_calls;
+
   ++m_stats.restores;
   m_stats.restore_us_total += us;
   m_stats.restore_us_max = std::max(m_stats.restore_us_max, us);
@@ -1100,6 +1243,55 @@ bool SyncTest::Restore(const Slot& s, const Command& command, u32 to)
     m_sink.Line(Format("RESTORE %u -> %u us=%llu%s", command.frame, to, static_cast<unsigned long long>(us), tb_text.c_str()));
   }
   return true;
+}
+
+// The ef list check around a restore (options.ef_check_restores). `when` "before" = the live state about to be overwritten (a bad list here
+// was already broken in the first run), "after" = the rewound state. Both go through CheckEfLists. A bad result is logged as
+//   EFCHECK bad after restore <from> -> <to>: <list> node=0x.. <why> page=0x.. in_snapshot=0|1 dynamic=0|1
+// (in_snapshot: the node's page is inside the current snapshot ranges, dynamic: the page tracker has seen it change); the first 20 are
+// logged, the rest only counted (SUMMARY ef_bad). The first 3 good results are logged too (`EFCHECK ok ...`), so a log shows the check ran.
+void SyncTest::EfCheck(const char* when, u32 from, u32 to)
+{
+  const u32 limit = m_options.ef_check_restores;
+  const bool after = std::strcmp(when, "after") == 0;
+  if (limit == 0 || (limit != EF_CHECK_ALL && m_ef_checks_done >= limit))
+    return;
+  const u64 t0 = m_micros();
+  const EfCheckResult r = CheckEfLists(m_memory);
+  const u64 us = m_micros() - t0;
+  if (after)
+  {
+    ++m_ef_checks_done;
+    ++m_stats.ef_checks;
+  }
+  if (!r.ran)
+    return;  // the effect system is not set up (`NOTE ef pool not found` at arm says why); nothing to check
+  if (r.ok)
+  {
+    if (after && m_ef_ok_logs < 3)
+    {
+      ++m_ef_ok_logs;
+      m_sink.Line(Format("EFCHECK ok after restore %u -> %u lists=%u nodes=%u effects=%u emitters=%u pms=%u particles=%u us=%llu", from, to,
+                         r.lists, r.nodes, r.objects[0], r.objects[1], r.objects[2], r.objects[3], static_cast<unsigned long long>(us)));
+    }
+    return;
+  }
+  if (after)
+    ++m_stats.ef_bad;
+  else
+    ++m_stats.ef_bad_before;
+  ++m_ef_bad_logs;
+  if (m_ef_bad_logs > 20)
+  {
+    if (m_ef_bad_logs == 21)
+      m_sink.Line("EFCHECK further failures are only counted (SUMMARY ef_bad / ef_bad_before)");
+    return;
+  }
+  const u32 page = r.node & ~(PAGE_SIZE - 1);
+  const bool in_snapshot = r.node != 0 && !RangeContaining(r.node).empty();
+  m_sink.Line(Format("EFCHECK bad %s restore %u -> %u: %s node=0x%08X list=0x%08X %s page=0x%08X in_snapshot=%d dynamic=%d lists=%u nodes=%u",
+                     when, from, to, r.list.c_str(), r.node, r.list_addr, r.why.c_str(), page, in_snapshot ? 1 : 0,
+                     (r.node != 0 && m_tracker.IsDynamic(r.node)) ? 1 : 0, r.lists, r.nodes));
 }
 
 // A restore under a disc read in flight would rewind memory the read is about to fill (or has half filled) from inside IOS HLE,
@@ -1326,7 +1518,8 @@ void SyncTest::SummaryLine(const char* tag)
   const double n = m_stats.restores != 0 ? static_cast<double>(m_stats.restores) : 1.0;
   m_sink.Line(Format("%s frame=%u rollbacks=%u frames_compared=%u mismatching_frames=%u restore_us_mean=%.1f restore_us_max=%llu "
                      "icache_us_mean=%.1f icache_us_max=%llu sp_mismatches=%u noop_restores=%u dynamic_pages=%zu scan_us_mean=%.1f "
-                     "scan_us_max=%llu io_postponed=%u audio_restores=%u audio_us_mean=%.1f audio_us_max=%llu",
+                     "scan_us_max=%llu io_postponed=%u audio_restores=%u audio_us_mean=%.1f audio_us_max=%llu ef_checks=%u ef_bad=%u "
+                     "ef_bad_before=%u layout_refused=%u late_learn_rollbacks=%u",
                      tag, m_last_frame, m_stats.rollbacks, m_stats.frames_compared, m_stats.mismatching_frames,
                      m_stats.restore_us_total / n, static_cast<unsigned long long>(m_stats.restore_us_max),
                      m_stats.icache_us_total / n, static_cast<unsigned long long>(m_stats.icache_us_max),
@@ -1334,7 +1527,8 @@ void SyncTest::SummaryLine(const char* tag)
                      m_stats.scans != 0 ? static_cast<double>(m_stats.scan_us_total) / static_cast<double>(m_stats.scans) : 0.0,
                      static_cast<unsigned long long>(m_stats.scan_us_max), m_stats.io_postponed, m_stats.audio_restores,
                      m_stats.audio_restores != 0 ? static_cast<double>(m_stats.audio_us_total) / m_stats.audio_restores : 0.0,
-                     static_cast<unsigned long long>(m_stats.audio_us_max)));
+                     static_cast<unsigned long long>(m_stats.audio_us_max), m_stats.ef_checks, m_stats.ef_bad, m_stats.ef_bad_before,
+                     m_stats.layout_refused, m_stats.late_learn_rollbacks));
 }
 
 void SyncTest::Finish()
@@ -1355,16 +1549,31 @@ void SyncTest::LearnWhileArmed(u32 added)
   std::vector<Range> ranges = ComputeRanges();
   if (SameRanges(ranges, m_ranges))
     return;
+  // What is new: the new set minus the old one (listed in the log, so a run shows WHICH pages the game touched after the learning phase).
+  std::vector<Range> fresh = ranges;
+  for (const Range& old_range : m_ranges)
+    SubtractRange(&fresh, old_range.start, old_range.end);
   m_ranges = std::move(ranges);
   RebuildLayout();
   ClearHistory();
+  // A page is noticed up to one scan cycle (scan_slices hook calls) after it first changed, and every rollback in that time rewound the
+  // other pages but not this one: those rollbacks were unsound for it. Only a restore within one cycle can have been affected.
+  const bool late = m_last_restore_call != 0 && m_armed_calls - m_last_restore_call <= m_tracker.Slices();
+  if (late)
+    ++m_stats.late_learn_rollbacks;
   // Rate limit: the first 10 growths are logged, then at most one line per 300 armed calls (with the pages learned since).
   if (m_learn_logs < MAX_LEARN_LOGS || m_armed_calls - m_learn_log_call >= LEARN_LOG_EVERY)
   {
     ++m_learn_logs;
     m_learn_log_call = m_armed_calls;
-    m_sink.Line(Format("NOTE learned +%u pages (now ranges=%zu bytes=%zu) frame %u, history cleared", m_learned_unlogged,
-                       m_ranges.size(), m_ranges_bytes, m_last_frame));
+    std::string where;
+    for (size_t i = 0; i < fresh.size() && i < 4; ++i)
+      where += Format("%s0x%08X-0x%08X", i == 0 ? "" : ",", fresh[i].start, fresh[i].end);
+    if (fresh.size() > 4)
+      where += Format(",+%zu more", fresh.size() - 4);
+    m_sink.Line(Format("NOTE learned +%u pages (now ranges=%zu bytes=%zu) frame %u, history cleared; new=[%s]%s", m_learned_unlogged,
+                       m_ranges.size(), m_ranges_bytes, m_last_frame, where.c_str(),
+                       late ? " WARNING a rollback ran within the last scan cycle without these pages" : ""));
     m_sink.Line(Format("NOTE snapshot now ranges=%zu bytes=%zu snapshot_bytes=%zu slots=%zu", m_ranges.size(), m_ranges_bytes,
                        m_snapshot_bytes, m_ring.size()));
     m_learned_unlogged = 0;
@@ -1379,8 +1588,10 @@ bool SyncTest::Arm(const Command& command, const std::array<u32, 2>& fighters)
 {
   m_set_sp = RegionEnd(command.sp) != 0 ? command.sp : 0;
   m_armed_calls = 0;
+  m_last_restore_call = 0;
   m_last_frame = command.frame;
   ClearHistory();
+  ResolveInclusions();  // the ef pool and REV3_SNAPSHOT_INCLUDE: in the set whatever the page tracker has seen
   m_ranges = ComputeRanges();
   RebuildLayout();
   RefreshExclusions(true);  // may cut more and rebuild again
@@ -2272,6 +2483,9 @@ std::vector<std::string> FreezeDump::Lines(bool full, bool racy)
   AppendCpu(&out, m_memory, cpu, cpu_ok);
   AppendOs(&out, m_memory, cpu, cpu_ok);
   AppendQueues(&out, m_memory);
+  // The effect system's lists (a spinning ParticleManager::Calc is a list that never ends): `ef ...` lines, read only.
+  for (std::string& line : EfDumpLines(m_memory))
+    out.push_back(std::move(line));
   AppendHw(&out, hw, hw_ok);
   m_source.ExtraLines(&out, racy);
   if (full)
@@ -2333,6 +2547,360 @@ bool FreezeDump::StallDue()
   if (!m_seen.load() || m_blocked.load() || m_reported.load() || LastAgeMs() < m_stall_ms)
     return false;
   return !m_reported.exchange(true);  // claimed once; the next Tick starts a new stall
+}
+
+// ---- (4d) nw4r::ef effect pool ---------------------------------------------------------------------------------------------
+// What the addresses and offsets mean (decomp functions, allocation, lists) is written down in Rev3Rollback.h "nw4r::ef effect pool".
+// Everything here is pure: GuestMemory in, ranges / a check result / log lines out.
+
+namespace
+{
+bool ReadWord(const GuestMemory& memory, u32 addr, u32* out)
+{
+  u8 raw[4];
+  if (!memory.Read(addr, raw, 4))
+    return false;
+  *out = ReadBE32(raw);
+  return true;
+}
+
+// [start, end) widened to whole 4 KB pages and clipped to the region `start` is in (which must be MEM1 / MEM2).
+Range PageAligned(u32 start, u32 end)
+{
+  const u32 region_end = RegionEnd(start);
+  const u32 lo = start & ~(PAGE_SIZE - 1);
+  const u64 hi = std::min<u64>((static_cast<u64>(end) + PAGE_SIZE - 1) & ~static_cast<u64>(PAGE_SIZE - 1), region_end);
+  return {lo, static_cast<u32>(hi)};
+}
+
+const char* const EF_KIND[4] = {"effect", "emitter", "pm", "particle"};
+}  // namespace
+
+bool FindEfPool(const GuestMemory& memory, EfPool* out, std::string* why)
+{
+  std::string scratch;
+  if (why == nullptr)
+    why = &scratch;
+  EfPool pool;
+  u32 mm = 0;
+  if (!ReadWord(memory, EF_SYSTEM_ADDR, &mm))
+  {
+    *why = Format("cannot read the EffectSystem at 0x%08X", EF_SYSTEM_ADDR);
+    return false;
+  }
+  if (mm == 0)
+  {
+    *why = Format("the memory manager pointer at EffectSystem 0x%08X is 0 (effect system not initialised yet)", EF_SYSTEM_ADDR);
+    return false;
+  }
+  if (!PointerOk(mm) || (mm & 0x1F) != 0)
+  {
+    *why = Format("the memory manager pointer 0x%08X is not a 32-byte aligned MEM1 / MEM2 address", mm);
+    return false;
+  }
+  u32 heap_start = 0;
+  u32 heap_end = 0;
+  if (!ReadWord(memory, mm + EF_MM_HEAP_START, &heap_start) || !ReadWord(memory, mm + EF_MM_HEAP_END, &heap_end))
+  {
+    *why = Format("cannot read the heap bounds of the manager at 0x%08X", mm);
+    return false;
+  }
+  const u32 region_end = RegionEnd(mm);
+  if (heap_start < mm + 0x3C || heap_end <= heap_start || heap_end > region_end || heap_end - mm > EF_POOL_MAX_BYTES)
+  {
+    *why = Format("implausible heap 0x%08X-0x%08X for the manager at 0x%08X (expected mm + 0x40 .. inside the same region, at most 0x%X bytes)",
+                  heap_start, heap_end, mm, EF_POOL_MAX_BYTES);
+    return false;
+  }
+  pool.mm = mm;
+  pool.heap_start = heap_start;
+  pool.heap_end = heap_end;
+  for (size_t i = 0; i < 4; ++i)
+    ReadWord(memory, mm + EF_MM_COUNTS[i], &pool.counts[i]);
+
+  // The allocation: manager + heap + the tail behind it (handle table and slack, all one block).
+  const u32 main_end = static_cast<u32>(std::min<u64>(static_cast<u64>(heap_end) + EF_BLOCK_TAIL, region_end));
+  pool.main = PageAligned(mm, main_end);
+  std::vector<Range> all = {pool.main};
+  std::string detail;
+
+  // The EffectSystem singleton itself (a static, MEM1): the manager pointer, the creation queue, the activity list pointers.
+  const Range instance = PageAligned(EF_SYSTEM_ADDR, EF_SYSTEM_ADDR + EF_SYSTEM_BYTES);
+  all.push_back(instance);
+  detail += Format("instance=0x%08X-0x%08X", instance.start, instance.end);
+
+  // The game's handle table (0x101 words behind the heap) and the two small fixed pools the handles come from.
+  u32 table = 0;
+  if (ReadWord(memory, EF_HANDLE_TABLE_GLOBAL, &table) && table != 0 && PointerOk(table) && (table & 3) == 0 &&
+      static_cast<u64>(table) + EF_HANDLE_TABLE_BYTES <= RegionEnd(table))
+  {
+    all.push_back(PageAligned(table, table + EF_HANDLE_TABLE_BYTES));
+    detail += Format(" handle_table=0x%08X%s", table, (table >= mm && table + EF_HANDLE_TABLE_BYTES <= main_end) ? "(inside the block)" : "");
+  }
+  else
+  {
+    detail += " handle_table=none";
+  }
+  for (size_t g = 0; g < 2; ++g)
+  {
+    u32 p = 0;
+    u32 n = 0;
+    u32 payload = 0;
+    if (!ReadWord(memory, EF_HANDLE_POOL_GLOBALS[g], &p) || p == 0 || !PointerOk(p) || (p & 3) != 0 || !ReadWord(memory, p + 8, &n) ||
+        !ReadWord(memory, p + 0xC, &payload) || n == 0 || n > 0x10000 || payload > 0x1000)
+    {
+      detail += Format(" handle_pool%zu=none", g);
+      continue;
+    }
+    const u64 bytes = 0x10 + static_cast<u64>(n) * (payload + 4);
+    if (static_cast<u64>(p) + bytes > RegionEnd(p))
+    {
+      detail += Format(" handle_pool%zu=none", g);
+      continue;
+    }
+    all.push_back(PageAligned(p, static_cast<u32>(p + bytes)));
+    detail += Format(" handle_pool%zu=0x%08X(n=%u,payload=0x%X)", g, p, n, payload);
+  }
+  pool.ranges = MergeRanges(std::move(all));
+  pool.bytes = 0;
+  for (const Range& r : pool.ranges)
+    pool.bytes += r.end - r.start;
+  pool.detail = std::move(detail);
+  *out = std::move(pool);
+  return true;
+}
+
+namespace
+{
+// The list walker of CheckEfLists. One instance per check; the first failure sticks.
+class EfWalker
+{
+public:
+  EfWalker(const GuestMemory& memory, u32 list_cap, u32 pool_lo, u32 pool_hi)
+      : m_memory(memory), m_list_cap(list_cap), m_lo(pool_lo), m_hi(pool_hi)
+  {
+    m_result.ran = true;
+  }
+
+  EfCheckResult& Result() { return m_result; }
+
+  bool Fail(const std::string& list, u32 list_addr, u32 node, const std::string& why)
+  {
+    m_result.ok = false;
+    m_result.list = list;
+    m_result.list_addr = list_addr;
+    m_result.node = node;
+    m_result.why = why;
+    return false;
+  }
+
+  // Walks the ut::List at `list_addr` whose links sit at node + `offset`; calls visit(node) for each node (before its successor is read).
+  bool Walk(const std::string& name, u32 list_addr, u32 offset, const std::function<bool(u32)>& visit)
+  {
+    u8 raw[12];
+    if (!m_memory.Read(list_addr, raw, sizeof(raw)))
+      return Fail(name, list_addr, 0, "cannot read the list header");
+    const u32 head = ReadBE32(raw);
+    const u32 tail = ReadBE32(raw + 4);
+    const u32 count = (static_cast<u32>(raw[8]) << 8) | raw[9];
+    const u32 stored_offset = (static_cast<u32>(raw[10]) << 8) | raw[11];
+    ++m_result.lists;
+    if (stored_offset != offset)
+      return Fail(name, list_addr, 0, Format("list offset is 0x%X, expected 0x%X", stored_offset, offset));
+    if (head == 0 || tail == 0 || count == 0)
+    {
+      if (head != 0 || tail != 0 || count != 0)
+        return Fail(name, list_addr, 0, Format("empty and non-empty at once: head=0x%08X tail=0x%08X count=%u", head, tail, count));
+      return true;
+    }
+    u32 prev = 0;
+    u32 node = head;
+    u32 n = 0;
+    while (node != 0)
+    {
+      if (n >= m_list_cap || m_result.nodes >= EF_CHECK_TOTAL_CAP)
+        return Fail(name, list_addr, node, Format("more than %u nodes: the list is cyclic (or its count is wrong)", n));
+      if ((node & 3) != 0 || node < m_lo || static_cast<u64>(node) + offset + 8 > m_hi)
+        return Fail(name, list_addr, node, Format("node is outside the ef heap 0x%08X-0x%08X (or misaligned)", m_lo, m_hi));
+      u8 link[8];
+      if (!m_memory.Read(node + offset, link, sizeof(link)))
+        return Fail(name, list_addr, node, "cannot read the node's link");
+      const u32 node_prev = ReadBE32(link);
+      const u32 node_next = ReadBE32(link + 4);
+      if (node_prev != prev)
+        return Fail(name, list_addr, node, Format("prev link is 0x%08X, expected 0x%08X (node %u of %u)", node_prev, prev, n, count));
+      ++n;
+      ++m_result.nodes;
+      if (!visit(node))
+        return false;
+      prev = node;
+      node = node_next;
+    }
+    if (prev != tail)
+      return Fail(name, list_addr, prev, Format("the walk ends at 0x%08X but the tail is 0x%08X", prev, tail));
+    if (n != count)
+      return Fail(name, list_addr, prev, Format("walked %u nodes but the count says %u", n, count));
+    return true;
+  }
+
+private:
+  const GuestMemory& m_memory;
+  u32 m_list_cap;
+  u32 m_lo;
+  u32 m_hi;
+  EfCheckResult m_result;
+};
+
+constexpr u32 EF_LIST_OFFSET = 0x14;    // offset of the activity link in Effect / Emitter / ParticleManager / Particle (List_Init(..., 0x14))
+constexpr u32 EF_GROUP_STRIDE = 0x1C;   // sizeof(ActivityList)
+constexpr u32 EF_SYS_GROUPS = 0xC014;   // EffectSystem: activity group count
+constexpr u32 EF_SYS_ACTIVITY = 0xC018; // EffectSystem: ActivityList[] pointer
+}  // namespace
+
+EfCheckResult CheckEfLists(const GuestMemory& memory, u32 list_cap)
+{
+  u32 mm = 0;
+  if (!ReadWord(memory, EF_SYSTEM_ADDR, &mm) || mm == 0)
+    return EfCheckResult();  // not set up: ran = false
+  u32 heap_start = 0;
+  u32 heap_end = 0;
+  if (!PointerOk(mm) || !ReadWord(memory, mm + EF_MM_HEAP_START, &heap_start) || !ReadWord(memory, mm + EF_MM_HEAP_END, &heap_end) ||
+      heap_start >= heap_end || !PointerOk(heap_start) || !PointerOk(heap_end - 1))
+  {
+    EfWalker bad(memory, list_cap, 0, 0);
+    bad.Fail("EffectSystem", EF_SYSTEM_ADDR, mm, Format("the manager 0x%08X has no usable heap (0x%08X-0x%08X)", mm, heap_start, heap_end));
+    return bad.Result();
+  }
+  EfWalker w(memory, list_cap, heap_start, heap_end);
+  EfCheckResult& r = w.Result();
+
+  u32 groups = 0;
+  u32 activity = 0;
+  if (!ReadWord(memory, EF_SYSTEM_ADDR + EF_SYS_GROUPS, &groups) || !ReadWord(memory, EF_SYSTEM_ADDR + EF_SYS_ACTIVITY, &activity))
+  {
+    w.Fail("EffectSystem", EF_SYSTEM_ADDR, 0, "cannot read the activity list fields");
+    return r;
+  }
+  if (groups > EF_CHECK_MAX_GROUPS || (groups != 0 && (activity < heap_start || static_cast<u64>(activity) + groups * EF_GROUP_STRIDE > heap_end)))
+  {
+    w.Fail("EffectSystem", EF_SYSTEM_ADDR, activity,
+           Format("%u activity groups at 0x%08X (expected <= %u, inside the ef heap)", groups, activity, EF_CHECK_MAX_GROUPS));
+    return r;
+  }
+
+  const auto visit_particle = [&r](u32) {
+    ++r.objects[3];
+    return true;
+  };
+  std::function<bool(u32)> visit_pm = [&](u32 pm) {
+    ++r.objects[2];
+    return w.Walk(Format("particles@pm=0x%08X", pm), pm + 0x38, EF_LIST_OFFSET, visit_particle) &&
+           w.Walk(Format("particles_closing@pm=0x%08X", pm), pm + 0x44, EF_LIST_OFFSET, visit_particle);
+  };
+  std::function<bool(u32)> visit_emitter = [&](u32 emitter) {
+    ++r.objects[1];
+    return w.Walk(Format("pms@emitter=0x%08X", emitter), emitter + 0xC0, EF_LIST_OFFSET, visit_pm) &&
+           w.Walk(Format("pms_closing@emitter=0x%08X", emitter), emitter + 0xCC, EF_LIST_OFFSET, visit_pm);
+  };
+  std::function<bool(u32)> visit_effect = [&](u32 effect) {
+    ++r.objects[0];
+    return w.Walk(Format("emitters@effect=0x%08X", effect), effect + 0x24, EF_LIST_OFFSET, visit_emitter) &&
+           w.Walk(Format("emitters_closing@effect=0x%08X", effect), effect + 0x30, EF_LIST_OFFSET, visit_emitter);
+  };
+  for (u32 g = 0; g < groups; ++g)
+  {
+    const u32 list = activity + g * EF_GROUP_STRIDE;
+    if (!w.Walk(Format("effects[g%u]", g), list, EF_LIST_OFFSET, visit_effect) ||
+        !w.Walk(Format("effects_closing[g%u]", g), list + 0xC, EF_LIST_OFFSET, visit_effect))
+    {
+      return r;
+    }
+  }
+  // The four object pools: free list at pool + 4, in-use list at pool + 0x10, links at offset 0 (zz_80189b40_ & co: List_Init(.., 0)).
+  const auto nothing = [](u32) { return true; };
+  for (size_t i = 0; i < 4; ++i)
+  {
+    u32 pool_obj = 0;
+    if (!ReadWord(memory, mm + EF_MM_POOLS[i], &pool_obj) || pool_obj < heap_start || static_cast<u64>(pool_obj) + 0x24 > heap_end)
+    {
+      w.Fail(Format("pool[%s]", EF_KIND[i]), mm + EF_MM_POOLS[i], pool_obj, Format("the pool object 0x%08X is outside the ef heap", pool_obj));
+      return r;
+    }
+    if (!w.Walk(Format("pool_free[%s]", EF_KIND[i]), pool_obj + 4, 0, nothing) ||
+        !w.Walk(Format("pool_used[%s]", EF_KIND[i]), pool_obj + 0x10, 0, nothing))
+    {
+      return r;
+    }
+  }
+  return r;
+}
+
+namespace
+{
+// "head=0x.. tail=0x.. n=.. off=0x.." of the ut::List at addr, "?" when unreadable.
+std::string ListText(const GuestMemory& memory, u32 addr)
+{
+  u8 raw[12];
+  if (!memory.Read(addr, raw, sizeof(raw)))
+    return "?";
+  return Format("head=0x%08X tail=0x%08X n=%u off=0x%X", ReadBE32(raw), ReadBE32(raw + 4), (raw[8] << 8) | raw[9], (raw[10] << 8) | raw[11]);
+}
+}  // namespace
+
+std::vector<std::string> EfDumpLines(const GuestMemory& memory)
+{
+  std::vector<std::string> out;
+  u32 mm = 0;
+  if (!ReadWord(memory, EF_SYSTEM_ADDR, &mm))
+  {
+    out.push_back(Format("ef sys=0x%08X unreadable", EF_SYSTEM_ADDR));
+    return out;
+  }
+  if (mm == 0)
+  {
+    out.push_back(Format("ef sys=0x%08X mm=0x00000000 (effect system not set up)", EF_SYSTEM_ADDR));
+    return out;
+  }
+  u32 heap_start = 0;
+  u32 heap_end = 0;
+  u32 groups = 0;
+  u32 activity = 0;
+  std::array<u32, 4> counts{};
+  ReadWord(memory, mm + EF_MM_HEAP_START, &heap_start);
+  ReadWord(memory, mm + EF_MM_HEAP_END, &heap_end);
+  ReadWord(memory, EF_SYSTEM_ADDR + EF_SYS_GROUPS, &groups);
+  ReadWord(memory, EF_SYSTEM_ADDR + EF_SYS_ACTIVITY, &activity);
+  for (size_t i = 0; i < 4; ++i)
+    ReadWord(memory, mm + EF_MM_COUNTS[i], &counts[i]);
+  out.push_back(Format("ef sys=0x%08X mm=0x%08X heap=0x%08X-0x%08X pool_sizes effect=%u emitter=%u pm=%u particle=%u groups=%u activity=0x%08X",
+                       EF_SYSTEM_ADDR, mm, heap_start, heap_end, counts[0], counts[1], counts[2], counts[3], groups, activity));
+  if (groups <= EF_CHECK_MAX_GROUPS && activity != 0)
+  {
+    for (u32 g = 0; g < groups && g < 8; ++g)
+    {
+      const u32 list = activity + g * EF_GROUP_STRIDE;
+      out.push_back(Format("ef group%u effects %s | closing %s", g, ListText(memory, list).c_str(), ListText(memory, list + 0xC).c_str()));
+    }
+  }
+  for (size_t i = 0; i < 4; ++i)
+  {
+    u32 pool_obj = 0;
+    if (ReadWord(memory, mm + EF_MM_POOLS[i], &pool_obj) && pool_obj != 0)
+    {
+      out.push_back(Format("ef pool %s obj=0x%08X free %s | used %s", EF_KIND[i], pool_obj, ListText(memory, pool_obj + 4).c_str(),
+                           ListText(memory, pool_obj + 0x10).c_str()));
+    }
+  }
+  const EfCheckResult r = CheckEfLists(memory);
+  if (!r.ran)
+    out.push_back("ef check not run");
+  else if (r.ok)
+    out.push_back(Format("ef check ok lists=%u nodes=%u effects=%u emitters=%u pms=%u particles=%u", r.lists, r.nodes, r.objects[0], r.objects[1],
+                         r.objects[2], r.objects[3]));
+  else
+    out.push_back(Format("ef check BAD list=%s list_addr=0x%08X node=0x%08X %s (lists=%u nodes=%u)", r.list.c_str(), r.list_addr, r.node,
+                         r.why.c_str(), r.lists, r.nodes));
+  return out;
 }
 
 // ---- (5) Dolphin glue ---------------------------------------------------------------------------------------------------
@@ -3222,6 +3790,20 @@ void Initialize(Module& module, Core::System& system)
   }
   options.invalidate_code = GetEnv("REV3_SYNCTEST_ICACHE") != "0";
   options.restore_timebase = GetEnv("REV3_SYNCTEST_TB") == "1";
+  options.ef_pool = GetEnv("REV3_EF_POOL") != "0";
+  // REV3_EFCHECK: unset = the first 200 restores, 0 = off, all = every restore, N = the first N restores.
+  const std::string efcheck = GetEnv("REV3_EFCHECK");
+  if (!efcheck.empty())
+  {
+    std::string lower = efcheck;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (lower == "all")
+      options.ef_check_restores = EF_CHECK_ALL;
+    else if (ParseInt(efcheck, &value) && value >= 0 && value < 1000000000)
+      options.ef_check_restores = static_cast<u32>(value);
+    else
+      ERROR_LOG_FMT(SLIPPI, "Rev3 SyncTest: ignoring REV3_EFCHECK={} (a number, 0 or all)", efcheck);
+  }
   const bool hardware_exclude = GetEnv("REV3_SYNCTEST_HW_EXCLUDE") != "0";
 
   std::string log_path;
@@ -3283,6 +3865,27 @@ void Initialize(Module& module, Core::System& system)
     }
   }
 
+  // REV3_SNAPSHOT_INCLUDE: regions forced into the snapshot at arm (same entries as the exclude file). Same failure policy as the exclude file.
+  std::vector<Range> include_ranges;
+  std::vector<PtrExclusion> include_ptrs;
+  const std::string include_path = GetEnv("REV3_SNAPSHOT_INCLUDE");
+  if (!include_path.empty())
+  {
+    std::string include_text;
+    if (!ReadTextFile(include_path, &include_text))
+      error = "cannot read REV3_SNAPSHOT_INCLUDE " + include_path;
+    else
+      LoadInclusions(include_text, *module.sink, &include_ranges, &include_ptrs, &error);
+    if (!error.empty())
+    {
+      const std::string message = "Rev3 SyncTest: include file unusable (" + error + "); SyncTest is off";
+      module.sink->Line("ERROR " + message);
+      ERROR_LOG_FMT(SLIPPI, "{}", message);
+      module.sink->Osd(message);
+      return;
+    }
+  }
+
   if (hook_bytes != 0)
   {
     module.sink->Line(Format("NOTE removed %llu bytes of the hook region 0x%08X-0x%08X from the whitelist",
@@ -3293,6 +3896,7 @@ void Initialize(Module& module, Core::System& system)
   module.synctest = std::make_unique<SyncTest>(options, std::move(ranges), *module.memory, *module.sink, std::function<u64()>(),
                                                module.hardware.get());
   module.synctest->SetUserExclusions(std::move(user_exclusions), std::move(ptr_exclusions));
+  module.synctest->SetUserInclusions(std::move(include_ranges), std::move(include_ptrs));
   if (options.restore_timebase)
   {
     module.sink->Line("NOTE timebase accessor: read SystemTimers::GetFakeTimeBase(); write CoreTiming::SetFakeTBStartValue(start + (value - now)) "

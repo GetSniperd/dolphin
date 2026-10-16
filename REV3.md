@@ -75,6 +75,9 @@ Run (set the variables before starting Slippi_Dolphin.exe; the patched game with
 | `REV3_SYNCTEST_AUDIO_HW=0` | do not rewind the emulated audio hardware (DSP, AI, their CoreTiming events, the PI DSP / AI interrupt bits) together with memory; default 1 = rewind it (see "Audio hardware rewind") |
 | `REV3_SYNCTEST_TB=1` | also store the emulated time base in every snapshot and set it back on restore (default 0, see "Time base" below) |
 | `REV3_SYNCTEST_EXCLUDE=path` | optional JSON `{"ranges":[{"start","end"}]}` (same format as the whitelist) subtracted from the snapshot after the whitelist is loaded; each range is logged as `NOTE exclude user 0x..-0x.. (n bytes were in the whitelist)`. Use it to test excluding audio / scratch ranges without editing the whitelist. A bad file or one that removes everything (classic mode only) turns SyncTest off with an error. Entries may be pointer based, `{"ptr":"0x8049D000","size":"0x3F0000","note":"nw4r sound system"}`: the u32 at `ptr` is read when SyncTest arms and at every exclusion re-check (every 600 hook calls) and `[value, value+size)` is excluded (for heaps the game allocates at run time: sound system work block `*0x8049D000` 0x3F0000 bytes, Home Button sound block `*0x80461B50` 0x18700 bytes). Logged as `NOTE exclude ptr entry 0x.. size=.. note=..` once, then `NOTE exclude ptr 0x8049D000 -> 0xS-0xE (n bytes were in the whitelist)` per resolved region (a region that moves adds a cut, the old one stays) or `NOTE exclude ptr 0x.. skipped: pointer is 0 | pointer is outside MEM1 / MEM2 (value 0x..)` once per value |
+| `REV3_EF_POOL=0` | do not force the nw4r::ef effect pool into the snapshot at arm (default 1, see "Effect pool" below) |
+| `REV3_SNAPSHOT_INCLUDE=path` | optional JSON, the very entry formats of `REV3_SYNCTEST_EXCLUDE` (`{"start","end"}` ranges, `{"ptr","size","note"}` pointer entries): these regions are forced INTO the snapshot set at every arm, on top of the learned pages (and of the ef pool). Logged `NOTE include user 0x..-0x.. (n bytes ...)`, `NOTE include ptr entry ..` at start and `NOTE include ptr 0x.. -> 0xS-0xE (n bytes) note=..` / `NOTE include ptr 0x.. skipped: pointer is 0 \| outside MEM1 / MEM2` at arm, then `NOTE forced include: ranges=.. bytes=..; the snapshot set grows by n bytes`. The cuts (hook region, `REV3_SYNCTEST_EXCLUDE`, hardware regions) still win. A bad file turns SyncTest off with an error (like the exclude file). Use it to test a suspicion without rebuilding |
+| `REV3_EFCHECK=N\|all\|0` | the ef list check around restores (see "Effect pool"): unset = the first 200 restores, `N` = the first N, `all` = every restore, `0` = off |
 | `REV3_SYNCTEST_LOG=path` | log file (default `<User>\Logs\rev3_synctest.log`), appended, flushed per line |
 
 Hardware regions (computed from Dolphin's emulated hardware when SyncTest arms and re-checked every 600 hook calls; the set
@@ -202,6 +205,80 @@ A clean run: a fight of a few thousand frames ends with `mismatching_frames=0`, 
 lines, and a restore time of a few hundred microseconds. The state machine is separate from Dolphin (`Rev3::SyncTest` talks to a
 `GuestMemory` / `Sink` interface); `Source/UnitTests/Core/Rev3RollbackTest.cpp` drives it with a fake game (target `tests`,
 filter `Rev3*`).
+
+## Effect pool (`REV3_EF_POOL`, `REV3_SNAPSHOT_INCLUDE`, `REV3_EFCHECK`)
+
+Why: the first netplay run (K = 5) rolled back once (3959 -> 3954) and never sent another hook command. The freeze dump showed the main
+thread RUNNING (state 2, not blocked) at pc `0x801B72D8`, the same sp 2 s and 12 s later, inside `nw4r::ef::ParticleManager::Calc`
+(`0x801B5E50`, 5444 bytes; called from `Emitter::CalcParticle` `0x801ABD5C` <- `Effect::Calc` `0x801A93BC`): an endless walk of a
+particle list. The earlier SyncTest freezes after 40-60 rollbacks (hit sparks) are very probably the same thing.
+
+What the decomp says (addresses of the RNEEDA build, all in the comments of `Rev3Rollback.h`):
+
+- `Calc` walks the particle manager's list with `node = *(node + offset + 4)` (the `ut::List` at pm + 0x38, offset = the u16 at pm + 0x42 =
+  0x14) until it reads 0 (loop head `LAB_801b72dc`, next to the frozen pc). A list that is cyclic or runs into stale memory never ends.
+- The objects live in object pools carved out of ONE block, allocated once at start-up by `zz_80186fd8_` (`0x80186fd8`): `block =
+  zz_80170620_(size + 0xC60)` (global `0x8049CFB0`), the `MemoryManager` (0x3C bytes, nw4r `memorymanagertmp.h`) is constructed at the START
+  of the block (`zz_801895d8_` `0x801895d8`), its free-list heap is `[block + 0x40, block + 0x40 + size)` (`mm + 0x24` / `mm + 0x28`), and
+  Effect[n] (0xA0 bytes), Emitter[n] (0x154), ParticleManager[256] (0xBC) and Particle[2500] (0xE4) with their 0x24-byte `ObjectPool` objects
+  (free list at +4, in-use list at +0x10, links at offset 0) are allocated out of that heap through the manager's vtable slot +0x60. So
+  every ef object, every list head and every link is in `[mm, mm + 0x40 + size)`. The game's handle table (`0x8049CFC4`, 0x101 words) sits
+  right behind the heap, inside the same allocation, and two small fixed pools (globals `0x8049CFBC` / `0x8049CFC0`) hold the handle nodes.
+  The pool sizes are not constants of the emulator: the element counts of Effect / Emitter are arguments the decomp does not show, so the
+  extent is read at run time.
+- `EffectSystem::GetInstance` (`0x801A9C18`) returns the static `0x803D9588`: word 0 = the manager pointer (`zz_80189590_` stores it and calls
+  `EffectSystem::Initialize` `0x801A9C24`), the `CreationQueue` is inside it (+0x10), `+0xC014` = the number of activity groups (the init code passes 3),
+  `+0xC018` = `ActivityList[group]` (0x1C bytes: active effects at +0, closing at +0xC, both offset 0x14). Effect: emitters at +0x24 /
+  +0x30; Emitter: particle managers at +0xC0 / +0xCC; ParticleManager: particles at +0x38 / +0x44.
+
+Hypothesis behind the fix: the page tracker adds a page only after it saw the page change, up to one scan cycle (16 calls = 16 frames at the
+default) later. A particle allocated into a never-touched page of the pool inside the rolled-back window is therefore NOT in the snapshot
+while the list heads (in an old, dynamic page) are: the restore rewinds the heads to "this particle is free" but leaves the particle's
+links as the first run set them, and the lists run into stale nodes (`pool_free` loops, `prev` links that point nowhere). The unit test
+`WithoutThePoolARollbackLeavesBrokenEfListsAndEfCheckSaysWhere` reproduces exactly that on a synthetic image.
+
+The fix, at every arm (SyncTest) and every arm of a netplay stretch (`NetPrepareArm`):
+
+- `FindEfPool` reads the singleton and computes the page-aligned ranges that hold all ef objects: the allocation `[mm, mHeapEnd + 0xC20)`
+  (clipped to the region), the singleton itself (`0x803D9588`, 0xC070 bytes) and, when they validate, the handle table and the two handle
+  pools. Log: `NOTE ef pool 0xS-0xE bytes=N` (the allocation), `NOTE ef pool total bytes=T ranges=R mm=.. heap=.. effects=.. emitters=..
+  particle_managers=.. particles=..`, `NOTE ef pool extras: instance=.. handle_table=.. handle_pool0=.. handle_pool1=..`,
+  `NOTE forced include: ranges=.. bytes=..; the snapshot set grows by n bytes (a -> b, before the hardware cuts)` (only what the page tracker
+  did not already have counts as growth); or `NOTE ef pool not found: <why>` (manager pointer 0 = effect system not set up yet, misaligned
+  pointer, implausible heap) and nothing is forced; `NOTE ef pool off (REV3_EF_POOL=0)`.
+- The cost is the size of the pool per snapshot slot and per restore: at least 0.62 MB (2500 particles x 0xE4 + 256 particle managers x 0xBC)
+  plus the Effect / Emitter pools, so roughly 0.7-1.1 MB (the log line has the exact figure; the part the game touches is already in the
+  set, `the snapshot set grows by` says how much is new). Copying 1 MB is about 0.1-0.2 ms.
+- `REV3_SNAPSHOT_INCLUDE` forces more regions in the same way (above).
+
+The check (`CheckEfLists`, `REV3_EFCHECK`): around the first N restores the walker follows the lists from the singleton (activity groups ->
+effects -> emitters -> particle managers -> particles, plus the free / in-use list of each of the four pools) and verifies for every list:
+head, tail and count agree about emptiness, every node is a 4-byte aligned pointer inside the ef heap, every `prev` link matches, the walk ends
+at the tail after exactly `count` nodes, and it ends within 10000 nodes per list (40000 in all). Lines:
+
+- `EFCHECK ok after restore n -> m lists=16 nodes=.. effects=.. emitters=.. pms=.. particles=.. us=..` (the first 3 good results)
+- `EFCHECK bad after restore n -> m: <list> node=0x.. list=0x.. <why> page=0x.. in_snapshot=0|1 dynamic=0|1 lists=.. nodes=..` and the same
+  with `before restore`: the state the game left just before the write-back (a bad `before` means the first run itself had broken the lists,
+  a bad `after` with a good `before` is the restore's doing). `<list>` names the list (`particles@pm=0x..`, `pool_free[particle]`,
+  `effects[g0]`, ...), `in_snapshot` says whether the node's page is inside the snapshot ranges, `dynamic` whether the tracker had seen it
+  change. The first 20 failures are logged, the rest counted. The pool lists were derived from the pool init code only; if a
+  `pool_free` / `pool_used` line is the only complaint on a game that runs fine, the pool code uses them differently than assumed.
+- SUMMARY lines end with `ef_checks=.. ef_bad=.. ef_bad_before=.. layout_refused=.. late_learn_rollbacks=..`.
+- The freeze dump has `DUMP <reason> ef ...` lines: `ef sys=0x803D9588 mm=.. heap=.. pool_sizes effect=.. emitter=.. pm=.. particle=.. groups=..
+  activity=..`, `ef group<g> effects head= tail= n= off= | closing ...`, `ef pool <kind> obj=.. free ... | used ...` and `ef check ok ...` or `ef check
+  BAD list=.. list_addr=.. node=.. <why>`. In a frozen `Calc` the BAD line names the particle manager whose list loops.
+
+Layout changes while armed (`LearnWhileArmed`, hardware cuts, exclusions): every one goes through `RebuildLayout`, which invalidates every
+snapshot slot, and `ClearHistory`, which restarts the history, so no rollback happens until K new frames are captured under the new layout
+(test `LearningAPageWhileArmedBlocksRollbacksToOlderSnapshots`). As a guard, a slot also carries the layout generation it was captured
+under and `Restore` refuses (and counts `layout_refused`) a slot of another generation; that count must stay 0. What a layout change does
+NOT cover is the other direction: a page noticed late. Rollbacks that ran during the up to one scan cycle between the first change of a page
+and its discovery did not rewind that page. `NOTE learned +n pages (...); new=[0xS-0xE,..]` now lists the new pages and adds `WARNING a
+rollback ran within the last scan cycle without these pages` (counted in `late_learn_rollbacks`) when that happened. Any such line in a
+netplay run names a region that should be added to `REV3_SNAPSHOT_INCLUDE` (or to the code, like the ef pool).
+
+Tests: `Rev3Rollback.EfPool*`, `InclusionFile*`, `EfCheck*`, `EfDump*`, `FreezeDumpCarriesTheEfLines`, `ArmForcesTheEfPool*`, `WithoutThePool*`,
+`WithThePoolForced*`, `UserInclusionsAreForced*`, `LearningAPageWhileArmed*` (a synthetic ef image with the same offsets).
 
 ## Freeze dump (`REV3_SYNCTEST_DUMP`, default on)
 
