@@ -435,6 +435,9 @@ void CoreTimingManager::SleepUntil(TimePoint time_point)
 
 void CoreTimingManager::Throttle(const s64 target_cycle)
 {
+  if (m_resim_active)
+    return;  // a hidden resimulation: the schedule is left alone and put back by EndResim()
+
   const TimePoint time = Clock::now();
 
   const bool already_throttled =
@@ -491,6 +494,24 @@ void CoreTimingManager::SleepAndResetThrottle(DT delay)
   if (delay > DT::zero())
     SleepUntil(Clock::now() + delay);
   ResetThrottle(static_cast<s64>(GetTicks()));
+}
+
+void CoreTimingManager::BeginResim()
+{
+  if (m_resim_active)
+    return;
+  m_resim_active = true;
+  m_resim_begin_cycle = static_cast<s64>(GetTicks());
+}
+
+void CoreTimingManager::EndResim()
+{
+  if (!m_resim_active)
+    return;
+  m_resim_active = false;
+  // The emulated time of the re-run frames does not count as schedule time: the next Throttle() aims at the same host time as it would have
+  // without the rollback.
+  m_throttle_reference_cycle += static_cast<s64>(GetTicks()) - m_resim_begin_cycle;
 }
 
 void CoreTimingManager::UpdateSpeedLimit(s64 cycle, double new_speed)

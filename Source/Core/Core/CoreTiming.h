@@ -108,6 +108,15 @@ public:
   // forgets that lag, so the delay stays. The emulated clock is untouched: the game state cannot differ because of this.
   void SleepAndResetThrottle(DT delay);
 
+  // Rev3 netplay, hidden resimulation (Core::SetIsThrottlerResimDisabled; CPU thread only). While it lasts Throttle() neither sleeps nor touches
+  // its reference, and EndResim() moves the reference cycle forward by the emulated time the re-run frames took. The schedule of the match
+  // (reference time + cycles / clock) is then exactly what it would have been without the rollback: a machine that rolled back pays for the
+  // re-run out of the following frames (it runs them without sleeping until it is back on its schedule, like after any stall) instead of
+  // restarting its clock and ending up later by the cost of every rollback for the rest of the match, which is what made the machine that
+  // rolls back often fall behind a peer that never does (D's loopback: 120 rollbacks of ~7 ms = ~2 % of the speed, host pinned at the stall limit).
+  void BeginResim();
+  void EndResim();
+
   void RefreshConfig();
 
   void DoState(PointerWrap& p);
@@ -229,6 +238,8 @@ private:
   bool IsSpeedUnlimited() const;
   void UpdateSpeedLimit(s64 cycle, double new_speed);
   void ResetThrottle(s64 cycle);
+  bool m_resim_active = false;  // BeginResim .. EndResim
+  s64 m_resim_begin_cycle = 0;  // GetTicks() at BeginResim
   TimePoint CalculateTargetHostTimeInternal(s64 target_cycle);
   void UpdateVISkip(TimePoint current_time, TimePoint target_time);
 

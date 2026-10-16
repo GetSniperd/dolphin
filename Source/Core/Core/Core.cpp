@@ -143,7 +143,15 @@ bool GetIsThrottlerTempDisabled()
 // Rev3 netplay (M4): a flag of its own, because the hotkey scheduler rewrites s_is_throttler_temp_disabled every loop.
 void SetIsThrottlerResimDisabled(bool disable)
 {
+  if (disable == s_is_throttler_resim_disabled)
+    return;
   s_is_throttler_resim_disabled = disable;
+  // M5: the throttle's schedule survives the resimulation (CoreTimingManager::BeginResim / EndResim). CPU thread only (the Rev3 hook).
+  CoreTiming::CoreTimingManager& timing = Core::System::GetInstance().GetCoreTiming();
+  if (disable)
+    timing.BeginResim();
+  else
+    timing.EndResim();
 }
 
 void SetIsThrottlerTempDisabled(bool disable)
