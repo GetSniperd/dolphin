@@ -1646,7 +1646,9 @@ public:
       if (IOS::HLE::EmulationKernel* ios = m_system.GetIOS(); ios != nullptr)
       {
         const std::shared_ptr<IOS::HLE::Device> device = ios->GetDeviceByName("/dev/di");
-        const auto* di = dynamic_cast<const IOS::HLE::DIDevice*>(device.get());
+        // "/dev/di" is always the DIDevice (IOS.cpp AddDevice); Dolphin builds with /GR- (no RTTI), so static_cast as
+        // Boot_BS2Emu.cpp and DI.cpp do
+        const auto* di = static_cast<const IOS::HLE::DIDevice*>(device.get());
         if (di != nullptr && di->IsBusy())
           return true;
       }
