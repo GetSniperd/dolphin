@@ -43,6 +43,10 @@
 //   REV3_EF_POOL=0           do not force the nw4r::ef (effect / particle) pool into the snapshot at arm (default 1, see "THE EFFECT POOL")
 //   REV3_SNAPSHOT_INCLUDE=path   JSON, same entries as REV3_SYNCTEST_EXCLUDE ({"start","end"} or {"ptr","size"}): always in the snapshot
 //   REV3_EFCHECK=N|all|0     list consistency check of the effect system after the first N restores (default 200; all = every restore)
+//   REV3_RB_VERIFY=N|all     restore verify (off by default): keep full shadow copies of guest memory (88 MB each) and after N restores compare ALL
+//                            memory with the shadow of the frame restored to, in 32-byte blocks; the blocks that differ are pages the snapshot set
+//                            misses (see "restore verify" below, REV3.md "Restore verify"). Also REV3_RB_VERIFY_EVERY / _SLOTS / _HEAL / _STACK_BELOW /
+//                            _IGNORE (ParseVerifyEnv)
 //   SyncTest only runs once armed (both fighters found through the TEAMS pointers); menus and loading screens are never
 //   rolled back. See REV3.md for what a clean run looks like.
 //
@@ -104,6 +108,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -507,6 +512,156 @@ private:
   std::atomic<bool> m_seen{false};  // a command arrived at least once
 };
 
+// ---- restore verify (REV3_RB_VERIFY) ------------------------------------------------------------------------------------------
+// "Is guest memory after a restore really what it was when the snapshot was taken?" The snapshot set only rewinds the pages it knows;
+// a page outside the set that the game wrote in the rolled-back frames keeps its new contents (a hit-spark particle in a page the
+// adaptive tracker had not found yet made the effect lists circular and froze the game). The verifier keeps a SHADOW: a full copy of
+// guest MEM1 + MEM2 taken at the same moment as the snapshot of a frame, and after a restore to that frame compares ALL guest memory
+// with it in 32-byte blocks. A block that differs is "wrong": either a page the set misses (outside_set, the useful finding) or memory
+// the restore failed to rewind / something wrote behind it (in_set, a bug or a host thread).
+// Cost: a shadow is 24 + 64 MB (88 MB) per kept frame and taking one is a memcpy of that (about 8-15 ms); a check reads both copies
+// again (about 5-10 ms). So shadows are taken only for every `every`-th frame and only `slots` of them are kept (a rotating ring,
+// slot = (frame / every) % slots); a restore is verified only when it lands on a frame that still has its shadow. After `restores`
+// verified restores shadows stop being taken (the cost disappears). Off by default (restores = 0): no memory, no copies.
+constexpr u32 VERIFY_ALL = 0xFFFFFFFFu;        // VerifyOptions::restores: never stop
+constexpr u32 VERIFY_BLOCK_BYTES = 32;         // granularity of the comparison and of the counts (HowlingWind reports 32-byte blocks too)
+constexpr u32 VERIFY_REGION_BYTES = 0x10000;   // 64 KB regions of the per-region counts
+constexpr u32 VERIFY_FIRST_WORDS = 8;          // words of the first wrong block that are printed (one block = 8 words)
+constexpr u32 VERIFY_MAX_REGIONS_LISTED = 16;  // regions named in one VERIFY line
+constexpr u32 VERIFY_MAX_PAGE_RANGES_LISTED = 16;
+constexpr u32 VERIFY_MAX_WRONG_LOGS = 30;      // restores with wrong blocks that get the full VERIFY lines; the rest only count
+constexpr u32 VERIFY_MAX_OK_LOGS = 3;          // clean restores that get a line ("VERIFY restore n -> m ok ...")
+
+struct VerifyOptions
+{
+  u32 restores = 0;      // REV3_RB_VERIFY=N: verify the first N restores that land on a shadowed frame (count); VERIFY_ALL = all; 0 = off
+  u32 every = 0;         // REV3_RB_VERIFY_EVERY=P: take a shadow when frame % P == 0 (frames); 0 = automatic (the owner picks, SyncTest: K + 1)
+  u32 slots = 1;         // REV3_RB_VERIFY_SLOTS=S: shadows kept (1..8), 88 MB each (MEM1 + MEM2)
+  bool heal = false;     // REV3_RB_VERIFY_HEAL=1: copy the shadow's bytes back over wrong blocks and add their pages to the set (next layout)
+  u32 stack_below = 0x4000;  // REV3_RB_VERIFY_STACK_BELOW: bytes below the hook's sp that are dead stack and never compared (bytes), used when
+                             // the running thread's stack end cannot be read from the OSThread
+};
+
+// What to compare after one restore.
+struct VerifyInput
+{
+  u32 from_frame = 0;                  // the frame the restore was asked at (log only)
+  u32 to_frame = 0;                    // the frame restored: its shadow is compared
+  std::vector<Range> skip;             // memory nobody rewinds on purpose (hook region, hardware cuts, user exclusions, dead stack)
+  std::vector<Range> in_set;           // the memory the restore rewrote (snapshot ranges + the stack window)
+};
+
+struct VerifyRegionCount
+{
+  u32 base = 0;     // start of the 64 KB region
+  u32 blocks = 0;   // wrong 32-byte blocks inside it
+  u32 pages = 0;    // wrong 4 KB pages inside it
+};
+
+struct VerifyResult
+{
+  bool checked = false;           // a shadow of to_frame existed and was compared
+  u32 wrong_blocks = 0;           // 32-byte blocks that differ
+  u32 wrong_pages = 0;            // 4 KB pages holding at least one
+  u32 in_set_blocks = 0;          // ... of which inside the memory the restore rewrote (restore bug or a host thread writing)
+  u32 outside_set_blocks = 0;     // ... of which outside it (pages the set is missing)
+  u64 compared_bytes = 0;
+  u64 skipped_bytes = 0;          // bytes not compared (skip ranges, memory that is not there)
+  u32 first_addr = 0;             // the first wrong block (lowest address); first_snapshot / first_memory = its 8 words
+  std::array<u32, VERIFY_FIRST_WORDS> first_snapshot{};
+  std::array<u32, VERIFY_FIRST_WORDS> first_memory{};
+  bool has_first_in_set = false;  // the first wrong block that lies in the rewritten memory, if any
+  u32 first_in_set_addr = 0;
+  std::array<u32, VERIFY_FIRST_WORDS> first_in_set_snapshot{};
+  std::array<u32, VERIFY_FIRST_WORDS> first_in_set_memory{};
+  std::vector<VerifyRegionCount> regions;  // 64 KB regions with wrong blocks, ascending
+  std::vector<Range> outside_pages;        // 4 KB pages with wrong blocks outside the rewritten memory, merged
+  std::vector<Range> healed_pages;         // pages whose wrong blocks were overwritten with the shadow (heal), merged
+  u32 healed_blocks = 0;
+  u64 us = 0;                     // time of the comparison (and the heal)
+};
+
+class RestoreVerifier
+{
+public:
+  // `micros` is a monotonic clock in microseconds (default: steady_clock). Allocates nothing until the first shadow is taken.
+  RestoreVerifier(const VerifyOptions& options, GuestMemory& memory, Sink& sink, std::function<u64()> micros = {});
+
+  // True while shadows are still wanted: enabled and the budget of verified restores is not used up.
+  bool Active() const { return m_options.restores != 0 && (m_options.restores == VERIFY_ALL || m_checked < m_options.restores); }
+  // True when `frame` should get a shadow now (Active and frame % every == 0).
+  bool WantsShadow(u32 frame) const { return Active() && m_options.every != 0 && frame % m_options.every == 0; }
+  // Copies all of guest MEM1 + MEM2 (the parts that exist) into the shadow slot of `frame`. False: a read failed (nothing is kept).
+  bool TakeShadow(u32 frame);
+  bool HasShadow(u32 frame) const;
+  void DropShadows();  // forget every shadow (the memory stays allocated)
+
+  // Compares all guest memory with the shadow of in.to_frame, 32-byte blocks, minus in.skip. With options.heal also copies the shadow's
+  // bytes back over every wrong block (and reports their pages in healed_pages). result.checked is false when there is no shadow.
+  // Counts the restore as verified (budget) and updates the totals below. Does not log (SyncTest formats the lines).
+  VerifyResult Check(const VerifyInput& in);
+
+  const VerifyOptions& Options() const { return m_options; }
+  // Totals over all checks.
+  u32 Checked() const { return m_checked; }                    // restores verified
+  u32 Wrong() const { return m_wrong; }                        // ... that left at least one wrong block
+  u64 WrongBlocksTotal() const { return m_blocks_total; }      // wrong blocks summed over the restores
+  u64 InSetBlocksTotal() const { return m_in_set_total; }
+  u64 OutsideSetBlocksTotal() const { return m_outside_total; }
+  u64 DistinctBlocks() const { return m_distinct_blocks; }     // different 32-byte blocks that were ever wrong
+  u64 DistinctPages() const { return m_distinct_pages; }       // different 4 KB pages that were ever wrong
+  u32 FirstWrongFrom() const { return m_first_wrong_from; }    // the first restore that left memory wrong: asked at this frame ...
+  u32 FirstWrongTo() const { return m_first_wrong_to; }        // ... back to this one ...
+  u32 FirstWrongBlocks() const { return m_first_wrong_blocks; }  // ... with this many wrong blocks (0: none so far)
+  u32 Shadows() const { return m_shadows; }                    // shadows taken
+  u64 ShadowUs() const { return m_shadow_us + m_check_us; }    // time spent copying shadows and comparing (microseconds)
+  size_t ShadowBytes() const;                                  // bytes held by the shadow slots now
+
+private:
+  struct Shadow
+  {
+    bool valid = false;
+    u32 frame = 0;
+    std::array<std::vector<u8>, 2> data;  // MEM1, MEM2
+  };
+  Shadow& SlotFor(u32 frame) { return m_slots[(frame / m_options.every) % m_slots.size()]; }
+  const Shadow& SlotFor(u32 frame) const { return m_slots[(frame / m_options.every) % m_slots.size()]; }
+  void Probe();
+  const u8* View(u32 addr, size_t n);  // host pointer to guest memory (Peek, or a copy in m_buf)
+
+  VerifyOptions m_options;
+  GuestMemory& m_memory;
+  Sink& m_sink;
+  std::function<u64()> m_micros;
+  std::vector<Shadow> m_slots;
+  std::array<bool, 2> m_present{};  // MEM1 / MEM2 readable (probed once)
+  bool m_probed = false;
+  bool m_error_logged = false;
+  std::vector<u8> m_buf;
+  std::vector<u64> m_seen_blocks;   // bitmap of 32-byte blocks that were ever wrong (MEM1 then MEM2)
+  std::vector<u64> m_seen_pages;    // bitmap of 4 KB pages that were ever wrong
+  u32 m_checked = 0;
+  u32 m_wrong = 0;
+  u64 m_blocks_total = 0;
+  u64 m_in_set_total = 0;
+  u64 m_outside_total = 0;
+  u64 m_distinct_blocks = 0;
+  u64 m_distinct_pages = 0;
+  u32 m_first_wrong_from = 0;
+  u32 m_first_wrong_to = 0;
+  u32 m_first_wrong_blocks = 0;
+  u32 m_shadows = 0;
+  u64 m_shadow_us = 0;
+  u64 m_check_us = 0;
+};
+
+// "gcd(a, b) divides k" test used to pick shadow frames that a SyncTest (roll back K frames every EVERY-th frame) restores to: a restore at
+// frame n goes to n - K, so shadows at frame % P == 0 are hit only when some multiple of P is congruent to -K modulo EVERY.
+bool VerifyEveryCanHit(u32 every_p, u32 k, u32 sync_every);
+// The smallest P >= K + 1 for which VerifyEveryCanHit holds (K + 1 keeps one shadow alive until its restore: the next shadow is taken K + 1
+// frames later).
+u32 AutoVerifyEvery(u32 k, u32 sync_every);
+
 // ---- SyncTest -------------------------------------------------------------------------------------------------------------
 struct SyncTestOptions
 {
@@ -529,6 +684,7 @@ struct SyncTestOptions
                                   // block spans pages that change one after the other. A page that never changes costs only copy time.
   u32 ef_check_restores = 200;    // REV3_EFCHECK: restores (count, not frames) that get the ef list check before / after the write-back;
                                   // 0 = off, EF_CHECK_ALL = every restore. 200 restores = 200 checks of a few thousand reads each (microseconds)
+  VerifyOptions verify;           // REV3_RB_VERIFY*: shadow copy of guest memory and a full comparison after restores (see "restore verify" above)
 };
 
 constexpr u32 EF_CHECK_ALL = 0xFFFFFFFFu;  // SyncTestOptions::ef_check_restores: check every restore
@@ -593,6 +749,7 @@ struct SyncTestStats
   u32 ef_bad_before = 0;          // checks before a restore that found a broken list (the game's own state was already bad)
   u32 layout_refused = 0;         // restores refused because the snapshot was taken under another snapshot layout
   u32 late_learn_rollbacks = 0;   // rollbacks done within one scan cycle before pages were learned (those pages were not rewound)
+  u32 verify_pages_added = 0;     // pages the restore verify (heal) added to the snapshot set
 };
 
 class SyncTest
@@ -624,6 +781,23 @@ public:
   // Optional: the freeze dump (REV3_SYNCTEST_DUMP). SyncTest dumps once when it arms, logs the RESTOREHW lines around the first
   // restores, and tells it about every command (frame, time, armed) for the stall watchdog. Not owned; null = off.
   void SetFreezeDump(FreezeDump* dump) { m_dump = dump; }
+
+  // Restore verify (options.verify, REV3_RB_VERIFY*; REV3.md "Restore verify"). Capture takes the shadows, Restore compares after the
+  // write-back, so both SyncTest and the netplay session (NetCapture / NetRestore call the same two functions) are covered.
+  // SetVerifyIgnore: memory the comparison never looks at (REV3_RB_VERIFY_IGNORE), on top of what the snapshot already cuts (hook region,
+  // user exclusions, hardware regions) and the dead stack below the hook's sp. Call before the first command.
+  void SetVerifyIgnore(std::vector<Range> ranges) { m_verify_ignore = MergeRanges(std::move(ranges)); }
+  const RestoreVerifier* Verifier() const { return m_verify.get(); }
+  // Heal found pages the set misses; they are part of ComputeRanges() already, but the layout (m_ranges) does not have them yet. SyncTest
+  // installs them by itself between a resimulation and the next frame; the netplay session installs them at its next arm (NetPrepareArm
+  // calls ComputeRanges()). The pages learned this way, merged, are VerifyExtraRanges().
+  bool VerifyPagesPending() const { return m_verify_dirty; }
+  // " restores_checked=.. restores_wrong=.. verify_blocks=.. first_wrong_frame=.. shadow_ms=.." (leading space), appended to the SUMMARY line;
+  // empty when verify is off. The netplay stats line appends it too.
+  std::string VerifyStatsFields() const;
+  // "VERIFY summary ..." (the end-of-run line); only call with verify on.
+  std::string VerifySummaryText() const;
+  const std::vector<Range>& VerifyExtraRanges() const { return m_verify_extra; }
 
   // Writes the final summary line (once). The destructor does not.
   void Finish();
@@ -708,6 +882,10 @@ private:
   // The ef list check around a restore (options.ef_check_restores): `when` = "before" / "after". Logs EFCHECK lines.
   void EfCheck(const char* when, u32 from, u32 to);
   void LearnWhileArmed(u32 added);
+  // Restore verify: compares all memory with the shadow of `to` after a write-back and logs / counts the result (see VerifyOptions).
+  void VerifyAfterRestore(const Slot& s, const Command& command, u32 to);
+  // Installs the pages the heal added (m_verify_extra) into the layout: new set, relayout, history cleared. SyncTest only, never mid-resim.
+  void ApplyVerifyPages();
   bool Arm(const Command& command, const std::array<u32, 2>& fighters);
   // "0xSTART-0xEND" of the current snapshot range that holds [addr, addr + 4); empty when none does.
   std::string RangeContaining(u32 addr) const;
@@ -722,6 +900,12 @@ private:
   std::vector<Range> m_include_fixed;           // REV3_SNAPSHOT_INCLUDE ranges
   std::vector<PtrExclusion> m_include_ptrs;     // REV3_SNAPSHOT_INCLUDE pointer entries (resolved at arm)
   std::vector<Range> m_forced;                  // resolved at the latest arm: ef pool + the user entries, merged
+  std::unique_ptr<RestoreVerifier> m_verify;    // null = restore verify off (options.verify.restores == 0)
+  std::vector<Range> m_verify_ignore;           // REV3_RB_VERIFY_IGNORE: never compared
+  std::vector<Range> m_verify_extra;            // pages the heal found missing: part of every ComputeRanges() from then on
+  bool m_verify_dirty = false;                  // m_verify_extra has pages the current layout (m_ranges) lacks
+  u32 m_verify_wrong_logs = 0;                  // VERIFY lines written for restores with wrong blocks (limit VERIFY_MAX_WRONG_LOGS)
+  u32 m_verify_ok_logs = 0;
   EfPool m_ef;
   bool m_ef_found = false;
   u32 m_ef_checks_done = 0;                     // restores that got the check (limit: options.ef_check_restores)
@@ -897,6 +1081,11 @@ private:
 // Called by CEXISlippi::DMAWrite when IsCommand(). `command` points at the DMA'd bytes (>= CMD_SIZE). Fills *read_queue with
 // the 64-byte reply (clearing it first). On the CPU thread.
 void HandleCommand(Core::System& system, const u8* command, size_t size, std::vector<u8>* read_queue);
+
+// Reads REV3_RB_VERIFY, REV3_RB_VERIFY_EVERY, REV3_RB_VERIFY_SLOTS, REV3_RB_VERIFY_HEAL, REV3_RB_VERIFY_STACK_BELOW into options->verify and
+// REV3_RB_VERIFY_IGNORE (a {"ranges":[..]} file) into *ignore; problems are logged to `sink` as ERROR lines and that variable stays at its
+// default. Shared by SyncTest and the netplay session's options code. Defined in the Dolphin glue (needs the environment and files).
+void ParseVerifyEnv(SyncTestOptions* options, std::vector<Range>* ignore, Sink& sink);
 
 // Writes the final summary and closes the log; the next command starts a fresh session. Safe to call any time.
 void Shutdown();

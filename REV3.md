@@ -316,6 +316,81 @@ shared options code and needs nothing; (e) the runner must hand `REV3_SNAPSHOT_I
 Tests: `Rev3Rollback.EfPool*`, `InclusionFile*`, `EfCheck*`, `EfDump*`, `FreezeDumpCarriesTheEfLines`, `ArmForcesTheEfPool*`, `WithoutThePool*`,
 `WithThePoolForced*`, `UserInclusionsAreForced*`, `LearningAPageWhileArmed*` (a synthetic ef image with the same offsets).
 
+## Restore verify (`REV3_RB_VERIFY`, off by default)
+
+Why: the adaptive snapshot set learns pages late, and a restore only rewinds the pages it knows. Two symptoms so far: 25 relayouts in a netplay
+match, and a hit-spark particle in a not-yet-learned page that made the restored lists circular (the freeze). The idea (borrowed from another
+project's "RESTORE MISS" mode; no code taken) is to ask the question directly: after a restore to frame f, is ALL of guest memory what it was
+when f was captured?
+
+How: a **shadow** is a full copy of guest MEM1 + MEM2 (24 + 64 MB = 88 MB) taken inside `SyncTest::Capture` at the same moment as the
+snapshot of a frame, for the frames that are a multiple of `every` only, in a ring of `slots` shadows (slot = (frame / every) % slots). After the
+write-back of `SyncTest::Restore` to frame f the verifier compares all guest memory with f's shadow, in 64 KB chunks first, then 4 KB pages, then
+32-byte blocks, and reports the blocks that differ. A restore is verified only when f still has its shadow, so with 1 slot and every = K + 1 one
+restore in K + 1 is checked. Both SyncTest and the netplay session use `Capture` / `Restore` (`NetCapture` / `NetRestore` call them), so the
+hooks are shared. Nothing is allocated and nothing is copied while `REV3_RB_VERIFY` is unset.
+
+Cost (unit: per shadow / per check, desktop core, measured only on the fake memory here, so treat as estimates): a shadow is a 88 MB memcpy
+(roughly 8-15 ms) and holds 88 MB; a check reads both copies again (5-10 ms). After N verified restores the shadows stop being taken. `shadow_ms`
+in the stats is the sum of both. This is a diagnosis mode, not for a match you want to play at full speed (a hitch of ~20 ms every K + 1 frames).
+
+What is not compared (the restore leaves it alone on purpose): the hook region 0x80002400-0x80002A00, the `REV3_SYNCTEST_EXCLUDE` ranges (including
+resolved pointer entries), every hardware cut (GX FIFO, XFB, audio DMA, DVD DMA; the set only grows), `REV3_RB_VERIFY_IGNORE`, and the **dead stack**:
+`[stack end, sp)` of the thread the hook runs on (OSThread `*0x800000E4`, stackBase +0x304, stackEnd +0x308; if that is not readable or does not hold sp,
+`sp - REV3_RB_VERIFY_STACK_BELOW` bytes). The hook's stack window `[sp, sp + REV3_STACK_WINDOW)` IS compared (the restore rewrote it).
+
+| variable | meaning |
+|---|---|
+| `REV3_RB_VERIFY=N\|all` | verify the first N restores that land on a shadowed frame (count); `all` = never stop; unset / 0 = off |
+| `REV3_RB_VERIFY_EVERY=P` | take a shadow when `frame % P == 0` (frames, 0..1000000). 0 / unset = automatic: SyncTest picks the smallest P >= K + 1 that can hit a restore target (`AutoVerifyEvery`; with EVERY>1 not every P can) |
+| `REV3_RB_VERIFY_SLOTS=S` | shadows kept, 1..8, default 1 (88 MB each). One slot is enough when P >= K + 1 (SyncTest); P = 1 with K = 2 needs 3 slots to verify every restore |
+| `REV3_RB_VERIFY_HEAL=1` | copy the shadow's bytes back over every wrong block (so the replay starts from the right state) and add the wrong pages that lie outside the set to the snapshot set (below) |
+| `REV3_RB_VERIFY_STACK_BELOW=bytes` | fallback size of the dead stack below the hook's sp, 0x100..0x400000, default 0x4000 |
+| `REV3_RB_VERIFY_IGNORE=path` | `{"ranges":[{"start","end"}]}` (the whitelist format): memory never compared (host-thread buffers that always differ, say) |
+
+Log lines (all in the Rev3 log):
+
+- `NOTE verify on: restores=.. every=.. slots=.. heal=.. stack_below=0x.. shadow_mb=88 per slot ...` at start; `NOTE verify: shadows at multiples of P never
+  match a restore target ...` when P cannot hit (no restore will be verified).
+- `VERIFY restore n -> m ok wrong_blocks=0 compared_mb=.. skipped_kb=.. us=..` (the first 3 clean restores).
+- `VERIFY first wrong restore: at frame n, back to frame m, k blocks of 32 bytes` once (and one on-screen message).
+- For the first 30 restores with wrong blocks: `VERIFY restore n -> m wrong_blocks=k pages=p in_set=a outside_set=b first=[0xADDR: snap w0 .. w7 | mem w0 .. w7]
+  compared_mb=.. skipped_kb=.. us=..` (`snap` = the shadow's 8 words of the first wrong 32-byte block, `mem` = what guest memory holds now),
+  `VERIFY restore n -> m first_in_set=[..]` (the first wrong block inside memory the restore rewrote, when it is not the first one),
+  `VERIFY restore n -> m regions64k=R [0xBASE:blocks b/pages p,..]` (64 KB regions with wrong blocks, at most 16 named) and
+  `VERIFY restore n -> m missing_pages=P [0xS-0xE,..]` (4 KB pages with wrong blocks that the snapshot set does not hold, merged; with heal `healed; added
+  to the snapshot set at the next layout` follows).
+- **How to read it**: `outside_set` blocks are pages the set is missing (what the tracker would learn late) or memory nobody can rewind (host-thread
+  writes, hardware buffers: add those to `REV3_RB_VERIFY_IGNORE` to see past them); `in_set` blocks (the line then ends `WARNING blocks inside the rewritten
+  memory differ`) mean the restore itself failed or something wrote behind it while it ran, which is a bug.
+- SUMMARY lines end with ` restores_checked=.. restores_wrong=.. verify_blocks=.. first_wrong_frame=.. shadow_ms=..`; at shutdown
+  `VERIFY summary restores_checked=.. restores_wrong=.. wrong_blocks=.. (in_set=.. outside_set=..) distinct_blocks=.. in distinct_pages=..
+  first_wrong_frame=.. first_wrong_back_to=.. first_wrong_blocks=.. shadows=.. shadow_mb_held=.. shadow_ms=.. heal=.. pages_added=..`.
+
+Heal: the wrong blocks are overwritten with the shadow's bytes (JIT invalidated for those pages, the page tracker's baseline for them reset), so the
+replay that follows starts from the true state of frame m. The pages among them that lie outside the snapshot set go into `m_verify_extra`, which is
+part of every `ComputeRanges()` from then on. SyncTest installs them on the first hook call after the resimulation (`ApplyVerifyPages`): relayout,
+history cleared, and a line in the learned-page format so `tools/rollback/learned_include.py` can consume it:
+`NOTE learned +n pages (now ranges=.. bytes=..) frame F, history cleared; new=[0xS-0xE,..] (restore verify heal)`; they also end up in
+`NOTE learned summary`. With the cuts winning as everywhere. Without heal nothing changes in the set; the `missing_pages=[..]` list is the finding.
+
+Tests: `Rev3Rollback.Verifier*`, `VerifyEvery*`, `RestoreVerify*` (exact block / page / region counts across MEM1 and MEM2, the Read fallback without Peek,
+skip ranges starting mid-block, slot rotation and the budget, the missing page named, heal giving a mismatch-free replay with an incomplete whitelist, a
+complete adaptive set verifying clean, a restore that drops writes reported as `in_set`, hardware cuts / ignore list / dead stack left out).
+
+What D runs (SyncTest; the environment is inherited by `phase3.bat`): `set REV3_RB_VERIFY=40` and `phase3.bat synctest --k 4` (play 2-3 minutes in a fight).
+Success: `restores_wrong=0` in the SUMMARY lines and `VERIFY summary ... restores_wrong=0`; otherwise the `VERIFY restore` lines name the pages. First try
+without heal to see everything the set misses; then `set REV3_RB_VERIFY_HEAL=1` plus `REV3_RB_VERIFY_EVERY=1` / `REV3_RB_VERIFY_SLOTS=5` (K + 1 slots: every restore verified
+and healed, 440 MB) to see whether the replay mismatches go away. Feed the `VERIFY ... missing_pages` / `NOTE learned` lines to `learned_include.py`.
+
+Merging into rev3-net (netplay path): the `Capture` / `Restore` hooks and `ComputeRanges` are shared, so a merge brings them along. Remaining there:
+(a) `ParseVerifyEnv(&options, &ignore, sink)` where the net options are read (it fills `options.verify`) and `SetVerifyIgnore(ignore)` on the SyncTest;
+(b) netplay restores land on arbitrary frames: set `REV3_RB_VERIFY_EVERY=1 REV3_RB_VERIFY_SLOTS=2` to verify depth-1 rollbacks (the shadow of f - 1 survives the
+capture of f; 176 MB, a copy per frame); the automatic P (K + 1 = MAXR + 2) rarely lands; (c) append `VerifyStatsFields()` to `NetStatsLine()` and write
+`VerifySummaryText()` in the net Finish when `Verifier() != nullptr`; (d) heal's pages are in `ComputeRanges()` already: `NetPrepareArm` installs them at the next
+arm (they show in the `NoteLearned(m_ranges, next)` line of the earlier merge note), and `NetObserve` may report `VerifyPagesPending()` like a pending learned
+page; (e) a heal while the session is resimulating writes guest memory behind the session: only use `REV3_RB_VERIFY_HEAL=1` in netplay for a diagnosis run.
+
 ## Freeze dump (`REV3_SYNCTEST_DUMP`, default on)
 
 Why: SyncTest replays gameplay exactly (`fields=0` on every resimulated frame) but the game freezes after about 40-60 rollbacks and the
