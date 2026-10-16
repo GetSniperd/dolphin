@@ -2,7 +2,8 @@
 // See Rev3Rollback.h for what it does, how to enable it (REV3_SYNCTEST ...) and where it fits in. Licensed under GPLv2+.
 //
 // Layout of this file: (1) wire codec, (2) whitelist parser, (3) the fighter field table, (4) Rev3::SyncTest (pure logic, only
-// GuestMemory / Sink / a clock), (5) Dolphin glue: env vars, log file, memory accessor, HandleCommand / Shutdown.
+// GuestMemory / Sink / a clock), (4b) determinism kit (fighter checksum, pad record / script, trace; pure logic too),
+// (5) Dolphin glue: env vars, log file, memory accessor, HandleCommand / Shutdown.
 // To change which fighter fields are compared, edit FIELDS (and FIELD_COUNT in the header) to match rev3-mod rbchecksum.py.
 
 #include "Core/Slippi/Rev3Rollback.h"
@@ -866,37 +867,7 @@ void SyncTest::Reset(const char* why)
 
 bool SyncTest::FindFighters(std::array<u32, 2>* addrs) const
 {
-  bool all = true;
-  for (u32 team = 0; team < 2; ++team)
-  {
-    (*addrs)[team] = 0;
-    u8 word[4];
-    if (!m_memory.Read(TEAMS_ADDR + 4 * team, word, 4))
-    {
-      all = false;
-      continue;
-    }
-    const u32 team_ptr = ReadBE32(word);
-    if (!PointerOk(team_ptr) || !m_memory.Read(team_ptr + 0x0C, word, 4))
-    {
-      all = false;
-      continue;
-    }
-    const u32 node = ReadBE32(word);
-    if (!PointerOk(node) || !m_memory.Read(node, word, 4))
-    {
-      all = false;
-      continue;
-    }
-    const u32 fighter = ReadBE32(word);
-    if (!PointerOk(fighter))
-    {
-      all = false;
-      continue;
-    }
-    (*addrs)[team] = fighter;
-  }
-  return all;
+  return FindFighterStructs(m_memory, addrs) == 2;
 }
 
 bool SyncTest::Capture(Slot& slot, const Command& command, const std::array<u32, 2>& fighters)
@@ -1611,6 +1582,322 @@ Reply SyncTest::OnCommand(const Command& command)
   return Normal(command, fighters);
 }
 
+// ---- (4b) determinism kit (milestone M1) -------------------------------------------------------------------------------------
+
+size_t FindFighterStructs(const GuestMemory& memory, std::array<u32, 2>* addrs)
+{
+  size_t found = 0;
+  for (u32 team = 0; team < 2; ++team)
+  {
+    (*addrs)[team] = 0;
+    u8 word[4];
+    // rbchecksum.find_fighters: TEAMS[team] -> team struct, +0x0C -> list node, word 0 of the node -> fighter; every hop must be a
+    // pointer into MEM1 / MEM2 (rbchecksum._ok).
+    if (!memory.Read(TEAMS_ADDR + 4 * team, word, 4))
+      continue;
+    const u32 team_ptr = ReadBE32(word);
+    if (!PointerOk(team_ptr) || !memory.Read(team_ptr + 0x0C, word, 4))
+      continue;
+    const u32 node = ReadBE32(word);
+    if (!PointerOk(node) || !memory.Read(node, word, 4))
+      continue;
+    const u32 fighter = ReadBE32(word);
+    if (!PointerOk(fighter))
+      continue;
+    (*addrs)[team] = fighter;
+    ++found;
+  }
+  return found;
+}
+
+size_t FighterChecksum(const GuestMemory& memory, u32 frame, u32* checksum)
+{
+  std::array<u32, 2> fighters{};
+  FindFighterStructs(memory, &fighters);
+
+  // The byte stream of rbchecksum.py's docstring: u32 BE frame, then per player (ascending) u32 BE player id and the fields' raw
+  // big-endian bytes in FIELDS order (floats are just 4 raw bytes; fighter addresses are not hashed).
+  std::vector<u8> stream;
+  stream.reserve(4 + 2 * (4 + FIELD_BYTES));
+  const auto append_be32 = [&stream](u32 v) {
+    stream.push_back(static_cast<u8>(v >> 24));
+    stream.push_back(static_cast<u8>(v >> 16));
+    stream.push_back(static_cast<u8>(v >> 8));
+    stream.push_back(static_cast<u8>(v));
+  };
+  append_be32(frame);
+  std::vector<u8> span(FIELD_SPAN_HI - FIELD_SPAN_LO);
+  size_t found = 0;
+  for (u32 player = 1; player <= 2; ++player)
+  {
+    const u32 fighter = fighters[player - 1];
+    if (fighter == 0 || !memory.Read(fighter + FIELD_SPAN_LO, span.data(), span.size()))
+      continue;
+    append_be32(player);
+    for (const FieldDef& f : FIELDS)
+      stream.insert(stream.end(), span.begin() + (f.offset - FIELD_SPAN_LO), span.begin() + (f.offset - FIELD_SPAN_LO) + 4);
+    ++found;
+  }
+  *checksum = Common::ComputeCRC32(stream.data(), stream.size());
+  return found;
+}
+
+u32 MemoryCrc(const GuestMemory& memory, const std::vector<Range>& ranges, size_t* unreadable)
+{
+  constexpr u32 CHUNK = 1u << 20;  // copy size when the memory cannot hand out a pointer
+  u32 crc = Common::StartCRC32();
+  std::vector<u8> buffer;
+  for (const Range& r : ranges)
+  {
+    const u8* direct = memory.Peek(r.start, r.end - r.start);
+    if (direct != nullptr)
+    {
+      crc = Common::UpdateCRC32(crc, direct, r.end - r.start);
+      continue;
+    }
+    for (u32 addr = r.start; addr < r.end;)
+    {
+      const u32 n = std::min(CHUNK, r.end - addr);
+      buffer.resize(n);
+      if (!memory.Read(addr, buffer.data(), n))
+      {
+        if (unreadable != nullptr)
+          ++*unreadable;
+        break;
+      }
+      crc = Common::UpdateCRC32(crc, buffer.data(), n);
+      addr += n;
+    }
+  }
+  return crc;
+}
+
+namespace
+{
+// Value of one hex digit, or -1.
+int HexValue(char c)
+{
+  if (c >= '0' && c <= '9')
+    return c - '0';
+  if (c >= 'a' && c <= 'f')
+    return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F')
+    return c - 'A' + 10;
+  return -1;
+}
+
+// 24 hex digits -> 12 pad bytes.
+bool ParsePadHex(const std::string& token, PadBytes* out)
+{
+  if (token.size() != 24)
+    return false;
+  for (size_t i = 0; i < 12; ++i)
+  {
+    const int hi = HexValue(token[2 * i]);
+    const int lo = HexValue(token[2 * i + 1]);
+    if (hi < 0 || lo < 0)
+      return false;
+    (*out)[i] = static_cast<u8>((hi << 4) | lo);
+  }
+  return true;
+}
+
+bool ParseDecimal(const std::string& token, bool allow_sign, long long* out)
+{
+  size_t i = 0;
+  bool negative = false;
+  if (allow_sign && !token.empty() && (token[0] == '-' || token[0] == '+'))
+  {
+    negative = token[0] == '-';
+    i = 1;
+  }
+  if (i >= token.size() || token.size() - i > 12)
+    return false;
+  long long value = 0;
+  for (; i < token.size(); ++i)
+  {
+    if (token[i] < '0' || token[i] > '9')
+      return false;
+    value = value * 10 + (token[i] - '0');
+  }
+  *out = negative ? -value : value;
+  return true;
+}
+
+std::string PadHex(const PadBytes& pad)
+{
+  static const char DIGITS[] = "0123456789abcdef";
+  std::string s;
+  s.reserve(24);
+  for (const u8 b : pad)
+  {
+    s.push_back(DIGITS[b >> 4]);
+    s.push_back(DIGITS[b & 15]);
+  }
+  return s;
+}
+}  // namespace
+
+bool ParsePadScript(const std::string& text, PadScript* out, std::string* error)
+{
+  PadScript script;
+  size_t pos = 0;
+  while (pos < text.size())
+  {
+    size_t eol = text.find('\n', pos);
+    if (eol == std::string::npos)
+      eol = text.size();  // no final newline
+    const std::string line = text.substr(pos, eol - pos);
+    pos = eol + 1;
+
+    std::vector<std::string> tokens;
+    size_t i = 0;
+    while (i < line.size())
+    {
+      while (i < line.size() && (line[i] == ' ' || line[i] == '\t' || line[i] == '\r'))
+        ++i;
+      const size_t start = i;
+      while (i < line.size() && line[i] != ' ' && line[i] != '\t' && line[i] != '\r')
+        ++i;
+      if (i > start)
+        tokens.push_back(line.substr(start, i - start));
+    }
+    if (tokens.empty() || tokens[0][0] == '#')
+      continue;
+
+    long long frame = 0;
+    long long pad_return = 0;
+    PadScriptEntry entry;
+    if (tokens.size() < 3 || !ParseDecimal(tokens[0], false, &frame) || frame > 0xFFFFFFFFll ||
+        !ParsePadHex(tokens[1], &entry.pads[0]) || !ParsePadHex(tokens[2], &entry.pads[1]) ||
+        (tokens.size() >= 4 && (!ParseDecimal(tokens[3], true, &pad_return) || pad_return < -0x80000000ll || pad_return > 0x7FFFFFFFll)))
+    {
+      ++script.ignored_lines;
+      continue;
+    }
+    entry.pad_return = static_cast<s32>(pad_return);
+    const u32 f = static_cast<u32>(frame);
+    if (script.frames.empty())
+      script.first = script.last = f;
+    script.first = std::min(script.first, f);
+    script.last = std::max(script.last, f);
+    script.frames[f] = entry;
+  }
+  if (script.frames.empty())
+  {
+    if (error != nullptr)
+      *error = "no pad lines (expected \"<frame> <24 hex> <24 hex> <return>\")";
+    return false;
+  }
+  *out = std::move(script);
+  return true;
+}
+
+std::string FormatPadRecordLine(u32 frame, const std::array<PadBytes, 2>& pads, s32 pad_return)
+{
+  return Format("%u %s %s %d", frame, PadHex(pads[0]).c_str(), PadHex(pads[1]).c_str(), pad_return);
+}
+
+std::string FormatTraceLine(u32 frame, int fighters, u32 checksum, u32 mem)
+{
+  return Format("T frame=%u fighters=%d chk=0x%08X mem=0x%08X", frame, fighters, checksum, mem);
+}
+
+DeterminismKit::DeterminismKit(DeterminismOptions options, GuestMemory& memory, Sink& log, LineWriter* record, LineWriter* trace)
+    : m_options(std::move(options)), m_memory(memory), m_log(log), m_record(record), m_trace(trace)
+{
+  m_options.trace_every = std::max<u32>(m_options.trace_every, 1);
+  if (m_record != nullptr)
+  {
+    if (m_options.record_header)
+      m_record->Line(PAD_RECORD_HEADER);
+    m_log.Line(Format("NOTE pad record -> %s", m_options.record_path.c_str()));
+  }
+  if (!m_options.script_path.empty())
+  {
+    const PadScript& s = m_options.script;
+    m_log.Line(Format("NOTE pad script %s frames=%zu first=%u last=%u", m_options.script_path.c_str(), s.frames.size(), s.first, s.last));
+    if (s.ignored_lines != 0)
+      m_log.Line(Format("NOTE pad script: %zu malformed lines ignored", s.ignored_lines));
+  }
+  if (m_trace != nullptr)
+  {
+    size_t bytes = 0;
+    for (const Range& r : m_options.ranges)
+      bytes += r.end - r.start;
+    m_log.Line(Format("NOTE trace -> %s every=%u ranges=%zu bytes=%zu", m_options.trace_path.c_str(), m_options.trace_every,
+                      m_options.ranges.size(), bytes));
+  }
+}
+
+void DeterminismKit::OnCommand(Command* command, bool resimulating)
+{
+  const u32 frame = command->frame;
+  const bool scripted = !m_options.script_path.empty();
+  if (scripted)
+  {
+    const auto it = m_options.script.frames.find(frame);
+    if (it != m_options.script.frames.end())
+    {
+      command->pads = it->second.pads;
+      command->pad_return = it->second.pad_return;
+    }
+  }
+  if (resimulating)
+    return;
+
+  if (scripted && !m_script_ended && frame > m_options.script.last)
+  {
+    m_script_ended = true;
+    const std::string note = Format("NOTE pad script ended at frame %u", m_options.script.last);
+    m_log.Line(note);
+    if (m_trace != nullptr)
+    {
+      m_trace->Line(note);
+      m_trace->Flush();
+    }
+  }
+
+  if (m_record != nullptr)
+  {
+    m_record->Line(FormatPadRecordLine(frame, command->pads, command->pad_return));
+    ++m_record_lines;
+    if (++m_record_pending >= PAD_RECORD_FLUSH_EVERY)
+    {
+      m_record->Flush();
+      m_record_pending = 0;
+    }
+  }
+
+  if (m_trace != nullptr && frame % m_options.trace_every == 0)
+  {
+    u32 checksum = 0;
+    const size_t found = FighterChecksum(m_memory, frame, &checksum);
+    size_t unreadable = 0;
+    const u32 mem = m_options.ranges.empty() ? 0 : MemoryCrc(m_memory, m_options.ranges, &unreadable);
+    if (unreadable != 0 && !m_unreadable_logged)
+    {
+      m_unreadable_logged = true;
+      m_log.Line(Format("ERROR frame %u: %zu trace range(s) could not be read (left out of mem; logged once)", frame, unreadable));
+    }
+    // Both fighters or none: a lone fighter is a menu / loading state and is reported like no fighters (the checksum would
+    // depend on which one is left).
+    const bool both = found == 2;
+    m_trace->Line(FormatTraceLine(frame, both ? 2 : 0, both ? checksum : 0, mem));
+    m_trace->Flush();
+    ++m_trace_lines;
+  }
+}
+
+void DeterminismKit::Finish()
+{
+  if (m_record != nullptr)
+    m_record->Flush();
+  if (m_trace != nullptr)
+    m_trace->Flush();
+  m_record_pending = 0;
+}
+
 // ---- (5) Dolphin glue ---------------------------------------------------------------------------------------------------
 
 namespace
@@ -1987,6 +2274,31 @@ private:
   std::ofstream m_file;
 };
 
+// A text file for the determinism kit (pad record, trace): appended to; Line() only buffers, Flush() writes through.
+class FileLineWriter final : public LineWriter
+{
+public:
+  explicit FileLineWriter(const std::string& path)
+  {
+    File::CreateFullPath(path);
+    File::OpenFStream(m_file, path, std::ios_base::out | std::ios_base::app);
+  }
+  bool IsOpen() const { return m_file.is_open(); }
+  void Line(const std::string& text) override
+  {
+    if (m_file.is_open())
+      m_file << text << '\n';
+  }
+  void Flush() override
+  {
+    if (m_file.is_open())
+      m_file.flush();
+  }
+
+private:
+  std::ofstream m_file;
+};
+
 // What the game sees when SyncTest is off: the module is created on the first command and then only echoes.
 struct Module
 {
@@ -1996,6 +2308,9 @@ struct Module
   std::unique_ptr<DolphinAudioHw> audio;
   std::unique_ptr<FileSink> sink;
   std::unique_ptr<SyncTest> synctest;  // null = off
+  std::unique_ptr<FileLineWriter> pad_record;
+  std::unique_ptr<FileLineWriter> trace;
+  std::unique_ptr<DeterminismKit> kit;  // null = none of REV3_PAD_RECORD / REV3_PAD_SCRIPT / REV3_TRACE is usable
 };
 
 Module& GetModule()
@@ -2034,9 +2349,113 @@ bool ReadTextFile(const std::string& path, std::string* out)
   return true;
 }
 
+// The Rev3 log (default <User>/Logs/rev3_synctest.log, REV3_SYNCTEST_LOG): opened by whichever feature needs it first.
+FileSink& EnsureSink(Module& module, std::string* path = nullptr)
+{
+  std::string log_path = GetEnv("REV3_SYNCTEST_LOG");
+  if (log_path.empty())
+    log_path = File::GetUserPath(D_LOGS_IDX) + "rev3_synctest.log";
+  if (module.sink == nullptr)
+    module.sink = std::make_unique<FileSink>(log_path);
+  if (path != nullptr)
+    *path = log_path;
+  return *module.sink;
+}
+
+// Whether a file exists and has content (the pad record gets its header only when it is new).
+bool FileHasContent(const std::string& path)
+{
+  return File::Exists(path) && File::GetSize(path) > 0;
+}
+
+// REV3_PAD_RECORD / REV3_PAD_SCRIPT / REV3_TRACE / REV3_TRACE_EVERY / REV3_TRACE_RANGES. A variable that is set but unusable is
+// logged as an ERROR and that part stays off; the others carry on.
+void InitializeKit(Module& module)
+{
+  const std::string record_path = GetEnv("REV3_PAD_RECORD");
+  const std::string script_path = GetEnv("REV3_PAD_SCRIPT");
+  const std::string trace_path = GetEnv("REV3_TRACE");
+  if (record_path.empty() && script_path.empty() && trace_path.empty())
+    return;
+  FileSink& sink = EnsureSink(module);
+  const auto fail = [&sink](const std::string& what) {
+    sink.Line("ERROR " + what);
+    ERROR_LOG_FMT(SLIPPI, "Rev3: {}", what);
+    sink.Osd("Rev3: " + what);
+  };
+
+  DeterminismOptions options;
+  if (!script_path.empty())
+  {
+    std::string text;
+    std::string error;
+    if (!ReadTextFile(script_path, &text))
+      fail("REV3_PAD_SCRIPT: cannot read " + script_path + "; pad script off");
+    else if (!ParsePadScript(text, &options.script, &error))
+      fail("REV3_PAD_SCRIPT " + script_path + ": " + error + "; pad script off");
+    else
+      options.script_path = script_path;
+  }
+  if (!trace_path.empty())
+  {
+    options.trace_path = trace_path;
+    const std::string every = GetEnv("REV3_TRACE_EVERY");
+    long value = 0;
+    if (!every.empty())
+    {
+      if (ParseInt(every, &value) && value >= 1 && value <= 1000000)
+        options.trace_every = static_cast<u32>(value);
+      else
+        fail("REV3_TRACE_EVERY=" + every + " is not 1..1000000; using " + std::to_string(TRACE_EVERY_DEFAULT));
+    }
+    const std::string ranges_path = GetEnv("REV3_TRACE_RANGES");
+    if (!ranges_path.empty())
+    {
+      std::string text;
+      std::string error;
+      if (!ReadTextFile(ranges_path, &text))
+        fail("REV3_TRACE_RANGES: cannot read " + ranges_path + "; mem will be 0");
+      else if (!ParseWhitelist(text, &options.ranges, &error))
+        fail("REV3_TRACE_RANGES " + ranges_path + ": " + error + "; mem will be 0");
+      else
+        options.ranges_path = ranges_path;
+    }
+  }
+  if (!record_path.empty())
+  {
+    options.record_header = !FileHasContent(record_path);
+    module.pad_record = std::make_unique<FileLineWriter>(record_path);
+    if (!module.pad_record->IsOpen())
+    {
+      fail("REV3_PAD_RECORD: cannot open " + record_path + "; pad record off");
+      module.pad_record.reset();
+    }
+    else
+    {
+      options.record_path = record_path;
+    }
+  }
+  if (!trace_path.empty())
+  {
+    module.trace = std::make_unique<FileLineWriter>(trace_path);
+    if (!module.trace->IsOpen())
+    {
+      fail("REV3_TRACE: cannot open " + trace_path + "; trace off");
+      module.trace.reset();
+    }
+  }
+  if (module.pad_record == nullptr && module.trace == nullptr && options.script_path.empty())
+    return;
+  module.kit = std::make_unique<DeterminismKit>(std::move(options), *module.memory, sink, module.pad_record.get(), module.trace.get());
+}
+
 void Initialize(Module& module, Core::System& system)
 {
   module.initialized = true;
+
+  // The determinism kit (pad record / script, trace) is independent of SyncTest and works with it off.
+  module.memory = std::make_unique<DolphinMemory>(system);
+  InitializeKit(module);
 
   const std::string k_text = GetEnv("REV3_SYNCTEST");
   if (k_text.empty())
@@ -2105,10 +2524,8 @@ void Initialize(Module& module, Core::System& system)
   options.restore_timebase = GetEnv("REV3_SYNCTEST_TB") == "1";
   const bool hardware_exclude = GetEnv("REV3_SYNCTEST_HW_EXCLUDE") != "0";
 
-  std::string log_path = GetEnv("REV3_SYNCTEST_LOG");
-  if (log_path.empty())
-    log_path = File::GetUserPath(D_LOGS_IDX) + "rev3_synctest.log";
-  module.sink = std::make_unique<FileSink>(log_path);
+  std::string log_path;
+  EnsureSink(module, &log_path);
 
   const std::string whitelist_path = GetEnv("REV3_WHITELIST");
   options.whitelist_path = whitelist_path.empty() ? "(none)" : whitelist_path;
@@ -2171,7 +2588,6 @@ void Initialize(Module& module, Core::System& system)
     module.sink->Line(Format("NOTE removed %llu bytes of the hook region 0x%08X-0x%08X from the whitelist",
                              static_cast<unsigned long long>(hook_bytes), HOOK_REGION_START, HOOK_REGION_END));
   }
-  module.memory = std::make_unique<DolphinMemory>(system);
   if (hardware_exclude)
     module.hardware = std::make_unique<DolphinHardware>(system, *module.sink);
   module.synctest = std::make_unique<SyncTest>(options, std::move(ranges), *module.memory, *module.sink, std::function<u64()>(),
@@ -2213,6 +2629,11 @@ void HandleCommand(Core::System& system, const u8* command, size_t size, std::ve
     return;
   }
 
+  // The determinism kit sees every hook call first: it may replace the pads (REV3_PAD_SCRIPT), then SyncTest (if on) works with
+  // those pads, and the reply carries them.
+  if (module.kit != nullptr && Core::IsCPUThread())
+    module.kit->OnCommand(&parsed, module.synctest != nullptr && module.synctest->Resimulating());
+
   if (module.synctest != nullptr && Core::IsCPUThread())
     reply = module.synctest->OnCommand(parsed);
   else
@@ -2229,6 +2650,11 @@ void HandleCommand(Core::System& system, const u8* command, size_t size, std::ve
 void Shutdown()
 {
   Module& module = GetModule();
+  if (module.kit != nullptr)
+    module.kit->Finish();
+  module.kit.reset();  // before the memory it reads
+  module.pad_record.reset();
+  module.trace.reset();
   if (module.synctest != nullptr)
     module.synctest->Finish();
   module.synctest.reset();

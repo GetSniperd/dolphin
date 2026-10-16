@@ -41,6 +41,17 @@
 //   SyncTest only runs once armed (both fighters found through the TEAMS pointers); menus and loading screens are never
 //   rolled back. See REV3.md for what a clean run looks like.
 //
+// DETERMINISM KIT (milestone M1; works with SyncTest off, and alongside it; REV3.md "Determinism kit (M1)")
+//   REV3_PAD_RECORD=file     write "# rev3 pad record v1", then one line per hook call that is not a resimulation:
+//                            "<frame> <port0 pad, 24 hex> <port1 pad, 24 hex> <padread return, signed>"; flushed every 60 lines
+//   REV3_PAD_SCRIPT=file     same format; for every listed frame the reply carries the listed pads instead of the live ones
+//                            (other frames: live pads); "NOTE pad script ended at frame N" once the last frame has passed
+//   REV3_TRACE=file          every REV3_TRACE_EVERY-th frame (default 30) append
+//                            "T frame=N fighters=0|2 chk=0x........ mem=0x........" (fighter checksum, CRC32 of the trace ranges)
+//   REV3_TRACE_RANGES=file   {"ranges":[{"start","end"}]} (hex strings or numbers, end exclusive): the bytes `mem` covers
+//   The record, the script and the trace are plain text; the runner is rev3-mod tools/rollback/phase4.py. The fighter checksum is
+//   rev3-mod rev3mod/rbchecksum.py checksum(), bit for bit (FighterChecksum below).
+//
 // THE ADAPTIVE SNAPSHOT SET (REV3_SYNCTEST_ADAPTIVE, default on)
 //   A per-match page list cannot work: the heap layout differs from match to match (the whitelist learned in one match left P2's
 //   fighter struct out of the snapshot in the next). So the set of memory that is snapshotted is learned in the running match:
@@ -78,6 +89,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -492,6 +504,103 @@ private:
   u32 m_logged_mismatch_frames = 0;
   u32 m_error_count = 0;
   SyncTestStats m_stats;
+};
+
+// ---- determinism kit (milestone M1) -------------------------------------------------------------------------------------------
+// Pad record / pad script / trace for the boot determinism test (record a play session's pads, replay them in a second run and
+// compare the traces of the two). Pure logic over GuestMemory / Sink / LineWriter, so the unit tests drive it without Dolphin.
+
+constexpr const char* PAD_RECORD_HEADER = "# rev3 pad record v1";  // first line of a REV3_PAD_RECORD file
+constexpr u32 PAD_RECORD_FLUSH_EVERY = 60;                          // record lines between two flushes (the rest is flushed at shutdown)
+constexpr u32 TRACE_EVERY_DEFAULT = 30;                             // REV3_TRACE_EVERY default: hook calls between two trace lines
+
+// The fighter structs found through TEAMS (team 0 -> [0], team 1 -> [1]); a team that is not found gives 0. Returns how many were found.
+size_t FindFighterStructs(const GuestMemory& memory, std::array<u32, 2>* addrs);
+
+// The desync checksum of `frame`, exactly rev3-mod rbchecksum.py checksum(): CRC-32 (zlib, init 0) over u32 BE frame, then for player
+// 1 and 2 (a player not found is skipped) u32 BE player id and the FIELD_COUNT fields' raw big-endian bytes in FIELDS order.
+// Returns how many fighters went into it (0..2); with 0 the checksum is that of the frame alone.
+size_t FighterChecksum(const GuestMemory& memory, u32 frame, u32* checksum);
+
+// CRC-32 (zlib, init 0) over the bytes of all `ranges` in the given order. A range that cannot be read is skipped and counted in
+// *unreadable (optional).
+u32 MemoryCrc(const GuestMemory& memory, const std::vector<Range>& ranges, size_t* unreadable = nullptr);
+
+// One frame of a pad script: both pads and the PADRead return value.
+struct PadScriptEntry
+{
+  std::array<PadBytes, 2> pads{};
+  s32 pad_return = 0;
+};
+
+struct PadScript
+{
+  std::map<u32, PadScriptEntry> frames;  // by frame; a frame listed twice keeps its last line
+  u32 first = 0;                         // lowest / highest frame listed (valid when frames is not empty)
+  u32 last = 0;
+  size_t ignored_lines = 0;              // lines that were neither a comment, blank nor a pad line
+};
+
+// Parses a pad record / script ("# ..." and blank lines skipped, lines in "<frame> <pad0> <pad1> [<return>]" form kept; a missing
+// final newline is fine). False when it holds no pad line (*error says so); a malformed line is skipped and counted.
+bool ParsePadScript(const std::string& text, PadScript* out, std::string* error);
+
+// "<frame> <24 hex> <24 hex> <return>" (lowercase hex), no newline.
+std::string FormatPadRecordLine(u32 frame, const std::array<PadBytes, 2>& pads, s32 pad_return);
+// "T frame=N fighters=F chk=0x........ mem=0x........" (hex digits uppercase), no newline.
+std::string FormatTraceLine(u32 frame, int fighters, u32 checksum, u32 mem);
+
+// A line-oriented text file. Line() appends one line (no newline in `text`); Flush() makes it durable.
+class LineWriter
+{
+public:
+  virtual ~LineWriter() = default;
+  virtual void Line(const std::string& text) = 0;
+  virtual void Flush() = 0;
+};
+
+struct DeterminismOptions
+{
+  std::string record_path;        // REV3_PAD_RECORD ("" = off); the writer is given to the kit
+  std::string script_path;        // REV3_PAD_SCRIPT ("" = off)
+  PadScript script;               // the parsed script
+  std::string trace_path;         // REV3_TRACE ("" = off)
+  u32 trace_every = TRACE_EVERY_DEFAULT;  // REV3_TRACE_EVERY: a trace line when frame % trace_every == 0
+  std::string ranges_path;        // REV3_TRACE_RANGES ("" = none: mem is 0)
+  std::vector<Range> ranges;      // the parsed trace ranges
+  bool record_header = true;      // write PAD_RECORD_HEADER first (false when the record file already has content)
+};
+
+// Called for every hook call before SyncTest sees it. Substitutes the scripted pads, records the pads, writes the trace line.
+class DeterminismKit
+{
+public:
+  // `record` / `trace` may be null when the matching path is empty. Logs the "NOTE pad record -> ..", "NOTE pad script ..",
+  // "NOTE trace -> .." lines to `log`. Neither is owned.
+  DeterminismKit(DeterminismOptions options, GuestMemory& memory, Sink& log, LineWriter* record, LineWriter* trace);
+
+  // `resimulating` = SyncTest is replaying a rolled-back frame: pads are still substituted (SyncTest ignores them there), but nothing
+  // is recorded or traced and the script cannot end. May change command->pads and pad_return.
+  void OnCommand(Command* command, bool resimulating);
+
+  void Finish();  // flushes the record and the trace
+
+  u32 RecordedLines() const { return m_record_lines; }
+  u32 TraceLines() const { return m_trace_lines; }
+  bool ScriptEnded() const { return m_script_ended; }
+  bool Active() const { return m_record != nullptr || m_trace != nullptr || !m_options.script_path.empty(); }
+
+private:
+  DeterminismOptions m_options;
+  GuestMemory& m_memory;
+  Sink& m_log;
+  LineWriter* m_record;
+  LineWriter* m_trace;
+  u32 m_record_pending = 0;   // record lines since the last flush
+  u32 m_record_lines = 0;
+  u32 m_trace_lines = 0;
+  bool m_script_ended = false;
+  bool m_unreadable_logged = false;
 };
 
 // ---- Dolphin glue ---------------------------------------------------------------------------------------------------------
