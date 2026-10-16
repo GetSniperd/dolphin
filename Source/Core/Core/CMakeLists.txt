@@ -558,6 +558,8 @@ add_library(core
   PowerPC/Interpreter/Interpreter_Paired.cpp
   PowerPC/Interpreter/Interpreter_SystemRegisters.cpp
   PowerPC/Interpreter/Interpreter_Tables.cpp
+  Slippi/Rev3Rollback.cpp
+  Slippi/Rev3Rollback.h
   Slippi/SlippiGameFileLoader.cpp
   Slippi/SlippiGameFileLoader.h
   Slippi/SlippiMatchmaking.cpp

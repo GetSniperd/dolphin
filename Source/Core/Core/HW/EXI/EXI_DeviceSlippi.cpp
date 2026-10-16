@@ -29,6 +29,7 @@
 #include "Core/Host.h"
 #include "Core/NetPlayClient.h"
 #include "Core/PowerPC/PowerPC.h"
+#include "Core/Slippi/Rev3Rollback.h"
 #include "Core/Slippi/SlippiMatchmaking.h"
 
 // SlippiTODO: should we remove this import for netplay build?? ifdef?
@@ -189,6 +190,8 @@ CEXISlippi::CEXISlippi(Core::System& system, const std::string current_file_name
 CEXISlippi::~CEXISlippi()
 {
   u8 empty[1];
+
+  Rev3::Shutdown();  // Rev3 SyncTest: final summary line (no-op when it never ran)
 
   // Closes file gracefully to prevent file corruption when emulation
   // suddenly stops. This would happen often on netplay when the opponent
@@ -3341,6 +3344,14 @@ void CEXISlippi::DMAWrite(u32 _uAddr, u32 _uSize)
     Dolphin_Debugger::PrintCallstack(guard, Common::Log::LogType::SLIPPI,
                                      Common::Log::LogLevel::LNOTICE);
     m_read_queue.clear();
+    return;
+  }
+
+  // Rev3 (Naruto Clash of Ninja Revolution 3) per-frame rollback hook: a 64-byte command with id 0xA0 and magic "RBK1"
+  // (Rev3Rollback.h). Answered here with a 64-byte reply and never passed on to the Melee dispatch below.
+  if (Rev3::IsCommand(mem_ptr, _uSize))
+  {
+    Rev3::HandleCommand(system, mem_ptr, _uSize, &m_read_queue);
     return;
   }
 
