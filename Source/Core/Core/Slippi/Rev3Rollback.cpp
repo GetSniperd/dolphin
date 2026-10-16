@@ -22,14 +22,19 @@
 
 #include <picojson.h>
 
+#include "Common/ChunkFile.h"
 #include "Common/CommonPaths.h"
 #include "Common/FileUtil.h"
 #include "Common/Hash.h"
 #include "Common/Logging/Log.h"
 #include "Core/Core.h"
 #include "Core/CoreTiming.h"
+#include "Core/DSPEmulator.h"
+#include "Core/HW/AudioInterface.h"
+#include "Core/HW/DSP.h"
 #include "Core/HW/MMIO.h"
 #include "Core/HW/Memmap.h"
+#include "Core/HW/ProcessorInterface.h"
 #include "Core/HW/SystemTimers.h"
 #include "Core/HW/VideoInterface.h"
 #include "Core/IOS/DI/DI.h"
@@ -56,6 +61,8 @@ constexpr u32 MEM2_END = 0x94000000;
 constexpr u32 HEARTBEAT_EVERY = 300;              // "HB" log line every this many hook calls while armed (finds where a hang is) ...
 constexpr u32 HEARTBEAT_EARLY_EVERY = 60;         // ... but every this many hook calls for the first HEARTBEAT_EARLY_CALLS armed calls
 constexpr u32 HEARTBEAT_EARLY_CALLS = 600;        // (the first real rewinds are where the game froze)
+constexpr size_t MAX_AUDIO_STATE_BYTES = 4u << 20;  // a larger audio state is not the DSP / AI registers (the GameCube's 16 MB ARAM, say)
+constexpr u32 MAX_AUDIO_SIZE_NOTES = 3;           // "audio state size changed" lines (the size varies with the HLE mail queue)
 constexpr u32 MAX_RESTORE_LOGS = 10;              // the first restores log RESTORE begin / done lines (bytes, microseconds)
 constexpr u32 MAX_SHORT_RESTORE_LOGS = 30;        // restores 11..30 log one short line "RESTORE n -> m us=.." (places a later hang)
 constexpr u32 MAX_LEARN_LOGS = 10;                // "NOTE learned" lines written in full, then at most one per LEARN_LOG_EVERY armed calls
@@ -919,6 +926,12 @@ bool SyncTest::Capture(Slot& slot, const Command& command, const std::array<u32,
     return false;
   }
 
+  // The audio hardware at the same moment as the memory (a failure only switches the audio rewind off, see DisableAudio).
+  if (m_audio != nullptr)
+    CaptureAudio(slot, command);
+  else
+    slot.audio.valid = false;
+
   for (size_t p = 0; p < 2; ++p)
   {
     if (!m_memory.Read(fighters[p] + FIELD_SPAN_LO, m_span.data(), m_span.size()))
@@ -938,6 +951,88 @@ bool SyncTest::Capture(Slot& slot, const Command& command, const std::array<u32,
   slot.stack_len = stack_len;
   slot.inputs = command.pads;
   return true;
+}
+
+void SyncTest::SetAudioHardware(AudioHardware* audio)
+{
+  m_audio = nullptr;
+  if (audio == nullptr)
+    return;
+  std::vector<u8> state;
+  if (!audio->SaveState(&state) || state.empty() || state.size() > MAX_AUDIO_STATE_BYTES)
+  {
+    Error(Format("audio hardware state is unusable at start (%zu bytes); audio rewind off, memory only", state.size()));
+    return;
+  }
+  m_audio = audio;
+  m_audio_bytes = state.size();
+  std::string names;
+  for (const std::string& name : audio->EventTypeNames())
+    names += (names.empty() ? "" : ",") + name;
+  m_sink.Line(Format("NOTE audio hw rewind on (dsp=%s, bytes=%zu, events=%s)", audio->DspKind(), state.size(),
+                     names.empty() ? "(none)" : names.c_str()));
+}
+
+// Audio rewind is a best effort on top of the memory rewind: whatever goes wrong with it is reported once and SyncTest carries on
+// with memory only (the snapshots already taken keep their audio part but it is no longer used).
+void SyncTest::DisableAudio(const std::string& why)
+{
+  Error(why);
+  m_sink.Line("NOTE audio hw rewind off: " + why + "; memory only from now on");
+  m_audio = nullptr;
+}
+
+void SyncTest::CaptureAudio(Slot& slot, const Command& command)
+{
+  Slot::Audio& a = slot.audio;
+  a.valid = false;
+  if (!m_audio->SaveState(&a.state))
+  {
+    DisableAudio(Format("frame %u: the audio hardware state could not be saved (measure and write passes disagree)", command.frame));
+    return;
+  }
+  if (a.state.empty() || a.state.size() > MAX_AUDIO_STATE_BYTES)
+  {
+    DisableAudio(Format("frame %u: the audio hardware state is %zu bytes (expected 1..%zu)", command.frame, a.state.size(),
+                        MAX_AUDIO_STATE_BYTES));
+    return;
+  }
+  m_audio->PendingEvents(&a.events);
+  a.irq = m_audio->InterruptBits();
+  a.valid = true;
+  if (a.state.size() != m_audio_bytes)
+  {
+    // Expected for the HLE DSP (its mail queue is a deque); only the measure / write agreement is an error.
+    if (m_audio_size_notes < MAX_AUDIO_SIZE_NOTES)
+    {
+      ++m_audio_size_notes;
+      m_sink.Line(Format("NOTE audio state size %zu -> %zu bytes (frame %u; variable-size parts such as the DSP mail queue)",
+                         m_audio_bytes, a.state.size(), command.frame));
+    }
+    m_audio_bytes = a.state.size();
+  }
+}
+
+// Order matters: the hardware state first (it rebases the AI sample-counter reference to the current tick), then the CoreTiming events
+// of the audio devices (removed and re-scheduled with their saved remaining cycles), then the PI cause bits (which re-evaluates the
+// external exception the normal way).
+std::string SyncTest::RestoreAudio(const Slot& s, const Command& command)
+{
+  if (m_audio == nullptr || !s.audio.valid)
+    return std::string();
+  const u64 t0 = m_micros();
+  if (!m_audio->LoadState(s.audio.state))
+  {
+    DisableAudio(Format("frame %u: the audio hardware state was not consumed exactly on restore", command.frame));
+    return std::string();
+  }
+  m_audio->ReplaceEvents(s.audio.events);
+  m_audio->SetInterruptBits(s.audio.irq);
+  const u64 us = m_micros() - t0;
+  ++m_stats.audio_restores;
+  m_stats.audio_us_total += us;
+  m_stats.audio_us_max = std::max(m_stats.audio_us_max, us);
+  return Format(" audio_bytes=%zu audio_events=%zu", s.audio.state.size(), s.audio.events.size());
 }
 
 // Writes the snapshot `s` (ranges, then the stack window) back, invalidates the JIT for the restored ranges, and times the two
@@ -1004,6 +1099,9 @@ bool SyncTest::Restore(const Slot& s, const Command& command, u32 to)
     else
       Error(Format("frame %u: cannot set the time base", command.frame));
   }
+
+  // The audio hardware goes back after the memory write-back and the JIT invalidation.
+  tb_text += RestoreAudio(s, command);
 
   ++m_stats.restores;
   m_stats.restore_us_total += us;
@@ -1248,13 +1346,15 @@ void SyncTest::SummaryLine(const char* tag)
   const double n = m_stats.restores != 0 ? static_cast<double>(m_stats.restores) : 1.0;
   m_sink.Line(Format("%s frame=%u rollbacks=%u frames_compared=%u mismatching_frames=%u restore_us_mean=%.1f restore_us_max=%llu "
                      "icache_us_mean=%.1f icache_us_max=%llu sp_mismatches=%u noop_restores=%u dynamic_pages=%zu scan_us_mean=%.1f "
-                     "scan_us_max=%llu io_postponed=%u",
+                     "scan_us_max=%llu io_postponed=%u audio_restores=%u audio_us_mean=%.1f audio_us_max=%llu",
                      tag, m_last_frame, m_stats.rollbacks, m_stats.frames_compared, m_stats.mismatching_frames,
                      m_stats.restore_us_total / n, static_cast<unsigned long long>(m_stats.restore_us_max),
                      m_stats.icache_us_total / n, static_cast<unsigned long long>(m_stats.icache_us_max),
                      m_stats.sp_mismatches, m_stats.noop_restores, m_tracker.DynamicPages(),
                      m_stats.scans != 0 ? static_cast<double>(m_stats.scan_us_total) / static_cast<double>(m_stats.scans) : 0.0,
-                     static_cast<unsigned long long>(m_stats.scan_us_max), m_stats.io_postponed));
+                     static_cast<unsigned long long>(m_stats.scan_us_max), m_stats.io_postponed, m_stats.audio_restores,
+                     m_stats.audio_restores != 0 ? static_cast<double>(m_stats.audio_us_total) / m_stats.audio_restores : 0.0,
+                     static_cast<unsigned long long>(m_stats.audio_us_max)));
 }
 
 void SyncTest::Finish()
@@ -1346,6 +1446,18 @@ bool SyncTest::Arm(const Command& command, const std::array<u32, 2>& fighters)
   LogFieldCoverage(fighters, nullptr);
   if (m_dsp_state)
     m_sink.Line("NOTE dsp at arm: " + m_dsp_state());
+  if (m_audio != nullptr)
+  {
+    std::vector<u8> state;
+    std::vector<AudioEvent> events;
+    if (m_audio->SaveState(&state))
+      m_audio->PendingEvents(&events);
+    std::string list;
+    for (const AudioEvent& e : events)
+      list += Format("%s%s+%lld", list.empty() ? "" : ",", e.type.c_str(), static_cast<long long>(e.cycles));
+    m_sink.Line(Format("NOTE audio hw at arm: bytes=%zu irq=0x%02X events=%zu [%s]", state.size(), m_audio->InterruptBits(),
+                       events.size(), list.c_str()));
+  }
   return true;
 }
 
@@ -1680,6 +1792,154 @@ private:
   Core::System& m_system;
 };
 
+// The emulated audio hardware (REV3_SYNCTEST_AUDIO_HW, see Rev3Rollback.h "THE AUDIO HARDWARE"). What is saved, and how:
+//   DSPManager::DoRewindState     DSP control / audio DMA / ARAM DMA registers + the DSP emulator's DoState (HLE: ucode CRCs, the
+//                                 ucode's own state, mail handler; LLE: the DSP core). A new method next to DoState that leaves out
+//                                 the ARAM contents (DoState writes 16 MB on a GameCube; on a Wii ARAM is MEM2, rewound as memory).
+//   AudioInterfaceManager::DoRewindState   AI registers. AudioInterfaceManager::DoState also runs Mixer::DoState (the Wiimote speaker /
+//                                 Skylander / GBA mixers too) and keeps m_last_cpu_time as an absolute tick; the new method leaves
+//                                 the mixer alone (re-applying rate / volume only if they changed) and stores that time as an age.
+//   CoreTiming events             the pending events of the types in AUDIO_EVENT_TYPES, as remaining cycles (CoreTimingManager::
+//                                 GetPendingEvents, FindEventType added for this). A restore removes all pending events of those
+//                                 types and schedules the saved ones again with their remaining cycles from now.
+//   ProcessorInterface            only the INT_CAUSE_DSP and INT_CAUSE_AI bits (GetCause / SetInterrupt).
+// Not touched: the rest of CoreTiming (VI, SI, EXI, IOS, DVD, GPU events), the PI mask, the host-side audio mixer buffers and the
+// sound backend (so the speakers keep getting samples), the PPC registers (the game hook reloads its own).
+// DSP LLE on its own thread is locked out (DSPEmulator::PauseAndLock) while the state is read or written; HLE has no lock to take.
+class DolphinAudioHw final : public AudioHardware
+{
+public:
+  explicit DolphinAudioHw(Core::System& system) : m_system(system)
+  {
+    auto& core_timing = m_system.GetCoreTiming();
+    for (const char* name : AUDIO_EVENT_TYPES)
+    {
+      if (CoreTiming::EventType* type = core_timing.FindEventType(name); type != nullptr)
+      {
+        m_types.push_back(type);
+        m_names.emplace_back(name);
+      }
+      else
+      {
+        m_names.push_back(std::string(name) + "(not registered)");
+      }
+    }
+  }
+
+  const char* DspKind() const override
+  {
+    const DSPEmulator* emulator = m_system.GetDSP().GetDSPEmulator();
+    return emulator != nullptr && emulator->IsLLE() ? "LLE" : "HLE";
+  }
+
+  std::vector<std::string> EventTypeNames() const override { return m_names; }
+
+  bool SaveState(std::vector<u8>* out) override
+  {
+    DSPEmulator* const emulator = m_system.GetDSP().GetDSPEmulator();
+    if (emulator == nullptr)
+      return false;
+    emulator->PauseAndLock(true);
+    u8* ptr = nullptr;
+    PointerWrap measure(&ptr, 0, PointerWrap::Mode::Measure);
+    DoAll(measure);
+    const size_t size = reinterpret_cast<uintptr_t>(ptr);
+    out->resize(size);
+    ptr = out->data();
+    PointerWrap writer(&ptr, size, PointerWrap::Mode::Write);
+    DoAll(writer);
+    const bool ok = writer.IsWriteMode() && ptr == out->data() + size;
+    emulator->PauseAndLock(false);
+    return ok;
+  }
+
+  bool LoadState(const std::vector<u8>& in) override
+  {
+    DSPEmulator* const emulator = m_system.GetDSP().GetDSPEmulator();
+    if (emulator == nullptr)
+      return false;
+    emulator->PauseAndLock(true);
+    // DoState takes a non-const buffer pointer in read mode too (it never writes to it).
+    u8* ptr = const_cast<u8*>(in.data());
+    PointerWrap reader(&ptr, in.size(), PointerWrap::Mode::Read);
+    DoAll(reader);
+    const bool ok = reader.IsReadMode() && ptr == in.data() + in.size();
+    emulator->PauseAndLock(false);
+    return ok;
+  }
+
+  void PendingEvents(std::vector<AudioEvent>* out) override
+  {
+    out->clear();
+    auto& core_timing = m_system.GetCoreTiming();
+    const s64 now = static_cast<s64>(core_timing.GetTicks());
+    for (const CoreTiming::Event& event : core_timing.GetPendingEvents())
+    {
+      if (event.type == nullptr || std::find(m_types.begin(), m_types.end(), event.type) == m_types.end())
+        continue;
+      AudioEvent saved;
+      saved.type = *event.type->name;
+      saved.cycles = std::max<s64>(event.time - now, 0);
+      saved.userdata = event.userdata;
+      out->push_back(std::move(saved));
+    }
+  }
+
+  void ReplaceEvents(const std::vector<AudioEvent>& events) override
+  {
+    auto& core_timing = m_system.GetCoreTiming();
+    for (CoreTiming::EventType* type : m_types)
+      core_timing.RemoveAllEvents(type);
+    for (const AudioEvent& saved : events)
+    {
+      for (CoreTiming::EventType* type : m_types)
+      {
+        if (*type->name == saved.type)
+        {
+          core_timing.ScheduleEvent(saved.cycles, type, saved.userdata);
+          break;
+        }
+      }
+    }
+  }
+
+  u32 InterruptBits() override { return m_system.GetProcessorInterface().GetCause() & INT_BITS; }
+
+  void SetInterruptBits(u32 bits) override
+  {
+    auto& pi = m_system.GetProcessorInterface();
+    for (const u32 bit : {DSP_BIT, AI_BIT})
+    {
+      const bool want = (bits & bit) != 0;
+      if (((pi.GetCause() & bit) != 0) != want)
+        pi.SetInterrupt(bit, want);  // also re-evaluates the PPC external exception
+    }
+  }
+
+private:
+  static constexpr u32 DSP_BIT = static_cast<u32>(ProcessorInterface::INT_CAUSE_DSP);
+  static constexpr u32 AI_BIT = static_cast<u32>(ProcessorInterface::INT_CAUSE_AI);
+  static constexpr u32 INT_BITS = DSP_BIT | AI_BIT;
+  // The event types of the DSP / AI devices (names as registered in SystemTimers.cpp, DSP.cpp, AudioInterface.cpp).
+  static constexpr const char* AUDIO_EVENT_TYPES[] = {
+      "DSPCallback",       // SystemTimers: gives the DSP emulator its time slices (periodic)
+      "AudioDMACallback",  // SystemTimers: pushes one 32-byte audio DMA block to the speakers, raises the AID interrupt (periodic)
+      "AICallback",        // AudioInterface: sample counter / AI interrupt timing
+      "DSPint",            // DSP: delayed DSP / AID / ARAM interrupts (userdata = interrupt type)
+      "ARAMint",           // DSP: ARAM DMA complete
+  };
+
+  void DoAll(PointerWrap& p)
+  {
+    m_system.GetDSP().DoRewindState(p);
+    m_system.GetAudioInterface().DoRewindState(p);
+  }
+
+  Core::System& m_system;
+  std::vector<CoreTiming::EventType*> m_types;
+  std::vector<std::string> m_names;
+};
+
 // One-line DSP / audio DMA state, read through the MMIO mapping without side effects (the DSP mailbox "from DSP" registers are not
 // read: reading the low half pops a mail, and on LLE the high half steps the DSP):
 //   csr         0x0C00500A DSP control register
@@ -1733,6 +1993,7 @@ struct Module
   bool initialized = false;
   std::unique_ptr<DolphinMemory> memory;
   std::unique_ptr<DolphinHardware> hardware;
+  std::unique_ptr<DolphinAudioHw> audio;
   std::unique_ptr<FileSink> sink;
   std::unique_ptr<SyncTest> synctest;  // null = off
 };
@@ -1921,6 +2182,15 @@ void Initialize(Module& module, Core::System& system)
     module.sink->Line("NOTE timebase accessor: read SystemTimers::GetFakeTimeBase(); write CoreTiming::SetFakeTBStartValue(start + (value - now)) "
                       "and PowerPCManager::WriteFullTimeBaseValue(value); decrementer and CoreTiming events untouched");
   }
+  if (GetEnv("REV3_SYNCTEST_AUDIO_HW") == "0")
+  {
+    module.sink->Line("NOTE audio hw rewind off (REV3_SYNCTEST_AUDIO_HW=0): memory only");
+  }
+  else
+  {
+    module.audio = std::make_unique<DolphinAudioHw>(system);
+    module.synctest->SetAudioHardware(module.audio.get());
+  }
   Core::System* const sys = &system;
   module.synctest->SetDspState([sys]() { return DescribeDsp(*sys); });
   module.sink->Osd(Format("Rev3 SyncTest on: K=%d, every %d frame(s), log %s", options.k, options.every, log_path.c_str()));
@@ -1962,6 +2232,7 @@ void Shutdown()
   if (module.synctest != nullptr)
     module.synctest->Finish();
   module.synctest.reset();
+  module.audio.reset();
   module.hardware.reset();
   module.memory.reset();
   module.sink.reset();

@@ -87,6 +87,10 @@ public:
   DSPEmulator* GetDSPEmulator();
 
   void DoState(PointerWrap& p);
+  // Rev3 SyncTest (Slippi/Rev3Rollback.cpp): DoState without the ARAM contents (on a Wii ARAM is MEM2, which the caller rewinds as
+  // memory; on a GameCube it would be 16 MB per call). Registers, DMA state, interrupt bits and the DSP emulator's own state (HLE
+  // ucode or LLE core). Same byte layout rules as DoState: only usable with a buffer written by the same call.
+  void DoRewindState(PointerWrap& p);
 
   // TODO: Maybe rethink this? The timing is unpredictable.
   void GenerateDSPInterruptFromDSPEmu(DSPInterruptType type, int cycles_into_future = 0);

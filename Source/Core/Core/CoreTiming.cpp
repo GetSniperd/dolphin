@@ -300,6 +300,20 @@ void CoreTimingManager::RemoveAllEvents(EventType* event_type)
   RemoveEvent(event_type);
 }
 
+EventType* CoreTimingManager::FindEventType(const std::string& name)
+{
+  const auto itr = m_event_types.find(name);
+  return itr != m_event_types.end() ? &itr->second : nullptr;
+}
+
+std::vector<Event> CoreTimingManager::GetPendingEvents()
+{
+  MoveEvents();
+  std::vector<Event> events = m_event_queue;
+  std::ranges::sort(events);  // Event::operator<=> orders by time, then by the order the events were scheduled
+  return events;
+}
+
 void CoreTimingManager::ForceExceptionCheck(s64 cycles)
 {
   cycles = std::max<s64>(0, cycles);

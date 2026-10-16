@@ -33,6 +33,8 @@
 //                                back on restore (default 0). Decrementer and CoreTiming are left alone.
 //   REV3_SYNCTEST_EXCLUDE=path   JSON {"ranges":[{"start","end"}]} subtracted from the snapshot (logged as NOTE exclude user ...),
 //                                to test excluding audio / scratch ranges without editing the whitelist
+//   REV3_SYNCTEST_AUDIO_HW=0 do not rewind the emulated audio hardware (DSP, AI, their CoreTiming events and PI interrupt bits)
+//                            together with memory (default 1, see "THE AUDIO HARDWARE" below)
 //   REV3_SYNCTEST_ADAPTIVE=0 do not learn the snapshot set in the running match (default 1: adaptive, see below)
 //   REV3_SYNCTEST_SCAN_SLICES=N  adaptive: every hook call hashes 1/N of all 4 KB pages of MEM1 + MEM2 (default 16)
 //   REV3_SYNCTEST_LEARN=N    adaptive: scan cycles that must complete with fighters present before SyncTest may arm (default 20)
@@ -49,6 +51,15 @@
 //   SyncTest arms only after LEARN full scan cycles; a page outside the set that changes later on a non-resimulated frame is
 //   added (layout rebuilt, history cleared). Resimulated frames are never scanned and a restore resets the baseline of the pages
 //   it rewrote, so rolling back cannot teach it anything.
+//
+// THE AUDIO HARDWARE (REV3_SYNCTEST_AUDIO_HW, default on)
+//   The audio runs on its own hardware clock (AI DMA every ~5 ms, DSP mail / interrupt handshakes, sound threads woken by them).
+//   Rewinding only memory rewinds the game's audio driver (AX's DSP handshake state, the sound threads' stacks) while the emulated
+//   DSP and AI move on, and the audio pipeline (and whatever waits on it) hangs. So every capture also saves the audio hardware
+//   (AudioHardware below) and every restore puts it back, right after the memory write-back and the JIT invalidation:
+//   the DSP manager + DSP emulator state, the AI registers, the CoreTiming events of those devices (as remaining cycles, so
+//   they stay in phase with the restored hardware state) and the DSP / AI interrupt bits of the PI. Nothing else of CoreTiming,
+//   the PI or the PPC is touched.
 //
 // HOW IT FITS IN
 //   Protocol and field table: GetSniperd/rev3-mod rev3mod/rbhook.py (game side), rev3mod/rbchecksum.py (FIELDS, TEAMS chain),
@@ -206,6 +217,41 @@ public:
   virtual bool DiscReadInFlight() { return false; }
 };
 
+// ---- audio hardware (REV3_SYNCTEST_AUDIO_HW) -------------------------------------------------------------------------------------
+// One pending CoreTiming event of an audio device, as remaining cycles (event time - now) so that it can be re-scheduled relative to
+// the time of the restore. `type` is the CoreTiming event type name ("AudioDMACallback", "DSPCallback", "AICallback", "DSPint",
+// "ARAMint"); userdata is the event's own payload (the DSPint interrupt type).
+struct AudioEvent
+{
+  std::string type;
+  s64 cycles = 0;  // >= 0
+  u64 userdata = 0;
+};
+
+// The emulated audio hardware, saved and restored with every snapshot. All calls are made on the CPU thread inside the hook's DMA
+// handler (the same moment as the memory capture / restore).
+class AudioHardware
+{
+public:
+  virtual ~AudioHardware() = default;
+  // "HLE" or "LLE" (logged once).
+  virtual const char* DspKind() const = 0;
+  // The CoreTiming event type names this object watches (logged once).
+  virtual std::vector<std::string> EventTypeNames() const = 0;
+  // Serialises the hardware state (DSP manager, DSP emulator, AI) into *out, which is resized to the exact size (the size may
+  // differ from call to call: the HLE mail queue is variable). False: the two passes (measure, write) disagreed or it failed.
+  virtual bool SaveState(std::vector<u8>* out) = 0;
+  // Loads a buffer written by SaveState. False: the buffer was not consumed exactly (the state may be half applied).
+  virtual bool LoadState(const std::vector<u8>& in) = 0;
+  // The pending events of the watched types, in firing order.
+  virtual void PendingEvents(std::vector<AudioEvent>* out) = 0;
+  // Removes every pending event of the watched types and schedules `events` (remaining cycles relative to now) in the given order.
+  virtual void ReplaceEvents(const std::vector<AudioEvent>& events) = 0;
+  // The DSP and AI cause bits of the processor interface (INT_CAUSE_DSP | INT_CAUSE_AI) and a way to set exactly those two.
+  virtual u32 InterruptBits() = 0;
+  virtual void SetInterruptBits(u32 bits) = 0;
+};
+
 class Sink
 {
 public:
@@ -284,6 +330,9 @@ struct SyncTestStats
   u64 scans = 0;
   u32 pages_learned_armed = 0;    // pages added to the set while armed
   u32 io_postponed = 0;           // rollbacks postponed because a disc read was in flight
+  u32 audio_restores = 0;         // restores that also put the audio hardware back
+  u64 audio_us_total = 0;         // time of those audio restores (state load + event re-scheduling)
+  u64 audio_us_max = 0;
 };
 
 class SyncTest
@@ -311,6 +360,12 @@ public:
   // SyncTest arms ("NOTE dsp at arm: ...") and appended to every HB line, so a freeze shows whether audio DMA stopped.
   void SetDspState(std::function<std::string()> dsp_state) { m_dsp_state = std::move(dsp_state); }
 
+  // Optional: the emulated audio hardware, saved with every capture and restored with every restore (see "THE AUDIO HARDWARE").
+  // Logs "NOTE audio hw rewind on (dsp=.., bytes=.., events=..)". Not owned; must outlive this object. nullptr switches it off. If a
+  // save or load fails later on, SyncTest logs an ERROR and carries on with memory only.
+  void SetAudioHardware(AudioHardware* audio);
+  bool AudioHardwareOn() const { return m_audio != nullptr; }
+
   const SyncTestStats& Stats() const { return m_stats; }
   bool Active() const { return m_armed; }  // armed (a fight, past the arm delay or toggled on by Z)
   const std::vector<Range>& Ranges() const { return m_ranges; }  // the current snapshot ranges (whitelist minus exclusions)
@@ -333,6 +388,13 @@ private:
     std::array<PadBytes, 2> inputs{};
     bool timebase_valid = false;
     u64 timebase = 0;                                       // emulated time base at capture (only with restore_timebase)
+    struct Audio
+    {
+      bool valid = false;
+      std::vector<u8> state;                                // AudioHardware::SaveState
+      std::vector<AudioEvent> events;                       // the audio devices' pending CoreTiming events
+      u32 irq = 0;                                          // PI DSP / AI cause bits
+    } audio;
   };
 
   bool FindFighters(std::array<u32, 2>* addrs) const;
@@ -343,6 +405,10 @@ private:
   Reply Normal(const Command& command, const std::array<u32, 2>& fighters);
   Reply Resim(const Command& command, const std::array<u32, 2>& fighters);
   bool Restore(const Slot& s, const Command& command, u32 to);
+  void CaptureAudio(Slot& slot, const Command& command);
+  // Puts the audio hardware back; returns the text appended to the RESTORE line (empty when nothing was restored).
+  std::string RestoreAudio(const Slot& s, const Command& command);
+  void DisableAudio(const std::string& why);
   Reply Noop(const Command& command);
   bool DiscReadPostpones(u32 frame);
   void RebuildLayout();
@@ -407,6 +473,9 @@ private:
   bool m_z_pending = false;  // a Z press not yet acted on (acted on outside a resimulation)
   u32 m_restore_logs = 0;    // RESTORE lines written (the first 10 in full, restores 11..30 as one short line)
   std::function<std::string()> m_dsp_state;
+  AudioHardware* m_audio = nullptr;  // null = memory only
+  size_t m_audio_bytes = 0;          // size of the latest audio state (it varies a little: the HLE mail queue)
+  u32 m_audio_size_notes = 0;        // "audio state size changed" lines written
   std::array<u32, 2> m_fighters{};            // the fighter addresses of the latest command (valid while both were found)
   std::vector<std::string> m_fields_annotated;  // field names already logged with their address / snapshot range
 

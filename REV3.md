@@ -72,6 +72,7 @@ Run (set the variables before starting Slippi_Dolphin.exe; the patched game with
 | `REV3_SYNCTEST_NOOP=1` | diagnosis: once armed, every frame capture S[n] and immediately restore S[n] (same frame), reply RESTORED with frame n and inputs n. Memory is unchanged in effect, but the game hook's RESTORED path (register reload from its stack frame) runs every frame. No comparisons. If the game runs fine in this mode the hook is cleared and the freeze comes from the memory rewind itself |
 | `REV3_SYNCTEST_HW_EXCLUDE=0` | do not cut hardware-DMA regions out of the snapshot (default on, see below) |
 | `REV3_SYNCTEST_ICACHE=0` | do not invalidate the JIT for restored ranges (default on) |
+| `REV3_SYNCTEST_AUDIO_HW=0` | do not rewind the emulated audio hardware (DSP, AI, their CoreTiming events, the PI DSP / AI interrupt bits) together with memory; default 1 = rewind it (see "Audio hardware rewind") |
 | `REV3_SYNCTEST_TB=1` | also store the emulated time base in every snapshot and set it back on restore (default 0, see "Time base" below) |
 | `REV3_SYNCTEST_EXCLUDE=path` | optional JSON `{"ranges":[{"start","end"}]}` (same format as the whitelist) subtracted from the snapshot after the whitelist is loaded; each range is logged as `NOTE exclude user 0x..-0x.. (n bytes were in the whitelist)`. Use it to test excluding audio / scratch ranges without editing the whitelist. A bad file or one that removes everything (classic mode only) turns SyncTest off with an error. Entries may be pointer based, `{"ptr":"0x8049D000","size":"0x3F0000","note":"nw4r sound system"}`: the u32 at `ptr` is read when SyncTest arms and at every exclusion re-check (every 600 hook calls) and `[value, value+size)` is excluded (for heaps the game allocates at run time: sound system work block `*0x8049D000` 0x3F0000 bytes, Home Button sound block `*0x80461B50` 0x18700 bytes). Logged as `NOTE exclude ptr entry 0x.. size=.. note=..` once, then `NOTE exclude ptr 0x8049D000 -> 0xS-0xE (n bytes were in the whitelist)` per resolved region (a region that moves adds a cut, the old one stays) or `NOTE exclude ptr 0x.. skipped: pointer is 0 | pointer is outside MEM1 / MEM2 (value 0x..)` once per value |
 | `REV3_SYNCTEST_LOG=path` | log file (default `<User>\Logs\rev3_synctest.log`), appended, flushed per line |
@@ -114,7 +115,55 @@ time to write the ranges back, `icache_us` the JIT invalidation.
 
 Narrowing a freeze, cheapest first: `REV3_SYNCTEST_ARM=pad` (arm by hand once the fight is running), `REV3_SYNCTEST_NOOP=1` (only
 the hook's register reload, memory unchanged), then a real run; `REV3_SYNCTEST_HW_EXCLUDE=0` and `REV3_SYNCTEST_ICACHE=0` switch
-the hardware cut-outs and the JIT invalidation off to see which one matters.
+the hardware cut-outs and the JIT invalidation off to see which one matters, and `REV3_SYNCTEST_AUDIO_HW=0` to see what the audio hardware rewind changes.
+
+### Audio hardware rewind (`REV3_SYNCTEST_AUDIO_HW`, default on)
+
+Why: with memory-only rewinds every resimulated frame matched (`fields=0` over 38 rollbacks, K=4), but the memory CRCs differed in the
+OS/thread areas and in a sound thread's stack (pointers into the AX AUX buffers, OS/AX return addresses), and the game froze about 40
+frames after arming. Excluding the sound memory made it freeze sooner (it cuts OSThreads out of the scheduler lists). The audio runs on
+its own hardware clock: the AI DMA interrupt every ~5 ms, DSP mails and interrupts, sound threads woken by them. A memory rewind turns
+AX's DSP handshake state back (AX believes the DSP is still busy with a frame whose "done" interrupt already happened) while the emulated
+DSP and AI move on, so the audio pipeline stops and whatever waits on it hangs. So the audio hardware is rewound together with memory.
+
+With every capture (same moment as the memory capture, in the hook's DMA handler on the CPU thread) the following is saved per
+snapshot slot; a restore puts it back right after the memory write-back and the JIT invalidation, in this order:
+
+1. **Hardware state** (`PointerWrap`, a measure pass then a write pass into the slot's byte buffer; read mode on restore):
+   `DSPManager::DoRewindState` (DSP control register, audio DMA, ARAM DMA and AR registers, then `DSPEmulator::DoState`: with the HLE DSP
+   the ucode CRCs, the AX ucode state, the mail handler; with LLE the DSP core) and `AudioInterfaceManager::DoRewindState` (AI control,
+   volume, sample counter, interrupt timing, rate divisors). Both are new methods next to `DoState`, because `DoState` has side effects
+   or costs that do not belong in a per-frame rewind: `DSPManager::DoState` writes the 16 MB ARAM on a GameCube (on a Wii ARAM is MEM2,
+   which the memory snapshot rewinds), and `AudioInterfaceManager::DoState` also runs `Mixer::DoState` (all mixers, including the Wiimote
+   speaker, Skylander and GBA ones) and keeps `m_last_cpu_time` as an absolute CoreTiming tick. The AI method leaves the mixer alone
+   (it re-applies the streaming volume and the rate divisors only if they differ) and stores `m_last_cpu_time` as an age (now - it) that
+   is rebased to the current tick on restore; otherwise the sample counter would jump forward by the CPU time that passed since the capture.
+   The host-side audio (mixer buffers, sound backend) is not rewound: the speakers keep being fed.
+2. **CoreTiming events of the audio devices.** `DSPCallback` (DSP time slices, periodic), `AudioDMACallback` (one 32-byte audio DMA block,
+   periodic, raises the AID interrupt), `AICallback` (AI sample counter), `DSPint` (delayed DSP / AID / ARAM interrupts, userdata = type),
+   `ARAMint` (ARAM DMA done). Each pending event of these types is saved as *remaining cycles* (event time - now) with its userdata
+   (new `CoreTimingManager::GetPendingEvents()` and `FindEventType()`; the queue itself stays private). A restore calls
+   `RemoveAllEvents` for these types and schedules the saved events again with the saved remaining cycles from now, in their old
+   firing order, so the events stay in phase with the restored hardware state. The rest of CoreTiming (VI, SI, EXI, IOS, DVD, GPU
+   events) and the global time are not touched, nor are the PPC registers (the game hook reloads its own).
+3. **PI interrupt bits.** Only `INT_CAUSE_DSP` and `INT_CAUSE_AI` of the PI cause register are set to their saved values with
+   `ProcessorInterfaceManager::SetInterrupt`, which also re-evaluates the PPC external exception the normal way. The mask and the
+   other cause bits are untouched.
+
+The state size varies a little from frame to frame (the HLE mail queue is a deque), so each capture measures first and sizes the slot's
+buffer; that is logged at most 3 times as a NOTE and is not an error. It is an error (and the audio rewind switches itself off, SyncTest
+carries on with memory only) when the measure and write passes disagree, when a load does not consume its buffer exactly, or when the
+state is empty or larger than 4 MB. With the LLE DSP on its own thread the DSP thread is locked out (`DSPEmulator::PauseAndLock`) while the
+state is read or written. Known gap: the HLE/LLE `control_reg_init_code_clear_time` is an absolute time base value; it only matters
+while the DSP is being initialised, and `REV3_SYNCTEST_TB=1` moves the time base, not it.
+
+Log lines: `NOTE audio hw rewind on (dsp=HLE|LLE, bytes=.., events=DSPCallback,AudioDMACallback,AICallback,DSPint,ARAMint)` once at start
+(a type that is not registered is listed as `name(not registered)`); `NOTE audio hw rewind off (REV3_SYNCTEST_AUDIO_HW=0): memory only`;
+`NOTE audio hw at arm: bytes=.. irq=0x.. events=n [DSPCallback+12345,...]` (the pending audio events with their remaining cycles) when
+SyncTest arms; every `RESTORE` line (full and short) ends with ` audio_bytes=.. audio_events=n`; `NOTE audio state size a -> b bytes`;
+`ERROR ...` plus `NOTE audio hw rewind off: <why>; memory only from now on` on a failure; and `audio_restores=.. audio_us_mean=..
+audio_us_max=..` at the end of every SUMMARY line. `REV3_SYNCTEST_NOOP=1` also restores the audio hardware (same frame), which exercises
+the save, load and event re-scheduling every frame without any rollback.
 
 ### Disc read gate
 

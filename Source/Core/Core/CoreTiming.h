@@ -122,6 +122,12 @@ public:
   void RemoveEvent(EventType* event_type);
   void RemoveAllEvents(EventType* event_type);
 
+  // Rev3 SyncTest (rollback self test; Slippi/Rev3Rollback.cpp): the registered type of that name, or nullptr; and a copy of every
+  // pending event in firing order (time, then scheduling order). Event::time is an absolute tick count (compare with GetTicks()).
+  // CPU thread only: the thread-safe queue is moved into the main queue first. Neither changes any timing state.
+  EventType* FindEventType(const std::string& name);
+  std::vector<Event> GetPendingEvents();
+
   // Advance must be called at the beginning of dispatcher loops, not the end. Advance() ends
   // the previous timing slice and begins the next one, you must Advance from the previous
   // slice to the current one before executing any cycles. CoreTiming starts in slice -1 so an

@@ -91,6 +91,19 @@ void DSPManager::DoState(PointerWrap& p)
   m_dsp_emulator->DoState(p);
 }
 
+void DSPManager::DoRewindState(PointerWrap& p)
+{
+  p.Do(m_dsp_control);
+  p.Do(m_audio_dma);
+  p.Do(m_aram_dma);
+  p.Do(m_aram_info);
+  p.Do(m_aram_mode);
+  p.Do(m_aram_refresh);
+  p.Do(m_dsp_slice);
+
+  m_dsp_emulator->DoState(p);
+}
+
 void DSPManager::GlobalCompleteARAM(Core::System& system, u64 userdata, s64 cyclesLate)
 {
   system.GetDSP().CompleteARAM(userdata, cyclesLate);

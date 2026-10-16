@@ -120,6 +120,88 @@ public:
   bool disc_busy = false;
 };
 
+// The emulated audio hardware: a counter the "game" advances every frame, a few variable-length bytes (like the HLE mail queue),
+// two pending CoreTiming events and the PI DSP / AI cause bits. Records how it was driven.
+class FakeAudio final : public AudioHardware
+{
+public:
+  explicit FakeAudio(FakeMemory* memory) : m_memory(memory) {}
+
+  const char* DspKind() const override { return "HLE"; }
+  std::vector<std::string> EventTypeNames() const override { return {"AudioDMACallback", "DSPint"}; }
+
+  bool SaveState(std::vector<u8>* out) override
+  {
+    ++saves;
+    if (fail_save)
+      return false;
+    out->assign(5 + extra.size() + extra_padding, 0);
+    for (int i = 0; i < 4; ++i)
+      (*out)[i] = u8(counter >> (8 * i));
+    (*out)[4] = u8(extra.size());
+    std::copy(extra.begin(), extra.end(), out->begin() + 5);
+    return true;
+  }
+  bool LoadState(const std::vector<u8>& in) override
+  {
+    ++loads;
+    // Memory (and its JIT invalidation) must already be back when the audio hardware is loaded.
+    invalidated_at_load.push_back(m_memory->invalidated.size());
+    if (fail_load)
+      return false;
+    counter = 0;
+    for (int i = 0; i < 4; ++i)
+      counter |= u32(in[i]) << (8 * i);
+    extra.assign(in.begin() + 5, in.begin() + 5 + in[4]);
+    return true;
+  }
+  void PendingEvents(std::vector<AudioEvent>* out) override { *out = events; }
+  void ReplaceEvents(const std::vector<AudioEvent>& e) override
+  {
+    ++replaces;
+    events = e;
+  }
+  u32 InterruptBits() override { return irq; }
+  void SetInterruptBits(u32 bits) override
+  {
+    ++irq_sets;
+    irq = bits;
+  }
+
+  // What the hardware does by itself while a frame runs.
+  void Advance()
+  {
+    ++counter;
+    extra.assign(vary_size ? counter % 3 : 0, 7);
+    events = {{"AudioDMACallback", 1000 - static_cast<s64>(counter % 1000), 0}, {"DSPint", 50 + static_cast<s64>(counter % 7), 0x80}};
+    irq = (counter & 1) != 0 ? 0x40 : 0x20;
+  }
+  std::string Key() const
+  {
+    std::string k = std::to_string(counter) + "/" + std::to_string(extra.size()) + "/" + std::to_string(irq);
+    for (const AudioEvent& e : events)
+      k += "/" + e.type + ":" + std::to_string(e.cycles) + ":" + std::to_string(e.userdata);
+    return k;
+  }
+
+  u32 counter = 0;
+  std::vector<u8> extra;
+  std::vector<AudioEvent> events;
+  u32 irq = 0;
+  bool vary_size = true;
+  size_t extra_padding = 0;  // makes the state bigger than the sanity limit in the oversize test
+  bool fail_save = false;
+  bool fail_load = false;
+  int saves = 0;
+  int loads = 0;
+  int replaces = 0;
+  int irq_sets = 0;
+  std::vector<size_t> invalidated_at_load;  // FakeMemory::invalidated.size() at each LoadState
+
+private:
+  FakeMemory* m_memory;
+};
+
 // The layout of the fake game's memory.
 constexpr u32 TEAM[2] = {0x80400000, 0x80401000};
 constexpr u32 NODE[2] = {0x80410000, 0x80411000};
@@ -179,6 +261,9 @@ public:
     const auto seen = m_tb_seen.emplace(m_counter, m_mem.time_base);
     if (!seen.second && seen.first->second != m_mem.time_base)
       m_tb_consistent = false;
+    // The audio hardware the capture of this frame sees; a RESTORED reply must bring exactly this state back.
+    if (m_audio != nullptr)
+      m_audio_seen.emplace(m_counter, m_audio->Key());
     Command c;
     c.frame = m_counter;
     c.pads = PadsFor(m_counter);
@@ -196,14 +281,28 @@ public:
       EXPECT_EQ(m_mem.U32(sp), r.frame) << "stack frame not restored";
       EXPECT_EQ(m_mem.U32(sp + 4), 0xC0FFEE00 + r.frame);
       m_counter = r.frame;
+      if (m_audio != nullptr)
+      {
+        const auto it = m_audio_seen.find(r.frame);
+        if (it == m_audio_seen.end() || it->second != m_audio->Key())
+          ++m_audio_wrong;
+        else
+          ++m_audio_right;
+      }
     }
     Step(r.pads);
+    if (m_audio != nullptr)
+      m_audio->Advance();  // the audio hardware runs on during the frame, rewound or not
     if (m_hw_writes)
       m_mem.SetU32(HW_WORD, ++m_hw_ticks);  // the hardware's own write, after the frame
     m_mem.time_base += TB_PER_FRAME;
     ++m_counter;
     return r;
   }
+
+  void AttachAudio(FakeAudio* audio) { m_audio = audio; }
+  int AudioRight() const { return m_audio_right; }  // RESTORED replies after which the audio hardware equalled its state at capture
+  int AudioWrong() const { return m_audio_wrong; }
 
   bool TimeBaseConsistent() const { return m_tb_consistent; }  // every revisited frame saw the time base it saw the first time
 
@@ -258,6 +357,10 @@ private:
   u32 m_late_page_from = 0;
   u32 m_walk_from = 0;
   u32 m_walk_stride = 0;
+  FakeAudio* m_audio = nullptr;
+  std::map<u32, std::string> m_audio_seen;
+  int m_audio_right = 0;
+  int m_audio_wrong = 0;
   std::map<u32, u64> m_tb_seen;
   bool m_tb_consistent = true;
   u32 m_counter = 1000;
@@ -1727,4 +1830,204 @@ TEST(Rev3Rollback, NoopRestoresAlsoWaitForTheDisc)
     EXPECT_EQ(game.Frame(test).flags, 0u);
   EXPECT_EQ(test.Stats().noop_restores, noops);
   EXPECT_EQ(test.Stats().io_postponed, 10u);
+}
+
+// ---- audio hardware rewind ----------------------------------------------------------------------------------------------------
+
+TEST(Rev3Rollback, AudioHardwareIsRewoundWithMemory)
+{
+  FakeGame game(false);
+  FakeAudio audio(&game.Mem());
+  game.AttachAudio(&audio);
+  FakeSink sink;
+  SyncTest test(Options(2), game.Ranges(), game.Mem(), sink, FakeClock());
+  test.SetAudioHardware(&audio);
+  EXPECT_TRUE(test.AudioHardwareOn());
+  EXPECT_TRUE(sink.Contains("NOTE audio hw rewind on (dsp=HLE, bytes=5, events=AudioDMACallback,DSPint)"));
+
+  for (int i = 0; i < 400; ++i)
+    game.Frame(test);
+  const SyncTestStats& s = test.Stats();
+  EXPECT_GT(s.rollbacks, 50u);
+  EXPECT_EQ(s.mismatching_frames, 0u);
+  // After every restore the audio hardware was exactly what the capture of that frame saw: state, events, interrupt bits.
+  EXPECT_EQ(game.AudioWrong(), 0);
+  EXPECT_EQ(game.AudioRight(), static_cast<int>(s.rollbacks));
+  EXPECT_EQ(audio.loads, static_cast<int>(s.rollbacks));
+  EXPECT_EQ(audio.replaces, static_cast<int>(s.rollbacks));
+  EXPECT_EQ(audio.irq_sets, static_cast<int>(s.rollbacks));
+  EXPECT_EQ(s.audio_restores, s.rollbacks);
+  // Memory was written back and the JIT invalidated before the audio hardware was loaded.
+  EXPECT_FALSE(audio.invalidated_at_load.empty());
+  if (!audio.invalidated_at_load.empty())
+    EXPECT_GT(*std::min_element(audio.invalidated_at_load.begin(), audio.invalidated_at_load.end()), 0u);
+  EXPECT_FALSE(sink.Contains("ERROR"));
+  EXPECT_FALSE(sink.Contains("MISMATCH"));
+  EXPECT_TRUE(sink.Contains("NOTE audio hw at arm: bytes="));
+  EXPECT_TRUE(sink.Contains("events=2 [AudioDMACallback+"));
+  // The RESTORE lines (full and short) carry the audio size and event count.
+  int with_audio = 0;
+  for (const std::string& l : sink.lines)
+    with_audio += l.rfind("RESTORE ", 0) == 0 && l.find(" audio_events=2") != std::string::npos && l.find(" audio_bytes=") != std::string::npos;
+  EXPECT_EQ(with_audio, 30);  // 10 full + 20 short lines are logged
+  test.Finish();
+  EXPECT_TRUE(sink.Contains("audio_restores=" + std::to_string(s.rollbacks)));
+}
+
+TEST(Rev3Rollback, AudioStateSizeMayVaryWithoutError)
+{
+  FakeGame game(false);
+  FakeAudio audio(&game.Mem());
+  game.AttachAudio(&audio);
+  FakeSink sink;
+  SyncTest test(Options(2), game.Ranges(), game.Mem(), sink, FakeClock());
+  test.SetAudioHardware(&audio);
+  for (int i = 0; i < 200; ++i)
+    game.Frame(test);
+  EXPECT_TRUE(test.AudioHardwareOn());
+  EXPECT_GT(test.Stats().rollbacks, 20u);
+  EXPECT_EQ(game.AudioWrong(), 0);
+  EXPECT_TRUE(sink.Contains("NOTE audio state size 5 -> "));
+  EXPECT_FALSE(sink.Contains("ERROR"));
+  int notes = 0;
+  for (const std::string& l : sink.lines)
+    notes += l.find("NOTE audio state size") != std::string::npos;
+  EXPECT_EQ(notes, 3);  // rate limited
+}
+
+TEST(Rev3Rollback, AudioHardwareOffByDefaultChangesNothing)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTest test(Options(2), game.Ranges(), game.Mem(), sink, FakeClock());
+  EXPECT_FALSE(test.AudioHardwareOn());
+  for (int i = 0; i < 100; ++i)
+    game.Frame(test);
+  EXPECT_GT(test.Stats().rollbacks, 10u);
+  EXPECT_EQ(test.Stats().audio_restores, 0u);
+  EXPECT_FALSE(sink.Contains("audio_bytes="));
+  EXPECT_FALSE(sink.Contains("NOTE audio"));
+  const std::string full = "RESTORE 1061 -> 1059 bytes=" + std::to_string(320 + WINDOW) + " us=7 icache_us=7";
+  bool exact = false;
+  for (const std::string& l : sink.lines)
+    exact = exact || l == full;  // the line is unchanged: nothing appended
+  EXPECT_TRUE(exact);
+}
+
+TEST(Rev3Rollback, FailedAudioSaveFallsBackToMemoryOnly)
+{
+  FakeGame game(false);
+  FakeAudio audio(&game.Mem());
+  game.AttachAudio(&audio);
+  FakeSink sink;
+  SyncTest test(Options(2), game.Ranges(), game.Mem(), sink, FakeClock());
+  test.SetAudioHardware(&audio);
+  for (int i = 0; i < 100; ++i)
+    game.Frame(test);
+  const u32 rollbacks = test.Stats().rollbacks;
+  const int loads = audio.loads;
+  EXPECT_GT(rollbacks, 10u);
+  audio.fail_save = true;  // e.g. the measure and write passes disagreed
+  for (int i = 0; i < 100; ++i)
+    game.Frame(test);
+  EXPECT_FALSE(test.AudioHardwareOn());
+  EXPECT_TRUE(sink.Contains("ERROR frame "));
+  EXPECT_TRUE(sink.Contains("the audio hardware state could not be saved"));
+  EXPECT_TRUE(sink.Contains("NOTE audio hw rewind off:"));
+  // Rollbacks go on with memory only, and nothing touches the audio hardware any more.
+  EXPECT_GT(test.Stats().rollbacks, rollbacks + 10u);
+  EXPECT_LE(audio.loads, loads + 2);
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u);
+}
+
+TEST(Rev3Rollback, FailedAudioLoadFallsBackToMemoryOnly)
+{
+  FakeGame game(false);
+  FakeAudio audio(&game.Mem());
+  game.AttachAudio(&audio);
+  FakeSink sink;
+  SyncTest test(Options(2), game.Ranges(), game.Mem(), sink, FakeClock());
+  test.SetAudioHardware(&audio);
+  audio.fail_load = true;
+  for (int i = 0; i < 150; ++i)
+    game.Frame(test);
+  EXPECT_FALSE(test.AudioHardwareOn());
+  EXPECT_EQ(audio.loads, 1);  // tried once, then off
+  EXPECT_EQ(audio.replaces, 0);
+  EXPECT_TRUE(sink.Contains("was not consumed exactly on restore"));
+  EXPECT_TRUE(sink.Contains("NOTE audio hw rewind off:"));
+  EXPECT_GT(test.Stats().rollbacks, 20u);
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u);
+}
+
+TEST(Rev3Rollback, UnusableAudioStateIsNotEnabled)
+{
+  FakeGame game(false);
+  FakeAudio audio(&game.Mem());
+  audio.extra_padding = 5u << 20;  // 5 MB: more than the DSP / AI registers can be (a GameCube ARAM dump, say)
+  FakeSink sink;
+  SyncTest test(Options(2), game.Ranges(), game.Mem(), sink, FakeClock());
+  test.SetAudioHardware(&audio);
+  EXPECT_FALSE(test.AudioHardwareOn());
+  EXPECT_TRUE(sink.Contains("ERROR audio hardware state is unusable at start"));
+
+  FakeAudio failing(&game.Mem());
+  failing.fail_save = true;
+  test.SetAudioHardware(&failing);
+  EXPECT_FALSE(test.AudioHardwareOn());
+
+  // A state that grows past the limit while running switches the audio off at the capture.
+  FakeAudio growing(&game.Mem());
+  game.AttachAudio(&growing);
+  test.SetAudioHardware(&growing);
+  EXPECT_TRUE(test.AudioHardwareOn());
+  for (int i = 0; i < 70; ++i)
+    game.Frame(test);
+  growing.extra_padding = 5u << 20;
+  game.Frame(test);
+  EXPECT_FALSE(test.AudioHardwareOn());
+  EXPECT_TRUE(sink.Contains("the audio hardware state is "));
+  for (int i = 0; i < 50; ++i)
+    game.Frame(test);
+  EXPECT_GT(test.Stats().rollbacks, 5u);
+}
+
+TEST(Rev3Rollback, NoopModeAlsoRestoresTheAudioHardware)
+{
+  FakeGame game(false);
+  FakeAudio audio(&game.Mem());
+  game.AttachAudio(&audio);
+  FakeSink sink;
+  SyncTestOptions o = Options(2);
+  o.noop = true;
+  SyncTest test(o, game.Ranges(), game.Mem(), sink, FakeClock());
+  test.SetAudioHardware(&audio);
+  for (int i = 0; i < 200; ++i)
+    game.Frame(test);
+  const SyncTestStats& s = test.Stats();
+  EXPECT_GT(s.noop_restores, 100u);
+  EXPECT_EQ(s.audio_restores, s.noop_restores);
+  EXPECT_EQ(game.AudioWrong(), 0);  // same frame, same audio state: nothing changed by the round trip
+  EXPECT_EQ(game.AudioRight(), static_cast<int>(s.noop_restores));
+  EXPECT_FALSE(sink.Contains("ERROR"));
+}
+
+TEST(Rev3Rollback, AudioIsLeftAloneWhenTheRestoreIsRefused)
+{
+  FakeGame game(false);
+  FakeAudio audio(&game.Mem());
+  game.AttachAudio(&audio);
+  FakeSink sink;
+  SyncTest test(Options(2), game.Ranges(), game.Mem(), sink, FakeClock());
+  test.SetAudioHardware(&audio);
+  for (int i = 0; i < 70; ++i)
+    game.Frame(test);
+  while (test.Resimulating())
+    game.Frame(test);
+  const int loads = audio.loads;
+  const Reply r = game.Frame(test, SP + 0x40);  // another sp: the restore is refused, memory and audio stay as they are
+  EXPECT_EQ(r.flags, 0u);
+  EXPECT_EQ(audio.loads, loads);
+  EXPECT_EQ(audio.replaces, loads);
+  EXPECT_TRUE(test.AudioHardwareOn());
 }

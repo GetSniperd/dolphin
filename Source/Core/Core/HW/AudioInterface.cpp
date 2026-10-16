@@ -93,6 +93,38 @@ void AudioInterfaceManager::DoState(PointerWrap& p)
   sound_stream->GetMixer()->DoState(p);
 }
 
+void AudioInterfaceManager::DoRewindState(PointerWrap& p)
+{
+  const u32 old_volume = m_volume.hex;
+  const u32 old_ais_divisor = m_ais_sample_rate_divisor;
+  const u32 old_aid_divisor = m_aid_sample_rate_divisor;
+
+  p.Do(m_control);
+  p.Do(m_volume);
+  p.Do(m_sample_counter);
+  p.Do(m_interrupt_timing);
+  p.Do(m_ais_sample_rate_divisor);
+  p.Do(m_aid_sample_rate_divisor);
+  p.Do(m_cpu_cycles_per_sample);
+
+  // While playing, m_last_cpu_time is a CoreTiming tick (age = now - it); while stopped it holds the frozen sample remainder.
+  const u64 now = m_system.GetCoreTiming().GetTicks();
+  u64 last = (p.IsReadMode() || !IsPlaying()) ? m_last_cpu_time : now - m_last_cpu_time;
+  p.Do(last);
+  if (p.IsReadMode())
+  {
+    m_last_cpu_time = IsPlaying() ? now - last : last;
+
+    Mixer* const mixer = m_system.GetSoundStream()->GetMixer();
+    if (m_volume.hex != old_volume)
+      mixer->SetStreamingVolume(m_volume.left, m_volume.right);
+    if (m_ais_sample_rate_divisor != old_ais_divisor)
+      mixer->SetStreamInputSampleRateDivisor(m_ais_sample_rate_divisor);
+    if (m_aid_sample_rate_divisor != old_aid_divisor)
+      mixer->SetDMAInputSampleRateDivisor(m_aid_sample_rate_divisor);
+  }
+}
+
 void AudioInterfaceManager::UpdateInterrupts()
 {
   m_system.GetProcessorInterface().SetInterrupt(ProcessorInterface::INT_CAUSE_AI,

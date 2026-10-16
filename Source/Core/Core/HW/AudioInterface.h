@@ -42,6 +42,11 @@ public:
   void Init();
   void Shutdown();
   void DoState(PointerWrap& p);
+  // Rev3 SyncTest (Slippi/Rev3Rollback.cpp): the AI registers without the host-side Mixer (DoState also calls Mixer::DoState, which
+  // covers the Wiimote speaker, Skylander and GBA mixers too). The sample-counter time reference m_last_cpu_time is stored as an age
+  // (now - m_last_cpu_time) and rebased to the current CoreTiming tick on read, so a rewind does not make the counter jump by the
+  // CPU time that passed since the capture. The mixer's rate divisors and volume are re-applied when they differ.
+  void DoRewindState(PointerWrap& p);
   bool IsPlaying() const;
 
   void RegisterMMIO(MMIO::Mapping* mmio, u32 base);
