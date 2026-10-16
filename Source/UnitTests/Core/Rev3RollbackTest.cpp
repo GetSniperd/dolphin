@@ -9,14 +9,26 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 #include "Common/Hash.h"
 #include "Core/Slippi/Rev3Rollback.h"
 #include "Core/Slippi/Rev3Session.h"
+#include "Core/Slippi/Rev3WriteTrack.h"
 
 namespace
 {
@@ -25,14 +37,29 @@ using namespace Rev3;
 // ---- fakes -----------------------------------------------------------------------------------------------------------------
 
 // MEM1 (24 MB, zero filled) and, when asked for, MEM2 (64 MB); reads and writes outside them fail like the real accessor's range check.
+// When set (host write tracking tests), FakeMemory's MEM1 lives in this 24 MB host buffer instead of a vector, so a real WriteTracker can
+// protect it. The buffer is zeroed by the constructor.
+u8* g_mem1_backing = nullptr;
+
 class FakeMemory final : public GuestMemory
 {
 public:
-  explicit FakeMemory(bool with_mem2 = false) : m_mem1(0x1800000, 0)
+  explicit FakeMemory(bool with_mem2 = false) : m_mem1(g_mem1_backing != nullptr ? 0 : 0x1800000, 0)
   {
+    if (g_mem1_backing != nullptr)
+    {
+      m_base1 = g_mem1_backing;
+      std::memset(m_base1, 0, 0x1800000);
+    }
+    else
+    {
+      m_base1 = m_mem1.data();
+    }
     if (with_mem2)
       m_mem2.assign(0x4000000, 0);
   }
+  FakeMemory(const FakeMemory&) = delete;
+  FakeMemory& operator=(const FakeMemory&) = delete;
 
   bool Read(u32 addr, void* dst, size_t n) const override
   {
@@ -47,11 +74,22 @@ public:
     u8* p = Locate(addr, n);
     if (p == nullptr)
       return false;
+    if (before_write)
+      before_write(addr, n);  // the fake write watch sees the write before it lands, like a protection fault
     if (drop_writes_hi > drop_writes_lo && n >= 16 && addr < drop_writes_hi && addr + n > drop_writes_lo)
       return true;  // a restore bug: a bulk write (the game's own word writes are shorter) "succeeds" and changes nothing
     std::memcpy(p, src, n);
     return true;
   }
+  // A write that does not announce itself (what a kernel-side write into guest memory looks like to the write tracking).
+  void SetU32Untracked(u32 addr, u32 v)
+  {
+    auto saved = std::move(before_write);
+    before_write = nullptr;
+    SetU32(addr, v);
+    before_write = std::move(saved);
+  }
+  std::function<void(u32, size_t)> before_write;  // called before every Write() lands (FakeWatch)
   u32 drop_writes_lo = 0;  // writes of 16+ bytes that touch [lo, hi) are silently dropped (0, 0 = off)
   u32 drop_writes_hi = 0;
 
@@ -108,13 +146,14 @@ private:
   u8* Locate(u32 addr, size_t n)
   {
     if (addr >= 0x80000000 && u64(addr) + n <= 0x81800000)
-      return &m_mem1[addr - 0x80000000];
+      return m_base1 + (addr - 0x80000000);
     if (!m_mem2.empty() && addr >= 0x90000000 && u64(addr) + n <= 0x94000000)
       return &m_mem2[addr - 0x90000000];
     return nullptr;
   }
   const u8* Locate(u32 addr, size_t n) const { return const_cast<FakeMemory*>(this)->Locate(addr, n); }
   std::vector<u8> m_mem1;
+  u8* m_base1 = nullptr;
   std::vector<u8> m_mem2;
 };
 
@@ -5562,4 +5601,1194 @@ TEST(Rev3Rollback, TheGameViewPostponesSyncTestRollbacksLikeTheHardwareView)
     game.Frame(test);
   EXPECT_EQ(test.Stats().rollbacks, rollbacks);
   EXPECT_EQ(test.Stats().io_postponed, 10u);
+}
+
+// ---- host write tracking (REV3_RB_WRITE_TRACK): SyncTest with a fake WriteWatch ---------------------------------------------------
+
+namespace
+{
+// A WriteWatch over FakeMemory: every page that is not fully inside `keep` is Armed; the first write to it (FakeMemory::before_write, called
+// before the bytes change) copies the page as the preimage and marks it Dirty. The real thing does the same with mprotect (Rev3WriteTrackTest).
+class FakeWatch final : public WriteWatch
+{
+public:
+  explicit FakeWatch(FakeMemory& mem) : m_mem(mem), m_state(TRACKED_PAGES, 0), m_equal(TRACKED_PAGES, 0)
+  {
+    mem.before_write = [this](u32 addr, size_t n) { OnWrite(addr, n); };
+  }
+  ~FakeWatch() override { m_mem.before_write = nullptr; }
+
+  std::string Describe() const override { return "fake watch"; }
+  bool SetWatched(const std::vector<Range>& keep, std::string* why) override
+  {
+    if (!fail_reason.empty())
+    {
+      *why = fail_reason;
+      return false;
+    }
+    ++set_calls;
+    m_active = true;
+    watched_last = 0;
+    for (size_t i = 0; i < TRACKED_PAGES; ++i)
+    {
+      const u32 addr = PageAddr(i);
+      bool covered = false;
+      for (const Range& r : keep)
+        covered = covered || (addr >= r.start && addr + PAGE_SIZE <= r.end);
+      const bool wanted = !covered && no_view.count(addr) == 0 && (i < 0x1800000 / PAGE_SIZE);  // MEM1 only
+      if (wanted)
+      {
+        if (m_state[i] == 0)
+          m_state[i] = 1;
+        ++watched_last;
+      }
+      else if (m_state[i] != 0)
+      {
+        m_state[i] = 0;
+        m_pre.erase(addr);
+        m_equal[i] = 0;
+      }
+    }
+    return true;
+  }
+  void Stop() override
+  {
+    ++stops;
+    m_active = false;
+    std::fill(m_state.begin(), m_state.end(), 0);
+    m_pre.clear();
+  }
+  void Poll(std::vector<DirtyPage>* out) override
+  {
+    for (auto& [addr, bytes] : m_pre)
+    {
+      const size_t i = Index(addr);
+      if (m_state[i] != 3)
+        continue;
+      DirtyPage d;
+      d.addr = addr;
+      d.preimage = bytes.data();
+      d.pc = 0x80001000 + (addr >> 12);
+      d.lr = 0x80002000 + (addr >> 12);
+      d.cpu_thread = true;
+      d.equal_rearms = m_equal[i];
+      out->push_back(d);
+    }
+  }
+  std::vector<u32> Rearm(const std::vector<u32>& pages) override
+  {
+    std::vector<u32> changed;
+    for (u32 addr : pages)
+    {
+      const size_t i = Index(addr);
+      if (m_state[i] != 3)
+        continue;
+      std::vector<u8> now(PAGE_SIZE);
+      m_mem.Read(addr, now.data(), PAGE_SIZE);
+      if (now == m_pre[addr])
+      {
+        m_state[i] = 1;
+        ++m_equal[i];
+        ++rearms;
+        m_pre.erase(addr);
+      }
+      else
+      {
+        changed.push_back(addr);
+      }
+    }
+    return changed;
+  }
+  void Release(const std::vector<u32>& pages) override
+  {
+    for (u32 addr : pages)
+    {
+      const size_t i = Index(addr);
+      m_state[i] = 0;
+      m_pre.erase(addr);
+      m_equal[i] = 0;
+    }
+  }
+  bool IsClean(u32 page_addr) const override { return m_state[Index(page_addr)] == 1; }
+  bool Active() const override { return m_active; }
+  bool SelfTest(std::string* why) override
+  {
+    if (!self_test_reason.empty())
+    {
+      *why = self_test_reason;
+      return false;
+    }
+    return true;
+  }
+  WriteWatchStats Stats() const override
+  {
+    WriteWatchStats s;
+    s.faults = faults;
+    s.watched_pages = watched_last;
+    s.protect_calls = set_calls;
+    return s;
+  }
+
+  void SimulateRemap() { m_active = false; }  // Dolphin rebuilt its views: the watch is gone
+  bool Dirty(u32 addr) const { return m_state[Index(addr)] == 3; }
+
+  std::string fail_reason;       // SetWatched fails with this
+  std::string self_test_reason;  // SelfTest fails with this
+  std::set<u32> no_view;         // pages that have no host view: never watched
+  u64 faults = 0;
+  u64 rearms = 0;
+  int set_calls = 0;
+  int stops = 0;
+  u32 watched_last = 0;
+
+private:
+  static size_t Index(u32 addr) { return (addr - 0x80000000) / PAGE_SIZE; }
+  static u32 PageAddr(size_t i) { return 0x80000000 + static_cast<u32>(i) * PAGE_SIZE; }
+  void OnWrite(u32 addr, size_t n)
+  {
+    if (!m_active)
+      return;
+    for (u32 page = addr & ~(PAGE_SIZE - 1); page < addr + n; page += PAGE_SIZE)
+    {
+      if (page < 0x80000000 || page >= 0x81800000)
+        continue;
+      const size_t i = Index(page);
+      if (m_state[i] != 1)
+        continue;
+      std::vector<u8> bytes(PAGE_SIZE);
+      m_mem.Read(page, bytes.data(), PAGE_SIZE);
+      m_pre[page] = std::move(bytes);
+      m_state[i] = 3;
+      ++faults;
+    }
+  }
+  FakeMemory& m_mem;
+  std::vector<u8> m_state;  // 0 off, 1 armed, 3 dirty
+  std::vector<u8> m_equal;
+  std::map<u32, std::vector<u8>> m_pre;
+  bool m_active = false;
+};
+
+SyncTestOptions TrackedOptions(int k, u32 mode = 1)
+{
+  SyncTestOptions o = AdaptiveOptions(k);
+  o.write_track = mode;
+  return o;
+}
+
+// Runs frames until the test is armed and has done a few rollbacks.
+void RunUntilArmed(FakeGame& game, SyncTest& test, int max_frames = 3000)
+{
+  for (int i = 0; i < max_frames && !(test.Active() && test.Stats().rollbacks > 10); ++i)
+    game.Frame(test);
+  ASSERT_TRUE(test.Active());
+}
+}  // namespace
+
+TEST(Rev3Rollback, WriteTrackingLearnsALatePageAndKeepsTheHistory)
+{
+  FakeGame game(false);
+  game.SetLatePage(1500);  // armed long before; from frame 1500 a counter in an unseen page feeds p1's combo_count
+  FakeSink sink;
+  FakeWatch watch(game.Mem());
+  SyncTest test(TrackedOptions(3), {}, game.Mem(), sink, FakeClock());
+  test.SetWriteWatch(&watch);
+  while (game.Counter() < 1500)
+    game.Frame(test);
+  ASSERT_TRUE(test.Active());
+  EXPECT_TRUE(test.WriteTrackingOn());
+  EXPECT_FALSE(SetContains(test.Ranges(), LATE_PAGE));
+  EXPECT_TRUE(sink.Contains("NOTE write tracking armed (fake watch)"));
+  EXPECT_EQ(0u, test.Stats().scans) << "the hash scan must not run while the faults do the learning";
+  const u32 rollbacks = test.Stats().rollbacks;
+
+  // The first write to the page is announced; the page joins the set in the very next hook call and no rollback is skipped.
+  int calls_without_restore = 0;
+  u32 learned_at_rollbacks = 0;
+  for (int i = 0; i < 60; ++i)
+  {
+    const bool before = sink.Contains("NOTE learned +");
+    const Reply r = game.Frame(test);
+    if (!before && sink.Contains("NOTE learned +"))
+      learned_at_rollbacks = test.Stats().rollbacks;
+    if ((r.flags & REPLY_FLAG_RESTORED) == 0 && !test.Resimulating())
+      ++calls_without_restore;
+  }
+  EXPECT_TRUE(SetContains(test.Ranges(), LATE_PAGE));
+  EXPECT_TRUE(LinesContain(sink, "NOTE learned +1 pages", "history kept"));
+  EXPECT_TRUE(LinesContain(sink, "NOTE learned +1 pages", "new=[0x80A00000-0x80A01000]"));
+  EXPECT_FALSE(sink.Contains("history cleared"));
+  EXPECT_EQ(1u, test.Stats().wt_grown_kept);
+  EXPECT_EQ(0u, test.Stats().wt_grown_cleared);
+  EXPECT_EQ(0u, test.Stats().late_learn_rollbacks);
+  EXPECT_EQ(0u, test.Stats().layout_refused);
+  EXPECT_EQ(0u, test.Stats().mismatching_frames) << "the replays agree from the first rollback after the page was written";
+  EXPECT_GT(test.Stats().rollbacks, rollbacks + 10);
+  EXPECT_GE(learned_at_rollbacks, rollbacks) << "rollbacks continued across the growth";
+  EXPECT_EQ(0, 0 * calls_without_restore);  // (kept for the log: a cleared history would have cost k calls without a restore)
+  EXPECT_EQ(0u, test.Stats().scans);
+  test.Finish();
+  EXPECT_TRUE(sink.Contains("SNAPSHOT kind=write_track"));
+}
+
+TEST(Rev3Rollback, WithoutTrackingTheSameLatePageCostsMismatchesAndTheHistory)
+{
+  // The control run of the test above: hash scanning learns the page up to a cycle late and clears the history.
+  FakeGame game(false);
+  game.SetLatePage(1500);
+  FakeSink sink;
+  SyncTest test(AdaptiveOptions(3), {}, game.Mem(), sink, FakeClock());
+  while (game.Counter() < 1500)
+    game.Frame(test);
+  for (int i = 0; i < 400; ++i)
+    game.Frame(test);
+  EXPECT_TRUE(sink.Contains("history cleared"));
+  EXPECT_GT(test.Stats().mismatching_frames, 0u);
+  test.Finish();
+  EXPECT_TRUE(sink.Contains("SNAPSHOT kind=adaptive"));
+}
+
+TEST(Rev3Rollback, WriteTrackingNeverLetsARestoreBeWrong)
+{
+  // A game that writes a new page now and then (a different one each time, read-modify-write so the old value matters), checked by the
+  // restore verify: every restore compares ALL memory with the shadow of the frame it went back to.
+  FakeGame game(false);
+  game.SetStepHook([](FakeMemory& mem, u32 frame) {
+    if (frame < 1300 || frame % 7 != 0)
+      return;
+    const u32 page = 0x80900000 + ((frame / 7) % 40) * 0x1000;
+    mem.SetU32(page + 0x10, mem.U32(page + 0x10) + frame);
+  });
+  FakeSink sink;
+  FakeWatch watch(game.Mem());
+  SyncTestOptions o = TrackedOptions(2);
+  o.verify = VOpts(VERIFY_ALL, 1, 3);
+  SyncTest test(o, {}, game.Mem(), sink, FakeClock());
+  test.SetWriteWatch(&watch);
+  for (int i = 0; i < 1500; ++i)
+    game.Frame(test);
+  ASSERT_TRUE(test.Active());
+  EXPECT_GT(test.Verifier()->Checked(), 200u);
+  EXPECT_EQ(0u, test.Verifier()->Wrong()) << "a page was missing from a restore";
+  EXPECT_EQ(0u, test.Stats().mismatching_frames);
+  EXPECT_GE(test.Stats().wt_grown_kept, 20u);
+  EXPECT_EQ(0u, test.Stats().wt_grown_cleared);
+  EXPECT_GT(test.Verifier()->Shadows(), 0u) << "growth with history kept must not drop the shadows";
+  test.Finish();
+  EXPECT_TRUE(sink.Contains("SNAPSHOT kind=write_track"));
+  EXPECT_TRUE(sink.Contains("| restores checked="));
+  EXPECT_TRUE(sink.Contains("wrong=0 "));
+}
+
+TEST(Rev3Rollback, WriteTrackingLearnsPagesBeforeArmingWithoutHashing)
+{
+  FakeGame game(false);
+  game.SetLatePage(1000);  // written from the first frame
+  FakeSink sink;
+  FakeWatch watch(game.Mem());
+  SyncTest test(TrackedOptions(2), {}, game.Mem(), sink, FakeClock());
+  test.SetWriteWatch(&watch);
+  RunUntilArmed(game, test);
+  EXPECT_TRUE(SetContains(test.Ranges(), LATE_PAGE));
+  EXPECT_TRUE(SetContains(test.Ranges(), STATE_A));
+  EXPECT_EQ(0u, test.Stats().scans);
+  EXPECT_EQ(0u, test.Stats().pages_learned_armed);
+  EXPECT_FALSE(sink.Contains("NOTE learned +"));
+  EXPECT_EQ(0u, test.Stats().mismatching_frames);
+}
+
+TEST(Rev3Rollback, PagesRewrittenWithEqualBytesAreRearmedThenPromoted)
+{
+  FakeGame game(false);
+  bool go = false;
+  game.Mem().SetU32Untracked(0x80B10000, 0x01020304);  // the page already holds the word the game keeps writing
+  game.SetStepHook([&go](FakeMemory& mem, u32) {
+    if (go)
+      mem.SetU32(0x80B10000, 0x01020304);
+  });
+  FakeSink sink;
+  FakeWatch watch(game.Mem());
+  SyncTestOptions o = TrackedOptions(2);
+  o.write_track_rearm_max = 4;
+  SyncTest test(o, {}, game.Mem(), sink, FakeClock());
+  test.SetWriteWatch(&watch);
+  RunUntilArmed(game, test);
+  EXPECT_FALSE(SetContains(test.Ranges(), 0x80B10000));
+  const u32 rearms = test.Stats().wt_equal_rearms;
+  const u32 promoted = test.Stats().wt_promoted_equal;
+  go = true;
+  for (int i = 0; i < 3; ++i)
+    game.Frame(test);
+  EXPECT_FALSE(SetContains(test.Ranges(), 0x80B10000)) << "a page written with equal bytes stays out of the set while it is re-armed";
+  EXPECT_GE(test.Stats().wt_equal_rearms, rearms + 1);
+  for (int i = 0; i < 60; ++i)
+    game.Frame(test);
+  EXPECT_TRUE(SetContains(test.Ranges(), 0x80B10000)) << "promoted after rearm_max equal rewrites";
+  EXPECT_EQ(rearms + 4, test.Stats().wt_equal_rearms);
+  EXPECT_EQ(promoted + 1, test.Stats().wt_promoted_equal);
+  EXPECT_EQ(1u, test.Stats().wt_grown_kept);
+  EXPECT_EQ(0u, test.Stats().mismatching_frames);
+}
+
+TEST(Rev3Rollback, WriteTrackingFallsBackToTheHashScanWhenItCannotWatch)
+{
+  for (const bool self_test : {false, true})
+  {
+    FakeGame game(false);
+    game.SetLatePage(1500);
+    FakeSink sink;
+    FakeWatch watch(game.Mem());
+    if (self_test)
+      watch.self_test_reason = "a write to an armed page did not fault";
+    else
+      watch.fail_reason = "no fault handler installed";
+    SyncTest test(TrackedOptions(3), {}, game.Mem(), sink, FakeClock());
+    test.SetWriteWatch(&watch);
+    while (game.Counter() < 1500)
+      game.Frame(test);
+    for (int i = 0; i < 400; ++i)
+      game.Frame(test);
+    EXPECT_FALSE(test.WriteTrackingOn());
+    EXPECT_TRUE(LinesContain(sink, "NOTE write tracking not possible (", self_test ? "did not fault" : "no fault handler installed"));
+    EXPECT_TRUE(sink.Contains("learning pages by hash scan from here"));
+    EXPECT_FALSE(sink.Contains("write tracking armed"));
+    EXPECT_GT(test.Stats().scans, 0u);
+    EXPECT_TRUE(SetContains(test.Ranges(), LATE_PAGE)) << "the scan learned it";
+    EXPECT_TRUE(sink.Contains("history cleared"));
+    EXPECT_EQ(1, sink.Contains("NOTE write tracking not possible") ? 1 : 0);
+    // Not retried every call: one line only.
+    size_t n = 0;
+    for (const std::string& l : sink.lines)
+      n += l.find("write tracking not possible") != std::string::npos;
+    EXPECT_EQ(1u, n);
+    test.Finish();
+    EXPECT_TRUE(sink.Contains("SNAPSHOT kind=adaptive"));
+  }
+}
+
+TEST(Rev3Rollback, WriteTrackingStopsWhenTheFightIsLostAndStartsWithTheNext)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  FakeWatch watch(game.Mem());
+  SyncTest test(TrackedOptions(2), {}, game.Mem(), sink, FakeClock());
+  test.SetWriteWatch(&watch);
+  for (int i = 0; i < 100; ++i)
+    game.Frame(test);
+  EXPECT_TRUE(test.WriteTrackingOn());
+  EXPECT_EQ(1u, test.Stats().wt_arms);
+  game.Mem().SetU32(0x8038FE50, 0);  // fighters lost
+  game.Frame(test);
+  EXPECT_FALSE(test.WriteTrackingOn());
+  EXPECT_TRUE(sink.Contains("NOTE write tracking off (not gameplay)"));
+  EXPECT_EQ(1, watch.stops);
+  game.Mem().SetU32(0x8038FE50, TEAM[0]);
+  for (int i = 0; i < 20; ++i)
+    game.Frame(test);
+  EXPECT_TRUE(test.WriteTrackingOn());
+  EXPECT_EQ(2u, test.Stats().wt_arms);
+}
+
+TEST(Rev3Rollback, RemappedViewsRestartTheTrackingAndClearTheHistory)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  FakeWatch watch(game.Mem());
+  SyncTest test(TrackedOptions(2), {}, game.Mem(), sink, FakeClock());
+  test.SetWriteWatch(&watch);
+  RunUntilArmed(game, test);
+  const int sets = watch.set_calls;
+  watch.SimulateRemap();
+  game.Frame(test);
+  EXPECT_TRUE(sink.Contains("NOTE Dolphin remapped its memory views, write tracking restarted"));
+  EXPECT_TRUE(sink.Contains("history cleared: write tracking restarted"));
+  EXPECT_EQ(1u, test.Stats().wt_restarts);
+  EXPECT_GT(watch.set_calls, sets);
+  EXPECT_TRUE(test.WriteTrackingOn());
+  const u32 rollbacks = test.Stats().rollbacks;
+  for (int i = 0; i < 40; ++i)
+    game.Frame(test);
+  EXPECT_GT(test.Stats().rollbacks, rollbacks);
+  EXPECT_EQ(0u, test.Stats().mismatching_frames);
+}
+
+TEST(Rev3Rollback, GrowthWithoutABaselineClearsTheHistoryAfterTheResimulation)
+{
+  // The learned page's neighbour (learn pad) is neither clean nor has a preimage: the slots cannot be extended. In the middle of a
+  // resimulation the growth waits, then it falls back to the cleared history.
+  FakeGame game(false);
+  int restores_at_write = -1;
+  game.SetStepHook([&](FakeMemory& mem, u32) {
+    if (restores_at_write < 0 && game.RestoresSeen() >= 40)
+    {
+      restores_at_write = game.RestoresSeen();
+      mem.SetU32(0x80D00000, 7);  // the first write to this page happens right after a restore, i.e. in a resimulated frame
+    }
+  });
+  FakeSink sink;
+  FakeWatch watch(game.Mem());
+  watch.no_view.insert(0x80D01000);  // the neighbour page the pad pulls in is not watched at all
+  SyncTestOptions o = TrackedOptions(3);
+  o.learn_pad_pages = 1;
+  SyncTest test(o, {}, game.Mem(), sink, FakeClock());
+  test.SetWriteWatch(&watch);
+  for (int i = 0; i < 900; ++i)
+    game.Frame(test);
+  ASSERT_GE(restores_at_write, 40);
+  EXPECT_GE(test.Stats().wt_deferred, 1u);
+  EXPECT_EQ(1u, test.Stats().wt_grown_cleared);
+  EXPECT_EQ(0u, test.Stats().wt_grown_kept);
+  EXPECT_TRUE(SetContains(test.Ranges(), 0x80D00000));
+  EXPECT_TRUE(LinesContain(sink, "NOTE learned +", "history cleared"));
+  EXPECT_EQ(0u, test.Stats().layout_refused);
+}
+
+TEST(Rev3Rollback, NeighbourPagesThatWereNeverWrittenAreTakenFromLiveMemory)
+{
+  // learn pad pulls the neighbour of a learned page into the set; the neighbour is watched and clean, so its current bytes ARE its bytes in
+  // every old slot.
+  FakeGame game(false);
+  game.Mem().SetU32(0x80E01010, 0xDEADBEEF);  // the neighbour holds data from the start and never changes
+  game.SetStepHook([](FakeMemory& mem, u32 frame) {
+    if (frame >= 1400)
+      mem.SetU32(0x80E00000, frame);
+  });
+  FakeSink sink;
+  FakeWatch watch(game.Mem());
+  SyncTestOptions o = TrackedOptions(2);
+  o.learn_pad_pages = 1;
+  o.verify = VOpts(VERIFY_ALL, 1, 3);
+  SyncTest test(o, {}, game.Mem(), sink, FakeClock());
+  test.SetWriteWatch(&watch);
+  for (int i = 0; i < 1500; ++i)
+    game.Frame(test);
+  EXPECT_TRUE(SetContains(test.Ranges(), 0x80E01010));
+  EXPECT_EQ(1u, test.Stats().wt_grown_kept);
+  EXPECT_EQ(0u, test.Stats().wt_grown_cleared);
+  EXPECT_EQ(0u, test.Verifier()->Wrong());
+  EXPECT_EQ(0u, test.Stats().mismatching_frames);
+}
+
+TEST(Rev3Rollback, VerifyModeTwoNamesTheWritesNoFaultAnnounced)
+{
+  FakeGame game(false);
+  game.SetStepHook([&](FakeMemory& mem, u32 frame) {
+    if (frame >= 1500)
+      mem.SetU32Untracked(0x80F00000, frame);  // like a kernel write into guest memory: no fault
+  });
+  FakeSink sink;
+  FakeWatch watch(game.Mem());
+  SyncTest test(TrackedOptions(2, 2), {}, game.Mem(), sink, FakeClock());
+  test.SetWriteWatch(&watch);
+  while (game.Counter() < 1500)
+    game.Frame(test);
+  EXPECT_GT(test.Stats().scans, 0u) << "mode 2 keeps hashing";
+  EXPECT_EQ(0u, test.Stats().wt_misses);
+  for (int i = 0; i < 400; ++i)
+    game.Frame(test);
+  EXPECT_EQ(1u, test.Stats().wt_misses);
+  EXPECT_TRUE(sink.Contains("WRITE TRACK MISS"));
+  EXPECT_TRUE(SetContains(test.Ranges(), 0x80F00000)) << "the scan still learns it";
+}
+
+TEST(Rev3Rollback, DirtyLogNamesPageAndWriterAndStops)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  FakeWatch watch(game.Mem());
+  SyncTestOptions o = TrackedOptions(2);
+  o.dirty_log = 3;
+  SyncTest test(o, {}, game.Mem(), sink, FakeClock());
+  test.SetWriteWatch(&watch);
+  for (int i = 0; i < 100; ++i)
+    game.Frame(test);
+  size_t dirty = 0;
+  for (const std::string& l : sink.lines)
+    dirty += l.rfind("DIRTY f", 0) == 0;
+  EXPECT_EQ(3u, dirty);
+  EXPECT_TRUE(LinesContain(sink, "DIRTY f", " pc=0x80"));
+  EXPECT_TRUE(LinesContain(sink, "DIRTY f", " lr=0x80"));
+  EXPECT_TRUE(LinesContain(sink, "DIRTY f", " cpu changed"));
+  EXPECT_TRUE(sink.Contains("NOTE DIRTY log limit reached (REV3_RB_DIRTY_LOG)"));
+}
+
+TEST(Rev3Rollback, TheArmLineSaysWhatIsWatched)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  FakeWatch watch(game.Mem());
+  SyncTest test(TrackedOptions(2), {}, game.Mem(), sink, FakeClock());
+  test.SetWriteWatch(&watch);
+  game.Frame(test);
+  EXPECT_TRUE(LinesContain(sink, "NOTE write tracking armed (fake watch)", " pages watched, "));
+  EXPECT_TRUE(LinesContain(sink, "NOTE write tracking armed (fake watch)", " edge pages (learned on their first write)"));
+  EXPECT_TRUE(LinesContain(sink, "NOTE write tracking armed (fake watch)", " ms"));
+}
+
+TEST(Rev3Rollback, TrackingIsOffWithoutAWatchOrInClassicMode)
+{
+  {
+    FakeGame game(false);
+    FakeSink sink;
+    SyncTest test(TrackedOptions(2), {}, game.Mem(), sink, FakeClock());  // write_track set but nobody gave it a watch
+    for (int i = 0; i < 100; ++i)
+      game.Frame(test);
+    EXPECT_FALSE(test.WriteTrackingOn());
+    EXPECT_GT(test.Stats().scans, 0u);
+    EXPECT_FALSE(sink.Contains("write tracking"));
+  }
+  {
+    FakeGame game(false);
+    FakeSink sink;
+    FakeWatch watch(game.Mem());
+    SyncTestOptions o = Options(2);  // classic whitelist mode
+    o.write_track = 1;
+    SyncTest test(o, game.Ranges(), game.Mem(), sink, FakeClock());
+    test.SetWriteWatch(&watch);
+    for (int i = 0; i < 100; ++i)
+      game.Frame(test);
+    EXPECT_FALSE(test.WriteTrackingOn());
+    EXPECT_EQ(0, watch.set_calls);
+  }
+}
+
+// ---- host write tracking, end to end: SyncTest + the real WriteTracker (mprotect / VirtualProtect and a real fault handler) -----------
+
+namespace
+{
+// The 24 MB of MEM1 as host memory mapped three times (like Dolphin's views of one arena): views 0 and 1 are registered with the tracker,
+// view 2 is not (a write through it is invisible to the tracker, like a kernel-side write).
+class MappedMem1
+{
+public:
+  static constexpr size_t BYTES = 0x1800000;
+  MappedMem1()
+  {
+#ifdef _WIN32
+    m_handle = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, BYTES, nullptr);
+    for (u8*& v : m_view)
+      v = m_handle == nullptr ? nullptr : static_cast<u8*>(MapViewOfFile(m_handle, FILE_MAP_ALL_ACCESS, 0, 0, BYTES));
+#else
+    FILE* file = tmpfile();
+    if (file != nullptr)
+    {
+      const int fd = fileno(file);
+      if (ftruncate(fd, BYTES) == 0)
+      {
+        for (u8*& v : m_view)
+        {
+          void* p = mmap(nullptr, BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+          v = p == MAP_FAILED ? nullptr : static_cast<u8*>(p);
+        }
+      }
+      fclose(file);
+    }
+#endif
+  }
+  ~MappedMem1()
+  {
+    for (u8* v : m_view)
+    {
+      if (v == nullptr)
+        continue;
+#ifdef _WIN32
+      UnmapViewOfFile(v);
+#else
+      munmap(v, BYTES);
+#endif
+    }
+#ifdef _WIN32
+    if (m_handle != nullptr)
+      CloseHandle(m_handle);
+#endif
+  }
+  bool Ok() const { return m_view[0] != nullptr && m_view[1] != nullptr && m_view[2] != nullptr; }
+  u8* View(int i) const { return m_view[i]; }
+
+private:
+  u8* m_view[3] = {nullptr, nullptr, nullptr};
+#ifdef _WIN32
+  HANDLE m_handle = nullptr;
+#endif
+};
+
+struct BackingScope  // FakeMemory takes its MEM1 from the mapped view while this lives
+{
+  explicit BackingScope(u8* backing) { g_mem1_backing = backing; }
+  ~BackingScope() { g_mem1_backing = nullptr; }
+};
+}  // namespace
+
+TEST(Rev3Rollback, RealWriteTrackingKeepsEveryRestoreRightWhilePagesAppear)
+{
+  MappedMem1 mapped;
+  ASSERT_TRUE(mapped.Ok());
+  BackingScope scope(mapped.View(0));
+  std::string why;
+  ASSERT_TRUE(InstallStandaloneHandler(&why)) << why;
+  {
+    FakeGame game(false);
+    WriteTracker tracker;
+    tracker.MakeCurrent();
+    tracker.SetHandlerInstalled(true);
+    ASSERT_TRUE(tracker.SetViews({{0x80000000, mapped.View(0), static_cast<u32>(MappedMem1::BYTES)},
+                                  {0x80000000, mapped.View(1), static_cast<u32>(MappedMem1::BYTES)}}, &why))
+        << why;
+    game.SetStepHook([](FakeMemory& mem, u32 frame) {
+      if (frame < 1300 || frame % 7 != 0)
+        return;
+      const u32 page = 0x80900000 + ((frame / 7) % 40) * 0x1000;
+      mem.SetU32(page + 0x10, mem.U32(page + 0x10) + frame);
+    });
+    FakeSink sink;
+    SyncTestOptions o = TrackedOptions(2);
+    o.verify = VOpts(VERIFY_ALL, 1, 3);
+    SyncTest test(o, {}, game.Mem(), sink, FakeClock());
+    test.SetWriteWatch(&tracker);
+    for (int i = 0; i < 1500; ++i)
+      game.Frame(test);
+    ASSERT_TRUE(test.Active());
+    EXPECT_TRUE(test.WriteTrackingOn());
+    EXPECT_TRUE(sink.Contains("NOTE write tracking armed (host page protection, 2 views of 6144 pages)"));
+    EXPECT_FALSE(sink.Contains("not possible"));
+    EXPECT_GT(tracker.Stats().faults, 40u);
+    EXPECT_EQ(0u, tracker.Stats().stale_faults);
+    EXPECT_EQ(0u, tracker.Stats().protect_errors);
+    EXPECT_EQ(0u, test.Stats().scans);
+    EXPECT_GT(test.Verifier()->Checked(), 200u);
+    EXPECT_EQ(0u, test.Verifier()->Wrong()) << "every restore put every byte of memory back";
+    EXPECT_EQ(0u, test.Stats().mismatching_frames);
+    EXPECT_GE(test.Stats().wt_grown_kept, 20u);
+    EXPECT_EQ(0u, test.Stats().wt_grown_cleared);
+    EXPECT_EQ(0u, test.Stats().layout_refused);
+    test.Finish();
+    EXPECT_TRUE(sink.Contains("SNAPSHOT kind=write_track"));
+    WriteWatchStats before_stop = tracker.Stats();
+    EXPECT_GT(before_stop.watched_pages, 5000u);
+    tracker.Stop();
+  }
+  UninstallStandaloneHandler();
+}
+
+TEST(Rev3Rollback, RealWriteTrackingModeTwoCatchesAWriteThroughAnUnprotectedView)
+{
+  MappedMem1 mapped;
+  ASSERT_TRUE(mapped.Ok());
+  BackingScope scope(mapped.View(0));
+  std::string why;
+  ASSERT_TRUE(InstallStandaloneHandler(&why)) << why;
+  {
+    FakeGame game(false);
+    WriteTracker tracker;
+    tracker.MakeCurrent();
+    tracker.SetHandlerInstalled(true);
+    ASSERT_TRUE(tracker.SetViews({{0x80000000, mapped.View(0), static_cast<u32>(MappedMem1::BYTES)},
+                                  {0x80000000, mapped.View(1), static_cast<u32>(MappedMem1::BYTES)}}, &why));
+    u8* unprotected = mapped.View(2);
+    game.SetStepHook([unprotected](FakeMemory& mem, u32 frame) {
+      if (frame >= 1700)
+        *reinterpret_cast<volatile u32*>(unprotected + 0x00F00000) = frame;  // page 0x80F00000, through the view the tracker does not know
+      if (frame >= 1400 && frame % 9 == 0)
+        mem.SetU32(0x80900000 + ((frame / 9) % 8) * 0x1000, frame);  // ordinary tracked writes
+    });
+    FakeSink sink;
+    SyncTest test(TrackedOptions(2, 2), {}, game.Mem(), sink, FakeClock());
+    test.SetWriteWatch(&tracker);
+    while (game.Counter() < 1700)
+      game.Frame(test);
+    EXPECT_EQ(0u, test.Stats().wt_misses) << "the faults announced every page the scan saw";
+    for (int i = 0; i < 400; ++i)
+      game.Frame(test);
+    EXPECT_EQ(1u, test.Stats().wt_misses);
+    EXPECT_TRUE(LinesContain(sink, "WRITE TRACK MISS", "[0x80F00000-0x80F01000]"));
+    tracker.Stop();
+  }
+  UninstallStandaloneHandler();
+}
+
+TEST(Rev3Rollback, RealWriteTrackingFallsBackWhenThereIsNoHandler)
+{
+  MappedMem1 mapped;
+  ASSERT_TRUE(mapped.Ok());
+  BackingScope scope(mapped.View(0));
+  FakeGame game(false);
+  WriteTracker tracker;  // the handler is NOT installed: protecting anything would kill the process, so the tracker refuses
+  std::string why;
+  ASSERT_TRUE(tracker.SetViews({{0x80000000, mapped.View(0), static_cast<u32>(MappedMem1::BYTES)}}, &why));
+  FakeSink sink;
+  SyncTest test(TrackedOptions(2), {}, game.Mem(), sink, FakeClock());
+  test.SetWriteWatch(&tracker);
+  for (int i = 0; i < 60; ++i)
+    game.Frame(test);
+  EXPECT_FALSE(test.WriteTrackingOn());
+  EXPECT_TRUE(LinesContain(sink, "NOTE write tracking not possible (no fault handler installed)", "hash scan"));
+  EXPECT_GT(test.Stats().scans, 0u);
+}
+
+// ---- memory hash check (REV3_RB_HASHCHECK) ---------------------------------------------------------------------------------------
+
+TEST(Rev3Rollback, MemoryHasherHashesEveryPageAndNamesTheDifferingOnes)
+{
+  for (const bool peek : {true, false})  // with and without a direct host pointer (the Read() fallback)
+  {
+    FakeMemory mem(true);
+    mem.peek_enabled = peek;
+    MemoryHasher hasher(mem, FakeClock());
+    MemoryHashes a;
+    MemoryHashes b;
+    // A page is a whole 4 KB or nothing: a skip range of one byte takes page 0x80010000 out; a MEM2 range takes two pages.
+    const std::vector<Range> skip = {{0x80010800, 0x80010801}, {0x90004F00, 0x90005001}};
+    hasher.Hash(skip, &a);
+    EXPECT_EQ(a.hashed, 22528u - 3u) << "peek=" << peek;
+    EXPECT_EQ(a.skipped, 3u);
+    EXPECT_FALSE(a.Empty());
+    mem.SetU32(0x80020010, 1);     // MEM1
+    mem.SetU32(0x90001FFC, 2);     // MEM2, last word of a page
+    mem.SetU32(0x80010800, 3);     // inside the skipped page: not seen
+    mem.SetU32(0x90005000, 4);     // inside the skipped MEM2 page: not seen
+    hasher.Hash(skip, &b);
+    u32 compared = 0;
+    const std::vector<u32> differing = DiffHashes(a, b, &compared);
+    ASSERT_EQ(differing.size(), 2u);
+    EXPECT_EQ(differing[0], 0x80020000u);
+    EXPECT_EQ(differing[1], 0x90001000u);
+    EXPECT_EQ(compared, 22528u - 3u);
+    // The same bytes hash the same, whatever the page.
+    MemoryHashes c;
+    hasher.Hash(skip, &c);
+    EXPECT_TRUE(DiffHashes(b, c, nullptr).empty());
+    // 64 KB regions: region 2 of MEM1 (0x80020000) and region 384 (the first of MEM2).
+    const std::vector<u32> regions = DiffRegions(RegionHashes(a), RegionHashes(b));
+    ASSERT_EQ(regions.size(), 2u);
+    EXPECT_EQ(regions[0], 2u);
+    EXPECT_EQ(regions[1], 384u);
+    EXPECT_EQ(RegionBase(2), 0x80020000u);
+    EXPECT_EQ(RegionBase(384), 0x90000000u);
+    EXPECT_EQ(RegionHashes(a).size(), HASHCHECK_REGIONS);
+    EXPECT_TRUE(DiffRegions(RegionHashes(b), RegionHashes(c)).empty());
+  }
+}
+
+TEST(Rev3Rollback, MemoryHasherWithoutMem2AndEmptyHashes)
+{
+  FakeMemory mem(false);  // a GameCube: MEM2 is not readable
+  MemoryHasher hasher(mem, FakeClock());
+  MemoryHashes a;
+  hasher.Hash({}, &a);
+  EXPECT_EQ(a.hashed, 6144u);
+  EXPECT_EQ(a.skipped, 0u);
+  MemoryHashes none;
+  EXPECT_TRUE(none.Empty());
+  u32 compared = 99;
+  EXPECT_TRUE(DiffHashes(a, none, &compared).empty());
+  EXPECT_EQ(compared, 0u);
+  // A region with no hashed page has hash 0 and is never reported.
+  const std::vector<u64> r = RegionHashes(a);
+  EXPECT_NE(r[0], 0u);
+  EXPECT_EQ(r[384], 0u);
+  EXPECT_TRUE(DiffRegions(r, RegionHashes(none)).empty());
+}
+
+namespace
+{
+SyncTestOptions HashCheckOptions(SyncTestOptions o, u32 every)
+{
+  o.hash_check_every = every;
+  return o;
+}
+}  // namespace
+
+TEST(Rev3Rollback, HashCheckOfADeterministicGameIsEqual)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTest test(HashCheckOptions(AdaptiveOptions(2), 3), {}, game.Mem(), sink, FakeClock());
+  EXPECT_TRUE(sink.Contains("NOTE hash check on: every 3 frames"));
+  while (game.Counter() < 1500)
+    game.Frame(test);
+  while (test.Resimulating())
+    game.Frame(test);
+  ASSERT_TRUE(test.Active());
+  EXPECT_GT(test.Stats().hc_compared, 10u);
+  EXPECT_EQ(test.Stats().hc_differ, 0u);
+  EXPECT_GT(test.Stats().hc_last_equal_frame, 0u);
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u);
+  EXPECT_TRUE(sink.Contains("HASHCHECK frame="));
+  EXPECT_TRUE(sink.Contains(" ok compared="));
+  EXPECT_FALSE(sink.Contains("DIFF"));
+  // Only the first few equal frames are logged.
+  size_t ok_lines = 0;
+  for (const std::string& l : sink.lines)
+    ok_lines += l.find("HASHCHECK frame=") != std::string::npos ? 1 : 0;
+  EXPECT_EQ(ok_lines, static_cast<size_t>(HASHCHECK_MAX_OK_LOGS));
+  test.Finish();
+  EXPECT_TRUE(sink.Contains(" hashcheck_compared="));
+  EXPECT_TRUE(sink.Contains(" hashcheck_differ=0 "));
+  EXPECT_TRUE(sink.Contains(" hashcheck_first_diff_frame=0 "));
+}
+
+TEST(Rev3Rollback, HashCheckNamesThePageTheWhitelistMisses)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTest test(HashCheckOptions(Options(2), 2), WithFighters(game), game.Mem(), sink, FakeClock());
+  RunFrames(game, test, 150);
+  while (test.Resimulating())
+    game.Frame(test);
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u) << "the hidden counter does not feed the state in this game";
+  EXPECT_GT(test.Stats().hc_differ, 5u) << "the hidden counter outside the whitelist is not rewound, so every replay differs there";
+  EXPECT_EQ(test.Stats().hc_pages_total, test.Stats().hc_differ);
+  EXPECT_NE(test.Stats().hc_first_diff_frame, 0u);
+  EXPECT_TRUE(LinesContain(sink, "DIFF pages=1 (in_set=0 outside_set=1)", "regions64k=1 [0x80700000:1] ranges=[0x80700000-0x80701000]"));
+  EXPECT_EQ(sink.osd.size(), 1u) << "one on-screen message for the first differing frame";
+  test.Finish();
+  EXPECT_TRUE(sink.Contains(" hashcheck_first_diff_frame="));
+}
+
+TEST(Rev3Rollback, HashCheckCallsAPageInTheSetInSet)
+{
+  // The hidden counter is whitelisted this time, and a host thread "bumps" a word of it behind the game's back during every replayed frame.
+  FakeGame game(false);
+  FakeSink sink;
+  std::vector<Range> ranges = WithFighters(game);
+  ranges.push_back({HIDDEN, HIDDEN + 0x100});
+  SyncTest test(HashCheckOptions(Options(2), 1), ranges, game.Mem(), sink, FakeClock());
+  game.SetStepHook([&test](FakeMemory& mem, u32 frame) {
+    if (test.Resimulating())
+      mem.SetU32(HIDDEN + 0x80, frame);  // differs from the first run's value (0) in every replayed frame
+  });
+  RunFrames(game, test, 150);
+  EXPECT_GT(test.Stats().hc_differ, 5u);
+  EXPECT_TRUE(LinesContain(sink, "DIFF pages=1 (in_set=1 outside_set=0)", "ranges=[0x80700000-0x80701000]"));
+}
+
+TEST(Rev3Rollback, HashCheckLeavesOutExclusionsHardwareAndTheIgnoreList)
+{
+  for (int variant = 0; variant < 3; ++variant)
+  {
+    FakeGame game(false);
+    FakeSink sink;
+    FakeHardware hw;
+    SyncTest test(HashCheckOptions(Options(2), 1), WithFighters(game), game.Mem(), sink, FakeClock(), &hw);
+    if (variant == 0)
+      hw.list.push_back({"audio_dma", HIDDEN, HIDDEN + 0x1000});
+    else if (variant == 1)
+      test.SetUserExclusions({{HIDDEN, HIDDEN + 0x1000}}, {});
+    else
+      test.SetVerifyIgnore({{HIDDEN + 0x10, HIDDEN + 0x20}});
+    RunFrames(game, test, 150);
+    while (test.Resimulating())
+      game.Frame(test);
+    EXPECT_GT(test.Stats().hc_compared, 20u) << "variant " << variant;
+    EXPECT_EQ(test.Stats().hc_differ, 0u) << "variant " << variant << ": the page is not hashed";
+    EXPECT_FALSE(sink.Contains("DIFF")) << "variant " << variant;
+  }
+}
+
+TEST(Rev3Rollback, HashCheckLeavesOutTheDeadStack)
+{
+  // Garbage below the hook's sp (the dead part of the stack) changes between two visits of a frame: not a difference.
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTest test(HashCheckOptions(Options(2), 1), WithFighters(game), game.Mem(), sink, FakeClock());
+  game.SetStepHook([](FakeMemory& mem, u32) {
+    constexpr u32 DEAD = SP - 0x2000 - 0x800;  // a page below the sp window, within the default 0x4000 bytes below sp
+    mem.SetU32(DEAD, mem.U32(DEAD) + 1);       // counts on in every visit, rewound or not
+  });
+  game.Mem().SetU32(HIDDEN, 0);
+  RunFrames(game, test, 150);
+  while (test.Resimulating())
+    game.Frame(test);
+  // The hidden counter's page still differs (2 pages never, 1 page here), the dead stack pages do not.
+  EXPECT_TRUE(LinesContain(sink, "DIFF pages=1 (in_set=0 outside_set=1)", "ranges=[0x80700000-0x80701000]"));
+  EXPECT_FALSE(LinesContain(sink, "DIFF pages=2", ""));
+}
+
+TEST(Rev3Rollback, HashCheckIsOffByDefault)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTest test(Options(2), WithFighters(game), game.Mem(), sink, FakeClock());
+  RunFrames(game, test, 100);
+  test.Finish();
+  EXPECT_EQ(test.Stats().hc_compared, 0u);
+  EXPECT_FALSE(sink.Contains("HASHCHECK"));
+  EXPECT_FALSE(sink.Contains("hashcheck_"));
+  EXPECT_FALSE(sink.Contains("hash check on"));
+}
+
+// ---- netplay with host write tracking (REV3_RB_WRITE_TRACK) and the local hash check (REV3_RB_HASHCHECK) -------------------------------------
+// The NetRig drives SyncTest::Net* the way Rev3::Net::SyncTestStore does, with the FakeWatch of the SyncTest tests behind it.
+
+namespace
+{
+// Runs the learning phase (the faults do the learning in mode 1), arms, and leaves `f` at the first captured frame's number.
+u32 NetTrackedArm(NetRig& rig)
+{
+  u32 f = 1000;
+  for (; f < 3000 && !rig.test.LearningDone(); ++f)
+  {
+    rig.Observe(f);
+    rig.Advance(f);
+  }
+  rig.Observe(f);
+  EXPECT_TRUE(rig.test.LearningDone());
+  EXPECT_TRUE(rig.test.NetPrepareArm());
+  return f;
+}
+
+// The session's rollback to `target`: restore, then the target's own hook call again (resimulated), captured again.
+bool NetReplayCall(NetRig& rig, u32 target)
+{
+  if (!rig.test.NetRestore(target))
+    return false;
+  rig.Observe(target, true);
+  return rig.Capture(target);
+}
+}  // namespace
+
+TEST(Rev3Rollback, NetWriteTrackingGrowsTheSlotsInPlaceAndNeverAsksForARelayout)
+{
+  NetRig rig(TrackedOptions(6));
+  FakeWatch watch(rig.game.Mem());
+  rig.test.SetWriteWatch(&watch);
+  u32 f = NetTrackedArm(rig);
+  EXPECT_TRUE(rig.sink.Contains("NOTE write tracking armed (fake watch)"));
+  EXPECT_EQ(0u, rig.test.Stats().scans) << "the faults do the learning, no hash scan";
+  EXPECT_FALSE(SetContains(rig.test.Ranges(), LATE_PAGE));
+  const std::vector<Range> installed = rig.test.Ranges();
+
+  // From now on the game writes a page nobody seeded, every frame. Frame F0 is captured BEFORE its first write.
+  std::map<u32, u32> late_value;
+  const u32 f0 = f;
+  for (int i = 0; i < 5; ++i, ++f)
+  {
+    if (i != 0)
+      rig.Observe(f);
+    ASSERT_TRUE(rig.Capture(f));
+    late_value[f] = rig.game.Mem().U32(LATE_PAGE);
+    rig.Advance(f, true);
+    EXPECT_FALSE(rig.test.NetLayoutPending()) << f;
+  }
+  rig.Observe(f);  // the poll of this call sees the page written during F0's frame
+  EXPECT_FALSE(rig.test.NetLayoutPending());
+  EXPECT_TRUE(SetContains(rig.test.Ranges(), LATE_PAGE)) << "the set grew under the slots";
+  EXPECT_GT(rig.test.Ranges().size() + 1, installed.size());
+  EXPECT_EQ(1u, rig.test.Stats().wt_grown_kept);
+  EXPECT_EQ(0u, rig.test.Stats().wt_grown_cleared);
+  EXPECT_EQ(0u, rig.test.Stats().scans);
+  EXPECT_EQ(0u, rig.test.Stats().late_learn_rollbacks);
+  EXPECT_TRUE(LinesContain(rig.sink, "NOTE learned +1 pages", "history kept"));
+  EXPECT_FALSE(rig.sink.Contains("while slots are in use"));
+  ASSERT_TRUE(rig.Capture(f));  // the new layout
+  late_value[f] = rig.game.Mem().U32(LATE_PAGE);
+
+  // The slots captured before the growth survived it, with the page filled from the preimage: restoring the oldest one puts the page back.
+  ASSERT_TRUE(rig.test.NetHas(f0));
+  ASSERT_TRUE(rig.test.NetRestore(f0));
+  EXPECT_EQ(late_value[f0], rig.game.Mem().U32(LATE_PAGE));
+  EXPECT_NE(late_value[f], late_value[f0]);
+  ASSERT_TRUE(rig.test.NetRestore(f - 1));
+  EXPECT_EQ(late_value[f - 1], rig.game.Mem().U32(LATE_PAGE));
+  EXPECT_EQ(0u, rig.test.Stats().layout_refused);
+  EXPECT_EQ(0u, rig.test.Stats().late_learn_rollbacks);
+
+  // The counters a SUMMARY / the stats line carries, and the SNAPSHOT line.
+  EXPECT_NE(rig.test.NetSummaryNote().find(" wt_grown_kept=1 wt_grown_cleared=0 "), std::string::npos);
+  EXPECT_NE(rig.test.NetStatsLine().find(" wt_grown_kept=1 "), std::string::npos);
+  EXPECT_EQ(0u, rig.test.SnapshotLine().find("SNAPSHOT kind=write_track "));
+}
+
+TEST(Rev3Rollback, NetWriteTrackingFallsBackToTheDrainWhenASlotCannotBeExtended)
+{
+  // The learned page's neighbour (learn pad) has neither a preimage nor a clean watch: the slots cannot be extended. Netplay then asks for its
+  // local relayout (NetLayoutPending) and leaves the slots and the set alone; a growth that comes up in a resimulation waits.
+  SyncTestOptions o = TrackedOptions(6);
+  o.learn_pad_pages = 1;
+  NetRig padded(o);
+  FakeWatch padded_watch(padded.game.Mem());
+  padded_watch.no_view.insert(0x80D01000);
+  padded.test.SetWriteWatch(&padded_watch);
+  u32 f = NetTrackedArm(padded);
+  const std::vector<Range> installed = padded.test.Ranges();
+  for (int i = 0; i < 4; ++i, ++f)
+  {
+    if (i != 0)
+      padded.Observe(f);
+    ASSERT_TRUE(padded.Capture(f));
+    padded.Advance(f);
+  }
+  padded.game.Mem().SetU32(0x80D00000, 7);  // the first write to the page
+  padded.Observe(f, true);                  // a resimulated call: the growth waits
+  EXPECT_FALSE(padded.test.NetLayoutPending());
+  EXPECT_GE(padded.test.Stats().wt_deferred, 1u);
+  padded.Observe(f);
+  EXPECT_TRUE(padded.test.NetLayoutPending()) << "the fallback is the old drain";
+  EXPECT_EQ(1u, padded.test.Stats().wt_grown_cleared);
+  EXPECT_EQ(0u, padded.test.Stats().wt_grown_kept);
+  EXPECT_EQ(installed.size(), padded.test.Ranges().size());
+  EXPECT_FALSE(SetContains(padded.test.Ranges(), 0x80D00000)) << "the set under the slots did not change";
+  EXPECT_TRUE(padded.test.NetHas(f - 1)) << "and neither did the slots";
+  EXPECT_TRUE(LinesContain(padded.sink, "NOTE learned +", "the slots cannot be extended"));
+  // More calls while the drain is pending: no second request, no new counts.
+  padded.Observe(f + 1);
+  EXPECT_EQ(1u, padded.test.Stats().wt_grown_cleared);
+  EXPECT_TRUE(padded.test.NetRestore(f - 1)) << "a restore in the meantime still works (and is counted as one with a pending set)";
+  EXPECT_EQ(1u, padded.test.Stats().late_learn_rollbacks);
+
+  padded.test.NetClear();  // the session's drain finished
+  EXPECT_FALSE(padded.test.NetLayoutPending());
+  EXPECT_TRUE(SetContains(padded.test.Ranges(), 0x80D00000));
+  EXPECT_TRUE(LinesContain(padded.sink, "NOTE learned +", "at clear"));
+  EXPECT_FALSE(padded.test.NetHas(f - 1));
+}
+
+TEST(Rev3Rollback, NetWriteTrackingStopsWithTheFightAndWithTheSessionAndNeverRestartsAfterIt)
+{
+  NetRig rig(TrackedOptions(6));
+  FakeWatch watch(rig.game.Mem());
+  rig.test.SetWriteWatch(&watch);
+  u32 f = NetTrackedArm(rig);
+  EXPECT_TRUE(rig.test.WriteTrackingOn());
+  EXPECT_EQ(1u, rig.sink.Count("NOTE write tracking armed"));
+
+  // Loading: the fighters are gone, the watch goes with them; the next fight starts it again.
+  rig.game.Mem().SetU32(0x8038FE50, 0);
+  rig.Observe(f++);
+  EXPECT_FALSE(rig.test.WriteTrackingOn());
+  EXPECT_TRUE(rig.sink.Contains("NOTE write tracking off (not gameplay)"));
+  rig.game.Mem().SetU32(0x8038FE50, TEAM[0]);
+  rig.Observe(f++);
+  EXPECT_TRUE(rig.test.WriteTrackingOn());
+  EXPECT_EQ(2u, rig.sink.Count("NOTE write tracking armed"));
+
+  // The session ended: stopped for good, the hash scan learns from here.
+  rig.test.NetLeave();
+  EXPECT_FALSE(rig.test.WriteTrackingOn());
+  EXPECT_FALSE(watch.Active());
+  EXPECT_TRUE(rig.sink.Contains("NOTE write tracking off (left the session)"));
+  const u64 scans = rig.test.Stats().scans;
+  for (int i = 0; i < 5; ++i)
+    rig.Observe(f++);
+  EXPECT_FALSE(rig.test.WriteTrackingOn());
+  EXPECT_EQ(2u, rig.sink.Count("NOTE write tracking armed"));
+  EXPECT_EQ(scans + 5, rig.test.Stats().scans);
+}
+
+TEST(Rev3Rollback, NetWriteTrackingModeTwoKeepsScanningAndNamesWhatNoFaultAnnounced)
+{
+  NetRig rig(TrackedOptions(6, 2));
+  FakeWatch watch(rig.game.Mem());
+  rig.test.SetWriteWatch(&watch);
+  u32 f = 1000;
+  for (; f < 3000 && !rig.test.LearningDone(); ++f)
+  {
+    rig.Observe(f);
+    rig.Advance(f);
+  }
+  EXPECT_GT(rig.test.Stats().scans, 0u);
+  EXPECT_EQ(0u, rig.test.Stats().wt_misses);
+  for (int i = 0; i < 400; ++i, ++f)
+  {
+    rig.Observe(f);
+    rig.Advance(f);
+    rig.game.Mem().SetU32Untracked(0x80F00000, f);  // like a kernel write: no fault
+  }
+  EXPECT_EQ(1u, rig.test.Stats().wt_misses);
+  EXPECT_TRUE(rig.sink.Contains("WRITE TRACK MISS"));
+}
+
+TEST(Rev3Rollback, NetModeHashCheckComparesTheFirstRunWithTheRestoredFrame)
+{
+  // The hidden counter is whitelisted, so a correct restore gives the same memory at the target's second visit.
+  std::vector<Range> seed = NetSeed();
+  seed.push_back({HIDDEN, HIDDEN + 0x100});
+  NetRig rig(HashCheckOptions(Options(6), 1), seed);
+  EXPECT_TRUE(rig.sink.Contains("NOTE hash check on: every 1 frames"));
+  u32 f = 1000;
+  for (; f < 1010; ++f)
+  {
+    rig.Observe(f);
+    rig.Advance(f);
+  }
+  rig.Observe(f);
+  ASSERT_TRUE(rig.test.NetPrepareArm());
+  for (int i = 0; i < 6; ++i, ++f)
+  {
+    if (i != 0)
+      rig.Observe(f);
+    ASSERT_TRUE(rig.Capture(f));
+    rig.Advance(f);
+  }
+  EXPECT_EQ(0u, rig.test.Stats().hc_compared) << "first runs are only hashed";
+  ASSERT_TRUE(NetReplayCall(rig, f - 3));
+  EXPECT_EQ(1u, rig.test.Stats().hc_compared);
+  EXPECT_EQ(0u, rig.test.Stats().hc_differ);
+  EXPECT_TRUE(LinesContain(rig.sink, "HASHCHECK frame=", " ok compared="));
+  // Only the target is compared: the frames after it are played with corrected pads in a real rollback.
+  rig.Advance(f - 3);
+  rig.Observe(f - 2, true);
+  ASSERT_TRUE(rig.Capture(f - 2));
+  EXPECT_EQ(1u, rig.test.Stats().hc_compared);
+  EXPECT_NE(rig.test.NetSummaryNote().find(" hashcheck_compared=1 hashcheck_differ=0 "), std::string::npos);
+  EXPECT_NE(rig.test.NetStatsLine().find(" hashcheck_compared=1 "), std::string::npos);
+}
+
+TEST(Rev3Rollback, NetModeHashCheckNamesAPageTheSetMisses)
+{
+  // The hidden counter is outside the set: a restore does not rewind it, so the replayed target differs there.
+  NetRig rig(HashCheckOptions(Options(6), 1), NetSeed());
+  u32 f = 1000;
+  for (; f < 1010; ++f)
+  {
+    rig.Observe(f);
+    rig.Advance(f);
+  }
+  rig.Observe(f);
+  ASSERT_TRUE(rig.test.NetPrepareArm());
+  for (int i = 0; i < 6; ++i, ++f)
+  {
+    if (i != 0)
+      rig.Observe(f);
+    ASSERT_TRUE(rig.Capture(f));
+    rig.Advance(f);
+  }
+  ASSERT_TRUE(NetReplayCall(rig, f - 3));
+  EXPECT_EQ(1u, rig.test.Stats().hc_compared);
+  EXPECT_EQ(1u, rig.test.Stats().hc_differ);
+  EXPECT_TRUE(LinesContain(rig.sink, "DIFF pages=1 (in_set=0 outside_set=1)", "ranges=[0x80700000-0x80701000]"));
+}
+
+TEST(Rev3Rollback, NetModeHashCheckOnlyLooksAtFramesItHashed)
+{
+  std::vector<Range> seed = NetSeed();
+  seed.push_back({HIDDEN, HIDDEN + 0x100});
+  NetRig rig(HashCheckOptions(Options(6), 4), seed);
+  u32 f = 1000;
+  for (; f < 1010; ++f)
+  {
+    rig.Observe(f);
+    rig.Advance(f);
+  }
+  rig.Observe(f);
+  ASSERT_TRUE(rig.test.NetPrepareArm());
+  for (int i = 0; i < 6; ++i, ++f)
+  {
+    if (i != 0)
+      rig.Observe(f);
+    ASSERT_TRUE(rig.Capture(f));
+    rig.Advance(f);
+  }
+  u32 odd = f - 1;
+  while (odd % 4 == 0)
+    --odd;
+  ASSERT_TRUE(NetReplayCall(rig, odd));
+  EXPECT_EQ(0u, rig.test.Stats().hc_compared);
+  u32 even = f - 1;
+  while (even % 4 != 0)
+    --even;
+  ASSERT_TRUE(rig.test.NetHas(even));
+  ASSERT_TRUE(NetReplayCall(rig, even));
+  EXPECT_EQ(1u, rig.test.Stats().hc_compared);
+  EXPECT_EQ(0u, rig.test.Stats().hc_differ);
 }

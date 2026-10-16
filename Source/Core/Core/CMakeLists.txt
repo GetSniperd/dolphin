@@ -568,6 +568,8 @@ add_library(core
   Slippi/Rev3Rollback.h
   Slippi/Rev3Session.cpp
   Slippi/Rev3Session.h
+  Slippi/Rev3WriteTrack.cpp
+  Slippi/Rev3WriteTrack.h
   Slippi/SlippiGameFileLoader.cpp
   Slippi/SlippiGameFileLoader.h
   Slippi/SlippiMatchmaking.cpp

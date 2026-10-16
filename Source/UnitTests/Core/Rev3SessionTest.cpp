@@ -232,6 +232,7 @@ public:
     return relayout_ok;
   }
   bool Clean(s32 frame) const override { return dirty.count(frame) == 0; }
+  std::string AfterSummaryLine() override { return after_summary; }
 
   struct Slot
   {
@@ -251,6 +252,7 @@ public:
   bool ranges_ok = false;
   std::vector<RangeCrc> ranges;  // what RangeCrcs reports (REV3_NET_RANGE_CRC tests)
   bool fail_capture = false;
+  std::string after_summary;  // what AfterSummaryLine returns (the SNAPSHOT line of the real store)
 };
 
 // ---- the scripted transport (unit tests) -------------------------------------------------------------------------------------------
@@ -1950,6 +1952,23 @@ TEST(Rev3Session, TheFirst200RollbackLinesAreWrittenInFullThenOneSummaryPerWindo
   EXPECT_GE(left_out, 130u);  // the first window also holds rollbacks that were written in full
   EXPECT_TRUE(rig.sink.Has("SUMMARY final"));
   EXPECT_TRUE(rig.sink.Has("log_suppressed=260"));
+}
+
+TEST(Rev3Session, TheStoresSnapshotLineFollowsEverySummaryLine)
+{
+  Rig rig(Role::Host, 0, 5);
+  rig.store.after_summary = "SNAPSHOT kind=fake pages=1";
+  rig.ReadyToArm(10);
+  PlayRollbacks(rig, 10, 3);
+  rig.session->Finish();
+  ASSERT_TRUE(rig.sink.Has("SUMMARY final"));
+  size_t summary = rig.sink.lines.size();
+  for (size_t i = 0; i < rig.sink.lines.size(); ++i)
+    if (rig.sink.lines[i].find("SUMMARY final") != std::string::npos)
+      summary = i;
+  ASSERT_LT(summary + 1, rig.sink.lines.size());
+  EXPECT_EQ(rig.sink.lines[summary + 1], "SNAPSHOT kind=fake pages=1");
+  EXPECT_EQ(rig.sink.Count("SNAPSHOT kind=fake"), 1u);
 }
 
 TEST(Rev3Session, ThereIsNoSummaryLineWhenNothingWasLeftOut)

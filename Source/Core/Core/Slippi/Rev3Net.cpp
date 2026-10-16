@@ -592,6 +592,12 @@ std::string SyncTestStore::SummaryNote()
   return m_sync != nullptr ? m_sync->NetSummaryNote() : std::string();
 }
 
+// After every SUMMARY line: the `SNAPSHOT kind=..` line (set size, write tracking counters, restore verify), as SyncTest writes it.
+std::string SyncTestStore::AfterSummaryLine()
+{
+  return m_sync != nullptr ? m_sync->SnapshotLine() : std::string();
+}
+
 // REV3_NET_RANGE_CRC: the snapshot ranges (SyncTest's set); before the first arm, or in a lockstep-only run, the REV3_NET_STABLE ranges.
 bool SyncTestStore::RangeCrcs(s32 frame, bool live, std::vector<RangeCrc>* out)
 {
@@ -842,6 +848,10 @@ Reply NetModule::OnCommand(const Command& command)
   m_last_gate = gate;
   const Reply reply = m_session->OnCommand(command, gate);
   const Mode after = m_session->mode();
+  // The session ended on this call (left, desync, timeout): nobody uses the snapshots any more, so host write tracking stops for good (the guest
+  // RAM is writable again at once; the SUMMARY the session wrote already carries the counters).
+  if (after == Mode::OFFLINE && before != Mode::OFFLINE && m_sync != nullptr)
+    m_sync->NetLeave();
   // An armed stretch that ended (DRAIN done): the tracker must see the gate shut to open it again later.
   if (after == Mode::LOCKSTEP && (before == Mode::ARMED || before == Mode::DRAIN))
     m_gate_tracker.Close();
@@ -872,9 +882,11 @@ void NetModule::Shutdown()
   }
   if (m_sync != nullptr && m_started && m_session != nullptr)
   {
+    m_sync->NetLeave();  // host write tracking off (counters stay for the lines below)
     m_sync->NetFlushLog();
     m_sync->LearnedSummaryLine();  // the session may have left (final SUMMARY already written) before pages were learned
     m_log.Line(m_sync->NetStatsLine());
+    m_log.Line(m_sync->SnapshotLine());
     if (m_sync->Verifier() != nullptr)
       m_log.Line(m_sync->VerifySummaryText());
   }

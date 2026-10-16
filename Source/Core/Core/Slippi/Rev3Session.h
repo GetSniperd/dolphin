@@ -338,6 +338,8 @@ public:
   // snapshot machinery) and returns fields appended to the SUMMARY line (restore verify counters, resimulation hiding counters), with a
   // leading space, or "".
   virtual std::string SummaryNote() { return {}; }
+  // Called right after every SUMMARY line: one more line for the log (the `SNAPSHOT kind=..` line of the snapshot machinery), or "".
+  virtual std::string AfterSummaryLine() { return {}; }
 };
 
 // The FieldSet of raw big-endian field bytes (Rev3::ReadFighterFields / SyncTest::NetSnapshotInfo), `present` as in FieldSet.

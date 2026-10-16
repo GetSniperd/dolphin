@@ -404,6 +404,190 @@ and shutdown writes the `VERIFY summary` line. Heal in netplay: the pages go to 
 the session on that machine only: use `REV3_RB_VERIFY_HEAL=1` in netplay for a diagnosis run.
 Tests: `NetModeRestoreVerifyHeal*`.
 
+## Host write tracking (`REV3_RB_WRITE_TRACK`, off by default)
+
+Why: the adaptive set finds the pages that change by hashing them (16 slices per hook call, so a page is noticed up to one scan cycle after its first
+change), and a late page costs a relayout that **drops the snapshot history** (25 of them in one netplay match; the freeze came from a particle in a page
+that was not learned yet). Write tracking learns a page at the moment it is first written, with its old contents in hand, so the set can grow and the
+history stays. Idea borrowed from another project's host write tracking (verify mode, "RESTORE MISS" style logs); no code taken.
+
+How it works (`Rev3WriteTrack.{h,cpp}`, `WriteWatch` interface and the SyncTest side in `Rev3Rollback.{h,cpp}`):
+
+- **Where the guest RAM is on the host** (`MemoryManager::GetRamViews()`): the linear views `m_ram` / `m_exram` (interpreter, DMA, GPU thread, `CopyToEmu`), the
+  fastmem physical view (`m_physical_base`, RAM at 0, EXRAM at 0x10000000) and the fastmem logical view, one mapping per BAT-mapped piece
+  (`m_logical_mapped_entries`, now with their `physical_address`, ~128 KB each, up to ~1400, the same RAM can be mapped twice by cached + uncached BATs).
+  Protecting a page in one view does not protect it in the others, so the tracker protects **every** view of every watched page (a CSR table
+  page -> host addresses, built once per view list, immutable, published with an atomic pointer; old tables are kept until exit because a handler may
+  still read one). Measured on the Linux sandbox with 900 views: arming 20736 pages is 1 ms and 800 protection calls; releasing one page again 0.2 ms.
+- **What is watched**: every page that is not *fully* inside the keep set = snapshot set U cuts (hook region, user exclusions, hardware cuts). With
+  tracking on the snapshot set is **page aligned** (`PageAlignRanges` in `ComputeRanges`: fighter tails, the stack window and forced ranges grow to whole
+  pages, a few pages = ~30 KB in all), so a page is either wholly in the set or wholly out and no watched page needs a partial comparison. Pages that a
+  cut only partly covers (a hardware region that does not start on a page boundary) stay watched.
+- **First write** (`WriteTracker::OnFault`, inside the signal / exception handler, any thread): the page state goes Armed -> Claimed (compare-and-swap, so one
+  thread owns the page), the 4 KB page is copied into a lazily committed preimage slot (88 MB of address space), the guest pc / lr are recorded when the
+  faulting thread is the CPU thread (`Probe`; the JIT keeps pc at the start of the current block, lr is exact), the page is made writable in all views, state
+  Dirty. The handler returns "handled" and the store runs again. A second thread that faults on a page being claimed waits for the owner (yield); a fault inside a
+  registered view on a page that is already writable (stale) is made writable in that view and resumed; a fault outside the registered views is not ours
+  (returns false, the caller chains on). The handler only uses atomics, `memcpy` and `mprotect` / `VirtualProtect`.
+- **Hook order**: `EMM::SetWriteFaultHook` (`Core/MemTools.cpp`) is called BEFORE `JitInterface::HandleFault` in the POSIX handler (`SEGV_ACCERR`) and the Windows
+  vectored handler (access type 1 = write); a tracked write never reaches the JIT's fastmem backpatching (which would treat any fault in the arena as a
+  load / store to rewrite to the slow path). macOS Mach exceptions do not call it: `SetWriteFaultHook` returns false there and tracking is "not possible".
+- **Each hook call** (`SyncTest::PollWrites`, before the call's capture, also during resimulations): the dirty pages are compared with their preimage. Different:
+  the page joins the set (`PageTracker::MarkDynamic`). Equal (a store of the same bytes): `Rearm` protects it again (protect first, compare after, so a
+  racing write is either seen by the comparison or faults: no third case; a write that raced the verdict makes the page dirty again and it is learned);
+  after `REV3_RB_WRITE_TRACK_REARM` (4) equal rewrites it is learned anyway (a page rewritten every frame costs a fault every frame; 4 KB of copy is cheaper).
+- **Growing with the history kept** (`SyncTest::GrowKeepingHistory`): a watched page that was not written since it was armed has the same contents in every
+  snapshot slot taken since; the preimage IS that content. The new bytes of the set are filled into every valid slot from the preimages of the learned pages
+  (or from live memory for pages that are still clean, e.g. the learn-pad neighbours), the old bytes are copied over, the slots get the new layout
+  generation and the restore verify's shadows stay valid. The next restore can go back across the growth. If a needed page has neither (not watched, no
+  view), the old behaviour applies (relayout, history cleared; logged `history cleared`); in the middle of a resimulation that fallback waits until the
+  resimulation is over (`wt_deferred`).
+- **When**: tracking starts when both fighters are found (loads are never tracked: the kernel-side writes of a load cannot be seen) and stops with
+  `NOTE write tracking off (not gameplay)` when they are lost. The hash scan is skipped while tracking (`PageTracker::SkipSlice` keeps the LEARN clock, so
+  arming happens at the same time as before). At arm the watch is refreshed with the final set and cuts; `RefreshExclusions` does the same when a cut appears.
+- **Views change** (BAT update, fastmem arena set up / torn down): `MemoryManager` calls `ViewsChanging` right BEFORE it unmaps anything; the glue makes all
+  guest RAM writable (`Stop`). `PollWrites` sees the watch inactive, logs `NOTE Dolphin remapped its memory views, write tracking restarted`, clears the
+  history (writes in the gap went unseen) and starts again with the new views.
+- **Fallback**: no hook (Mach), no handler installed, host page size other than 4 KB, a self test that did not fault (`SelfTest` writes the same byte back to a
+  watched page after arming and expects exactly that page dirty and every other view writable): `NOTE write tracking not possible (why): learning pages by hash
+  scan from here`, once, and the hash scan does the learning as before. Nothing stays protected.
+- **Guest-visible behaviour**: none. A protected page only delays the store by one signal; the store is re-executed. Nothing is emulated differently, no
+  emulated time passes. (A page written by the kernel on Dolphin's behalf, `read()` / `recv()` straight into guest memory, would fail with EFAULT instead of
+  faulting; Dolphin's disc, IOS file and socket paths copy through `CopyToEmu`, and tracking is only on during a fight. `WRITE TRACK MISS` in mode 2 and the
+  restore verify would show it.)
+
+| variable | meaning |
+|---|---|
+| `REV3_RB_WRITE_TRACK=0\|1\|2` | 0 / unset = off (hash scan). 1 = faults learn the pages, no scanning. 2 = faults AND the hash scan; every page the scan finds that the faults did not announce is a `WRITE TRACK MISS` (a verify mode for tracking itself; the set still follows the scan, with the old history clear). Needs the adaptive set |
+| `REV3_RB_DIRTY_LOG=N` | log the first N dirty pages of the run: `DIRTY f<frame> 0xPAGE pc=0x.. lr=0x.. cpu\|other changed\|equal\|promoted\|pending` (pc / lr 0 when another thread wrote it: GPU, DSP, IOS) |
+| `REV3_RB_WRITE_TRACK_REARM=N` | equal rewrites before a page is learned anyway, 1..200, default 4 |
+
+Log lines:
+
+- `NOTE write tracking requested: REV3_RB_WRITE_TRACK=.. dirty_log=.. rearm_max=..` at start (the environment as parsed).
+- `NOTE write tracking armed (host page protection, V views of P pages): W pages watched, E edge pages (learned on their first write), rearm_max=4, X ms`
+  (V and P tell whether Dolphin's views were found: expect the linear views + physical view + the BAT pieces, and 6144 + 16384 pages with MEM2).
+- `NOTE write tracking not possible (..): learning pages by hash scan from here`, `NOTE write tracking off (not gameplay)`, `NOTE Dolphin remapped its memory
+  views, write tracking restarted`, `NOTE write tracking lost (..)`.
+- `NOTE learned +n pages (now ranges=.. bytes=..) frame F, history kept; new=[0xS-0xE,..]` (same format as before, `history kept` instead of `history cleared`).
+- `HB ... wt_faults=.. wt_pages=.. wt_poll_us_max=..` in the heartbeat; after every SUMMARY line and at the end:
+  `SNAPSHOT kind=write_track last=.. MB max=.. MB pages=.. of watched=.. faults=.. arms=.. learned=.. equal_rearms=.. promoted_equal=.. grown_kept=..
+  grown_cleared=.. deferred=.. restarts=.. misses=.. stale=.. protect_calls=.. protect_ms=.. poll_ms=.. | restores checked=.. wrong=.. blocks=..
+  first_wrong_frame=.. shadow_ms=..` (`kind=adaptive` with the hash scan; the `|` part only with `REV3_RB_VERIFY`). `stale` counts faults on pages already writable
+  (a racing second thread; harmless). The fork has no counter for "edge bytes always copied": a page-aligned set has none.
+
+Tests (Linux, real faults): `Rev3WriteTrack.*` (`Rev3WriteTrackTest.cpp`: two views of one memory object, first write faults and records the preimage, a write through
+the second view faults too, keep ranges decide what is watched, rearm of equal / changed pages, release, stop, view-list change, self test, 8 threads on one page,
+6 threads over 256 pages, 150 rounds of a writer racing re-arms with no lost write, a real change caught after thousands of equal re-arms, faults outside the views
+chained to the previous `sigaction` handler, an unowned fault still killing the process, and **Dolphin's real `EMM` handler** asking the hook first and passing the
+rest on), `Rev3Rollback.WriteTracking*` / `*Tracking*` (SyncTest with a fake `WriteWatch`: late page learned with the history kept and no mismatch, the hash scan
+control run, `restores_wrong = 0` under the restore verify while pages keep appearing, pages before arming, equal rewrites rearmed then promoted, fallbacks, stop and
+restart, remapped views, missing baseline deferred past a resimulation, live-memory neighbours, mode 2 misses, the dirty log) and `Rev3Rollback.RealWriteTracking*`
+(SyncTest + the real tracker on a 24 MB mmap'd MEM1 with a real handler: every restore verified right while pages appear, a write through an unregistered view reported
+as a miss, no handler -> fallback). The Windows branch (`VirtualProtect`, vectored handler, `CreateFileMapping` views in the tests) is written by inspection and compiled
+by the `rev3-windows` workflow, not run.
+
+What D runs (needs a fight; the environment is inherited by `phase3.bat`): `set REV3_RB_WRITE_TRACK=1`, `set REV3_RB_DIRTY_LOG=60`, `set REV3_RB_VERIFY=40`,
+`phase3.bat synctest --k 4`. Success: `NOTE write tracking armed (...)` with a believable view count, `SNAPSHOT kind=write_track ...` with `restores checked=.. wrong=0`,
+`grown_cleared=0`, `restarts=0`, `late_learn_rollbacks=0` in the SUMMARY line and no `mismatching_frames`; `NOTE learned +n pages ... history kept` lines instead of
+`history cleared`. Then `set REV3_RB_WRITE_TRACK=2`: `misses=0` and no `WRITE TRACK MISS` means the faults saw everything the scan did. If tracking says `not possible`, the
+reason is in the line; send the log. The `DIRTY` lines name the code that writes each new page (`lr`): useful for the pages that still surprise us.
+
+What remains (not done, and why):
+- **Mode 2 proper (delta capture)**: watching the pages that ARE in the set too, so a capture copies only the pages written since the last one. That would cut the capture
+  cost (20 MB per frame today) but needs re-protecting every set page after each capture (a fault per set page per frame) and a per-slot dirty bitmap; the fault
+  rate on the fighter / effect pages is thousands per frame, so it only pays with a cheaper path than a signal. Left out on purpose.
+- **Apple Mach exception path** (`EMM::SetWriteFaultHook` returns false there) and non-4 KB host pages (Apple silicon, some Linux ARM): "not possible", hash scan.
+- **Kernel-side writes** into guest memory fail with EFAULT instead of faulting; not seen by tracking (mode 2 / restore verify show them).
+- **Netplay** (`rev3-net`): merged, see "Host write tracking in netplay" below (untested on Windows and in a real match).
+
+Merging into rev3-net: `Rev3WriteTrack.*`, `MemTools`, `Memmap` and the `WriteWatch` glue come over unchanged; the SyncTest-side pieces are `PollWrites`, `GrowKeepingHistory`,
+`WatchStart` / `WatchStop` / `WatchRefresh`, `ParseWriteTrackEnv` and `SetWriteWatch`. In the net session: (a) call `ParseWriteTrackEnv(&options, sink)` where the net options are read and create
+the `DolphinWriteWatch` (it lives in the anonymous namespace of the glue; move it to the header or construct it from `Initialize`) before the session's first command, and keep
+`REV3_RB_WRITE_TRACK*` in the environment list that `KEEP_REV3_VARS` / the launcher passes on; (b) replace the scan in `NetObserve` (the `ScanSlice(frame)` step) with
+`PollWrites()` when `WriteTrackingOn()`, and use its growth in place of the `GATE relayout` path: the ring of the session has the same slot layout (ranges back to back, then the stack
+window), `GrowKeepingHistory` extends every valid slot and bumps the layout generation; the session must also remap whatever else it keeps per layout (its `m_range_offsets` copy); (c) call
+`WatchStart` when the session arms and `WatchStop` when it disarms (`NetClear`); (d) append `SnapshotLine()` to `NetStatsLine` output; (e) the rollback depth is small in netplay, so
+the growth almost always happens with history; a page first written during a resimulation is learned at the next `PollWrites` (deferred only when it cannot be extended); (f) netplay
+restores write the set pages only, and the set is page aligned, so they cause no faults of their own.
+
+### Host write tracking in netplay (merged into rev3-net; REV3_RB_WRITE_TRACK=1|2)
+
+Same variables as SyncTest (`REV3_RB_WRITE_TRACK`, `_REARM`, `REV3_RB_DIRTY_LOG`; read by the shared `BuildSyncTest`, so they apply to the net path, the DolphinWriteWatch is
+created there too). What the net path does with it (`SyncTest::NetObserve`, `NetPrepareArm`, `NetClear`, `NetLeave`; `PollWrites` / `GrowKeepingHistory` are the SyncTest ones):
+
+- **Start**: `NetObserve` starts the watch when both fighters are found (not on a resimulated call), like SyncTest, so the first set of a match is learned by faults too
+  (`PageTracker::SkipSlice` keeps the LEARN clock: arming happens at the same time as with the hash scan). **Stop**: `NOTE write tracking off (not gameplay)` when the fighters are
+  lost (loading), and for good when the session ends or the emulator stops (`NetLeave`: `NOTE write tracking off (left the session)`; `NetModule::OnCommand` calls it on the
+  call that ended the session, `Shutdown` again). After that the hash scan learns, as without tracking.
+- **Every call polls first**: `PollWrites()` runs in `NetObserve` before the session captures anything, resimulated calls included; it replaces the hash scan (`ScanSlice` only
+  advances the learning clock in mode 1; mode 2 keeps scanning and logs `WRITE TRACK MISS`). `NetPrepareArm` and `NetClear` end with `WatchRefresh()` (the installed set and the
+  cuts decide what stays guarded).
+- **A page joins while slots are in use**: `GrowKeepingHistory` extends every valid slot of the ring in place from the preimages (new layout generation, the slot ring, `m_range_offsets`
+  and the restore verify's shadows stay consistent). `NetLayoutPending()` stays false, so the session never sees `gate.layout_pending` and there is **no `GATE relayout`**:
+  `NOTE learned +n pages (now ranges=.. bytes=..) frame f, history kept; new=[..]` replaces the pair `NOTE learned +n pages while slots are in use` + `GATE relayout`
+  (the lines `learned_include.py` reads still match). The slot of a frame captured before the growth is restorable afterwards (test `NetWriteTrackingGrowsTheSlotsInPlace*`).
+- **Fallback = the old drain**: when a slot cannot be extended (a page that is neither in a preimage nor clean), nothing is dropped under the session: `m_net_pending` is set,
+  `NOTE learned +n pages while slots are in use (frame f): the slots cannot be extended, the snapshot set grows at the next relayout; new=[..]`, the session drains and relayouts
+  (`GATE relayout`, `NetPrepareArm` installs the set, `NOTE learned +n pages at arm`). In a resimulation the growth waits for the next call (`wt_deferred`). The Dolphin views being
+  remapped also asks for that drain (`NOTE write tracking restarted while slots are in use`), because the history cannot be trusted after a gap.
+- **Counting both**: SUMMARY gets ` wt_grown_kept=.. wt_grown_cleared=.. wt_deferred=.. wt_restarts=.. wt_misses=..` (empty with tracking off); `wt_grown_cleared` is the number of
+  growths that fell back to the drain (the session counts the drains in `relayouts=`), `wt_grown_kept` the ones that did not need it. The `SNAPSHOT kind=write_track ...` line follows
+  every SUMMARY line (`SnapshotStore::AfterSummaryLine`) and is written again after the final `NOTE snapshot stats` (which carries the same fields). Success in a real match:
+  `relayouts=0` (or far fewer than without tracking), `wt_grown_kept=n`, `wt_grown_cleared=0`, `GATE relayout` absent, `late_learn_rollbacks=0`.
+- **Loopback check done here**: a synthetic game over real ENet with two NetModules and a fake watch that writes a page nobody seeded from frame 300 (scratch harness, not in the
+  repository): without tracking 1 `GATE relayout` per side and DESYNC lines (the hash scan finds the page late); with `REV3_RB_WRITE_TRACK=1` or 2 no relayout, `history kept`, no desync.
+  The real Linux write-fault path is the `Rev3Rollback.RealWriteTracking*` / `Rev3WriteTrack.*` tests; Windows (`VirtualProtect`, vectored handler) is compiled by CI only.
+
+`REV3_RB_HASHCHECK` in netplay is **local only**: `NetCapture` keeps the first run's hashes of a frame across the recapture, and the first call of a resimulation (the rollback
+target, which must start in the memory the first run had) is compared with them: `HASHCHECK frame=.. ok|DIFF` lines and the `hashcheck_*` fields on the SUMMARY lines. Later
+resimulated frames are not compared (the corrected pads make them differ legitimately), and only frames that were hashed (`frame % N == 0`) can be compared, so use a small N (1 costs
+~10 ms per frame). No hashes cross the network; the cross-peer diff below is still design only.
+
+## Desync region diff (`REV3_RB_HASHCHECK`, off by default)
+
+**What it answers.** Restore verify says whether a restore put memory back. This says whether the *resimulation* ended in the same memory as the
+first run, for ALL of guest memory and not only the snapshot set and the fighter fields (`Compare`). When a replay differs, the question
+that matters is where; the answer is a list of 4 KB pages, grouped by 64 KB region.
+
+**How it works.** `MemoryHasher` hashes every readable page of MEM1 + MEM2 (22528 pages, the same `HashPage` the page tracker uses; about 9 ms for
+the 88 MB, estimated from the measured 5-10 GB/s of `HashPage` on the sandbox VM; D's `hashcheck_ms=` in SUMMARY has the real cost) except the pages that overlap a skip range. With `REV3_RB_HASHCHECK=N` SyncTest
+hashes at capture when `frame % N == 0`, in the first run and again in the resimulation, and `HashCheck` compares the two page by page.
+Skipped, because the restore or the hardware deliberately leaves them alone or they differ between two visits of a frame: the hook region,
+`REV3_SYNCTEST_EXCLUDE`, the hardware cuts, `REV3_RB_VERIFY_IGNORE` and the dead stack below the hook's sp (the same `VerifyDeadStack` as
+restore verify). A page overlapping a skip range is skipped whole. Cost is one hash pass per hashed frame, twice per rollback; pick N so that
+it is not every frame (`N=30` is half a second apart).
+
+**Log lines**
+
+| Line | Meaning |
+|---|---|
+| `NOTE hash check on: every N frames ...` | at start |
+| `HASHCHECK frame=m ok compared=C skipped=S us=U` | the first 3 equal frames |
+| `HASHCHECK frame=m DIFF pages=p (in_set=a outside_set=b) compared=C regions64k=R [0xBASE:p,..] ranges=[0xS-0xE,..] last_equal_frame=L` | the first 30 differing frames. `in_set`: the page was rewound by the snapshot (nondeterminism inside the set, or a host thread); `outside_set`: nothing rewound it (a page the set misses, or memory the game does not reproduce by itself). At most 16 regions and 16 ranges are listed |
+| SUMMARY `hashcheck_compared= hashcheck_differ= hashcheck_last_equal_frame= hashcheck_first_diff_frame= hashcheck_pages= hashcheck_ms=` | only when on |
+
+**What D runs.** `set REV3_RB_HASHCHECK=30`, then `phase3.bat synctest --k 4` on a stage as for the other checks. Read it like this:
+`hashcheck_differ=0` means that every hashed frame ended in the same memory in the replay. Otherwise the `DIFF` lines name the pages;
+`outside_set` pages that recur in every line are either missing from the set (add them with `REV3_SNAPSHOT_INCLUDE`, or read them in
+the `VERIFY ... missing_pages` list) or are memory the game never reproduces by itself (timers, uninitialised scratch): those must be on the
+exclusion list of any hash two peers compare, and this run is how that list is found.
+
+**Netplay design (not built; the local part is merged, see "Host write tracking in netplay").** On a desync (the existing checksum of the fighter fields disagrees) both peers
+send, at the desync frame f, the same three levels, each level only for what the previous one found different:
+1. `RegionHashes` of the frame: 1408 x 8 bytes = 11 KB. `DiffRegions` names the regions that differ (typically 1-5).
+2. The page hashes of those regions: 16 x 8 bytes per region. `DiffHashes` on the two vectors names the pages.
+3. The 32-byte block hashes of the differing pages (128 x 4 bytes per page), which needs the bytes of frame f on both peers: a per-frame
+   shadow (restore verify's `TakeShadow`) or the snapshot slot. Only worth it for the first desync of a session.
+Both peers must use the *same skip set*: a skip range that exists on one side only makes a region hash differ although nothing is wrong.
+Apply the exclusion list learned with `REV3_RB_HASHCHECK` to both. The three functions are pure (no Dolphin), so rev3-net can use them as
+they are; the parts to bring over are `MemoryHasher`, `MemoryHashes`, `DiffHashes`, `RegionHashes`, `DiffRegions`, `RegionBase` and the
+`HashMemory` / `HashCheck` pair in SyncTest (its `Capture` calls `HashMemory`; `Resim` calls `HashCheck` after `Compare`).
+
+**Tests.** `MemoryHasher*` (exact pages in MEM1 and MEM2, skip ranges, with and without a direct pointer, no MEM2, empty hashes, 64 KB regions) and
+`HashCheck*` (equal run, a page the whitelist misses is named as `outside_set`, a page in the set as `in_set`, exclusions / hardware cuts /
+ignore list / dead stack are left out, off by default).
+
 ## Freeze dump (`REV3_SYNCTEST_DUMP`, default on)
 
 Why: SyncTest replays gameplay exactly (`fields=0` on every resimulated frame) but the game freezes after about 40-60 rollbacks and the

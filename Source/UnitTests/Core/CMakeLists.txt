@@ -6,6 +6,7 @@ add_dolphin_test(Rev3NetLinkTest Rev3NetLinkTest.cpp)
 add_dolphin_test(Rev3NetSimTest Rev3NetSimTest.cpp)
 add_dolphin_test(Rev3RollbackTest Rev3RollbackTest.cpp)
 add_dolphin_test(Rev3SessionTest Rev3SessionTest.cpp)
+add_dolphin_test(Rev3WriteTrackTest Rev3WriteTrackTest.cpp)
 
 add_dolphin_test(DSPAcceleratorTest DSP/DSPAcceleratorTest.cpp)
 add_dolphin_test(DSPAssemblyTest

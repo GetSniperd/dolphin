@@ -2009,6 +2009,9 @@ void RollbackSession::SummaryLine(const char* tag)
            m_stats.io_no_clean_slot, sim.c_str(),
            ranges.c_str(), m5.c_str()) +
        store_note);
+  const std::string after = m_store.AfterSummaryLine();
+  if (!after.empty())
+    Line(after);
 }
 
 void RollbackSession::Finish()

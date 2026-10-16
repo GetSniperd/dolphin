@@ -49,6 +49,13 @@
 //                            _IGNORE (ParseVerifyEnv)
 //   REV3_RESIM_HIDE=0|1|2|3  (or off|draw|sound|all) hook protocol 3 only (M6): what the game hides while a resimulation runs, written as a u32 to
 //                            0x8000241C (default 1 = draw; see "hiding resimulated frames" below). Netplay always; SyncTest with REV3_SYNCTEST_HIDE=1
+//   REV3_RB_WRITE_TRACK=0|1|2  host write tracking (default 0 = off): the pages the game writes are found by write-protecting guest RAM in every host
+//                            view and catching the first write (instead of hashing pages), so the snapshot set grows WITHOUT dropping the
+//                            snapshot history; 2 = also keep the hash scan and report every page it finds that no fault announced
+//                            ("WRITE TRACK MISS"). Also REV3_RB_DIRTY_LOG=N (name the first N dirty pages with the pc / lr of the store) and
+//                            REV3_RB_WRITE_TRACK_REARM=N (equal rewrites before a page is learned anyway, default 4). REV3.md "Host write tracking"
+//   REV3_RB_HASHCHECK=N      every Nth frame hash ALL of guest memory (4 KB pages) in the first run and again in the resimulation and name the pages that
+//                            differ (HASHCHECK lines; REV3.md "Desync region diff"): state the set misses, or memory the game does not reproduce by itself
 //   SyncTest only runs once armed (both fighters found through the TEAMS pointers); menus and loading screens are never
 //   rolled back. See REV3.md for what a clean run looks like.
 //
@@ -733,6 +740,120 @@ bool VerifyEveryCanHit(u32 every_p, u32 k, u32 sync_every);
 // frames later).
 u32 AutoVerifyEvery(u32 k, u32 sync_every);
 
+// ---- memory hash check (REV3_RB_HASHCHECK) -----------------------------------------------------------------------------------
+// "Is ALL of guest memory at frame m the same in the resimulation as in the first run?" Compare() only looks at the snapshot set and the
+// fighter fields; this looks at every page. MemoryHashes is one 64-bit hash per 4 KB page of MEM1 + MEM2 (22528 pages; ~9 ms for 88 MB), minus
+// the pages that overlap a skip range. SyncTest hashes every `every`-th frame at capture time, in the first run and again in the resimulation,
+// and names the pages whose hashes differ (HASHCHECK lines). Pages outside the set that differ are state the snapshot misses or memory the game
+// does not reproduce by itself (timers, uninitialised scratch): the second kind must be left out of any hash two peers compare. The same
+// structure is the first level of the netplay desync diff (REV3.md "Desync region diff"): RegionHashes() folds the page hashes into one hash
+// per 64 KB region (1408 of them, 11 KB on the wire); DiffHashes() on two page-hash vectors names the pages.
+constexpr u32 HASHCHECK_REGION_BYTES = 0x10000;                              // a region is 64 KB = 16 pages
+constexpr size_t HASHCHECK_REGIONS = (0x1800000u + 0x4000000u) / HASHCHECK_REGION_BYTES;  // 384 + 1024 = 1408
+constexpr u32 HASHCHECK_MAX_OK_LOGS = 3;      // equal frames that get a line
+constexpr u32 HASHCHECK_MAX_DIFF_LOGS = 30;   // differing frames that get the full HASHCHECK lines
+constexpr u32 HASHCHECK_MAX_REGIONS_LISTED = 16;
+constexpr u32 HASHCHECK_MAX_RANGES_LISTED = 16;
+
+struct MemoryHashes
+{
+  std::vector<u64> page;   // TRACKED_PAGES entries, MEM1 pages first; meaningful where valid[i] != 0
+  std::vector<u8> valid;   // 1 = hashed, 0 = skipped (overlaps a skip range) or not readable
+  u32 frame = 0;           // the frame the hashes were taken at
+  u32 hashed = 0;          // pages hashed (0: these hashes are not valid)
+  u32 skipped = 0;         // pages left out
+  u64 us = 0;              // time to hash (microseconds)
+  bool Empty() const { return hashed == 0; }
+};
+
+class MemoryHasher
+{
+public:
+  explicit MemoryHasher(GuestMemory& memory, std::function<u64()> micros = {});
+  // Hashes every readable page that does not overlap `skip` into *out (allocated on first use). A page is a whole 4 KB or nothing: a skip range
+  // of one byte takes its whole page out of the comparison.
+  void Hash(const std::vector<Range>& skip, MemoryHashes* out);
+
+private:
+  GuestMemory& m_memory;
+  std::function<u64()> m_micros;
+  std::vector<u8> m_buf;
+};
+
+// Addresses of the pages (ascending) that were hashed in both and differ; *compared = pages hashed in both.
+std::vector<u32> DiffHashes(const MemoryHashes& a, const MemoryHashes& b, u32* compared);
+// One hash per 64 KB region: the page hashes of its valid pages folded in order (a region without a valid page gets 0).
+std::vector<u64> RegionHashes(const MemoryHashes& hashes);
+// Regions (indexes into RegionHashes) in which `a` and `b` differ, ascending; regions where either side has no valid page are not listed.
+std::vector<u32> DiffRegions(const std::vector<u64>& a, const std::vector<u64>& b);
+// Address of the first byte of region `index` (MEM1 regions first).
+u32 RegionBase(size_t index);
+
+// ---- host write tracking (REV3_RB_WRITE_TRACK) ----------------------------------------------------------------------------------
+// The adaptive snapshot set finds the pages that change by hashing (a page is noticed up to one scan cycle after its first change). A
+// WriteWatch knows it at the moment of the first write: every guest page that is not (fully) in the snapshot set is write-protected in every
+// host view of guest RAM, the first write to it faults, the fault handler copies the page's contents as they were BEFORE the write (the
+// "preimage") and lets the write go on. Because a watched page was not written since it was armed, its contents in every snapshot slot
+// taken since then equal the preimage, so the page can join the snapshot set WITHOUT dropping the history (SyncTest::GrowSetKeepingHistory
+// back-fills the slots from the preimages). Implementations: Rev3::WriteTracker (Rev3WriteTrack.h, protects host memory pages) and the fakes
+// of the unit tests. All calls but the fault handler run on the CPU thread.
+struct DirtyPage
+{
+  u32 addr = 0;                    // guest address of the 4 KB page
+  const u8* preimage = nullptr;    // the page as it was when it was last clean (PAGE_SIZE bytes), valid until Rearm / Release of this page
+  u32 pc = 0;                      // guest pc / lr at the first write, when the CPU thread wrote it (pc = start of the JIT block that holds the
+  u32 lr = 0;                      // store, within a few dozen instructions; lr is exact), else 0
+  bool cpu_thread = false;         // the CPU thread did the first write (false: GPU / DSP / IOS / a savestate load)
+  u32 equal_rearms = 0;            // how often this page was found unchanged after a write and armed again
+};
+
+struct WriteWatchStats
+{
+  u64 faults = 0;            // first writes to watched pages (each costs one signal + a 4 KB copy + one protection change per host view)
+  u64 stale_faults = 0;      // faults on pages already released (a second thread racing the first, or a view that was remapped)
+  u64 protect_calls = 0;     // VirtualProtect / mprotect calls
+  u64 pages_protected = 0;   // pages made read-only (arming and re-arming)
+  u64 protect_us = 0;        // time in those calls (microseconds): the arm time
+  u64 rearms = 0;            // pages found unchanged after a write and armed again
+  u64 rearm_changed = 0;     // re-arms that found the page changed meanwhile (a write that raced the check)
+  u64 polls = 0;
+  u64 poll_us = 0;           // time in Poll (microseconds)
+  u32 watched_pages = 0;     // pages armed or dirty right now
+  u32 views = 0;             // host views registered
+  u32 restarts = 0;          // times the view list changed while watching (everything was dropped and made writable)
+  u64 protect_errors = 0;    // protection calls that failed (an address range that is no longer mapped, or out of kernel memory areas)
+};
+
+class WriteWatch
+{
+public:
+  virtual ~WriteWatch() = default;
+  // One line saying what is watching (logged at start), e.g. "host page protection, 7 views".
+  virtual std::string Describe() const { return {}; }
+  // Watch every page that has a host view and is not FULLY inside `keep` (sorted, merged ranges). Pages already watched stay as they are
+  // (a page that is dirty stays dirty until the caller re-arms or releases it); pages that became fully inside `keep` are released. False
+  // (and *why) when watching is not possible; nothing stays protected then.
+  virtual bool SetWatched(const std::vector<Range>& keep, std::string* why) = 0;
+  // Stops watching: every page writable again, all dirty marks dropped.
+  virtual void Stop() = 0;
+  // The pages written since they were armed and not yet re-armed or released, ascending. Not re-armed by this call.
+  virtual void Poll(std::vector<DirtyPage>* out) = 0;
+  // The caller found these pages unchanged (equal to their preimage): protect them again. Returns the pages that turned out changed after
+  // all (a write raced the check); those stay dirty.
+  virtual std::vector<u32> Rearm(const std::vector<u32>& pages) = 0;
+  // These pages joined the snapshot set (or were cut by a hardware exclusion): no longer watched, writable.
+  virtual void Release(const std::vector<u32>& pages) = 0;
+  // The page is watched and was not written since it was armed: its current contents are its contents at every time since then.
+  virtual bool IsClean(u32 page_addr) const = 0;
+  // True while watching. False after Stop(), and when the host views changed under a running watch (everything was made writable and
+  // forgotten; the caller starts again with SetWatched and treats the history as unproven).
+  virtual bool Active() const = 0;
+  virtual WriteWatchStats Stats() const = 0;
+  // Writes a byte back to a watched page and checks that the write faulted; call right after SetWatched succeeded. False (and *why): write
+  // tracking does not work here.
+  virtual bool SelfTest(std::string* why) { (void)why; return true; }
+};
+
 // ---- SyncTest -------------------------------------------------------------------------------------------------------------
 struct SyncTestOptions
 {
@@ -759,6 +880,13 @@ struct SyncTestOptions
   u32 ef_check_restores = 200;    // REV3_EFCHECK: restores (count, not frames) that get the ef list check before / after the write-back;
                                   // 0 = off, EF_CHECK_ALL = every restore. 200 restores = 200 checks of a few thousand reads each (microseconds)
   VerifyOptions verify;           // REV3_RB_VERIFY*: shadow copy of guest memory and a full comparison after restores (see "restore verify" above)
+  u32 write_track = 0;            // REV3_RB_WRITE_TRACK: 0 = off, 1 = learn pages from write faults (SetWriteWatch) instead of hashing, 2 = faults
+                                  // AND the hash scan (every page the scan finds that the faults missed is a "WRITE TRACK MISS"); needs adaptive
+  u32 dirty_log = 0;              // REV3_RB_DIRTY_LOG=N: log the first N dirty pages of each hook call with the guest pc / lr of the store (pages)
+  u32 hash_check_every = 0;       // REV3_RB_HASHCHECK=N: hash all of guest memory (MemoryHasher) when frame % N == 0, in the first run and in the resimulation,
+                                  // and name the pages that differ (frames, 0 = off; about 9 ms per hashed frame)
+  u32 write_track_rearm_max = 4;  // REV3_RB_WRITE_TRACK_REARM=N: a page found unchanged after a write this many times is learned anyway (count);
+                                  // it is rewritten with identical bytes every frame and each re-arm costs a fault, so its 4 KB are cheaper
 };
 
 constexpr u32 EF_CHECK_ALL = 0xFFFFFFFFu;  // SyncTestOptions::ef_check_restores: check every restore
@@ -777,6 +905,8 @@ public:
   PageTracker(GuestMemory& memory, u32 slices);
   void Reset();                                   // forget every hash, dynamic mark and cycle (fighters lost: a new match)
   u32 Scan();                                     // hash the next slice; returns how many pages just became dynamic
+  void SkipSlice();                               // advance the slice / cycle counters without hashing (write tracking found the pages)
+  bool MarkDynamic(u32 addr);                     // the page holding addr changed (write tracking saw it); true when it was not dynamic yet
   void InvalidateBaseline(const std::vector<Range>& ranges);  // a restore rewrote these: their old hashes mean nothing
   void AppendDynamicRanges(std::vector<Range>* out) const;    // dynamic pages, adjacent ones merged
   u32 Cycles() const { return m_cycles; }         // completed scan cycles (a cycle = `slices` Scan() calls)
@@ -828,6 +958,26 @@ struct SyncTestStats
   u32 layout_refused = 0;         // restores refused because the snapshot was taken under another snapshot layout
   u32 late_learn_rollbacks = 0;   // rollbacks done within one scan cycle before pages were learned (those pages were not rewound)
   u32 verify_pages_added = 0;     // pages the restore verify (heal) added to the snapshot set
+  // host write tracking (SetWriteWatch)
+  u32 wt_arms = 0;                // times tracking was started (a match, or a restart after the views changed)
+  u32 wt_pages_learned = 0;       // pages learned from write faults (changed, or rewritten equal wt_rearm_max times)
+  u32 wt_equal_rearms = 0;        // dirty pages found unchanged and armed again
+  u32 wt_promoted_equal = 0;      // pages learned only because they were rewritten with equal bytes too often
+  u32 wt_grown_kept = 0;          // growths that kept the snapshot history (the slots were extended from the preimages)
+  u32 wt_grown_cleared = 0;       // growths that had to clear the history (a baseline was missing)
+  u32 wt_restarts = 0;            // tracking restarted because the host views changed
+  u32 wt_misses = 0;              // REV3_RB_WRITE_TRACK=2: pages the hash scan found that no fault announced
+  u32 wt_deferred = 0;            // growths postponed until the end of a resimulation
+  u64 wt_poll_us_total = 0;       // time in PollWrites (microseconds)
+  u64 wt_poll_us_max = 0;
+  size_t snapshot_bytes_max = 0;  // largest snapshot (bytes)
+  // memory hash check (REV3_RB_HASHCHECK)
+  u32 hc_compared = 0;            // frames whose resimulated memory was compared with the first run
+  u32 hc_differ = 0;              // ... of which with at least one differing page
+  u32 hc_last_equal_frame = 0;    // latest frame that compared equal (0: none yet)
+  u32 hc_first_diff_frame = 0;    // first frame that differed (0: none yet)
+  u64 hc_pages_total = 0;         // differing pages summed over the frames
+  u64 hc_us_total = 0;            // time spent hashing (microseconds)
 };
 
 class SyncTest
@@ -881,6 +1031,17 @@ public:
   std::string VerifySummaryText() const;
   const std::vector<Range>& VerifyExtraRanges() const { return m_verify_extra; }
 
+  // " hashcheck_compared=.. hashcheck_differ=.. hashcheck_last_equal_frame=.. hashcheck_first_diff_frame=.." appended to SUMMARY lines; empty when off.
+  std::string HashCheckStatsFields() const;
+
+  // Host write tracking (REV3_RB_WRITE_TRACK; REV3.md "Host write tracking"). `watch` is not owned and must outlive this object; null (the
+  // default) or options.write_track == 0 leaves the hash scan in charge. Call before the first command.
+  void SetWriteWatch(WriteWatch* watch);
+  bool WriteTrackingOn() const { return m_watching; }
+  // "SNAPSHOT kind=write_track|adaptive|classic last=.. MB max=.. MB pages=.. of watched=.. faults=.. arms=.. | restores checked=.. wrong=..
+  // blocks=.. first_wrong_frame=.. shadow_ms=.." (also written after every SUMMARY line).
+  std::string SnapshotLine() const;
+
   // Writes the final summary line (once). The destructor does not. Also clears the resimulation hiding flags.
   void Finish();
 
@@ -914,9 +1075,11 @@ public:
   // adaptive set / hardware cuts / audio rewind as SyncTest, so this class offers them without SyncTest's own state machine
   // (OnCommand is NOT called in this mode; options.k = MAXR + 1 gives MAXR + 2 slots, slot of frame n = ring[n % slots]).
   // Per hook call, in this order: NetObserve(), then (session decides) NetCapture / NetRestore / NetClear. All on the CPU thread.
-  //   - The set (m_ranges) only changes in NetPrepareArm() and NetClear(), i.e. while no slot is in use: slots of an armed stretch all
-  //     share one layout. Pages learned and hardware regions found while a stretch is running are only noted (NetLayoutPending()); the
-  //     caller closes the gate, the session drains, and its Clear() installs the new set.
+  //   - The set (m_ranges) changes in NetPrepareArm() and NetClear(), i.e. while no slot is in use: slots of an armed stretch share one
+  //     layout. Pages learned and hardware regions found while a stretch is running are only noted (NetLayoutPending()); the caller
+  //     closes the gate, the session drains, and its Clear() installs the new set. The one exception is host write tracking
+  //     (REV3_RB_WRITE_TRACK): a learned page then extends every slot in place (PollWrites -> GrowKeepingHistory, new layout generation)
+  //     and nothing is pending; only a slot that cannot be extended falls back to the drain above.
   struct NetSnapshotInfo
   {
     std::array<std::array<u8, FIELD_BYTES>, 2> fields{};  // raw big-endian field bytes (FIELDS order) of both fighters at the capture
@@ -950,6 +1113,15 @@ public:
   std::string IoStatsFields() const;
   // Sets the hiding flags object whose counters NetSummaryNote reports (netplay: the session's ResimHiding writes the flags itself). Not owned.
   void SetHideCounters(const ResimHideFlags* hide) { m_hide_counters = hide; }
+  // Netplay and host write tracking (REV3_RB_WRITE_TRACK; REV3.md "Host write tracking" and "Netplay: write tracking"). With tracking on, NetObserve
+  // starts the watch when both fighters are found, polls it on every call (resimulated ones too) in place of the hash scan, and a page that
+  // joins the set while slots are in use extends the slots in place (GrowKeepingHistory): no NetLayoutPending, no drain. Only when a slot cannot be
+  // extended (a page without baseline) the old path runs: NetLayoutPending, the session drains and relayouts. NetLeave: the session ended or
+  // the emulator is stopping; the watch stops for good (the hash scan learns from then on, as without tracking).
+  void NetLeave();
+  // " wt_grown_kept=.. wt_grown_cleared=.. wt_deferred=.. wt_restarts=.. wt_misses=.." (leading space) appended to the SUMMARY lines; empty when
+  // tracking is off. In netplay wt_grown_cleared counts the growths that fell back to the drain path (the session counts those drains in relayouts=).
+  std::string WriteTrackFields() const;
   // Writes the pending RESTORE summary window (options.restore_log_full policy); call before the final stats at shutdown.
   void NetFlushLog();
   // REV3_NET_RANGE_CRC: the CRC of each snapshot range (m_ranges) as it was at the start of `frame`: from the frame's slot, or from live
@@ -979,6 +1151,7 @@ private:
                                                             // restoring it would leave the game waiting for a completion that has already happened
     bool timebase_valid = false;
     u64 timebase = 0;                                       // emulated time base at capture (only with restore_timebase)
+    MemoryHashes hashes;                                    // REV3_RB_HASHCHECK: all-memory page hashes of this frame (Empty() when not hashed)
     struct Audio
     {
       bool valid = false;
@@ -1035,6 +1208,20 @@ private:
   // Installs the pages the heal added (m_verify_extra) into the layout: new set, relayout, history cleared. SyncTest only, never mid-resim.
   void ApplyVerifyPages();
   bool Arm(const Command& command, const std::array<u32, 2>& fighters);
+  // ---- host write tracking, SyncTest side ----
+  // Everything the watch must not guard: the snapshot set plus every cut (hook region, user and hardware exclusions), merged.
+  std::vector<Range> KeepRanges() const;
+  void WatchStart(const char* why);
+  void WatchStop(const char* why);
+  void WatchRefresh();                               // the set or the cuts grew: release the pages that became fully covered
+  void PollWrites();                                 // dirty pages -> learn (growing the set) or arm again; once per hook call, before captures
+  // The set grew to `ranges` (a superset of m_ranges): extend every valid slot, filling the new bytes from the preimages in `dirty` or from
+  // the live memory of pages that were not written since they were armed. False when a page has neither (the caller clears the history).
+  bool GrowKeepingHistory(const std::vector<Range>& ranges, const std::vector<DirtyPage>& dirty);
+  void LogLearnedGrowth(const char* history, bool late);
+  // REV3_RB_HASHCHECK: hash all memory into the slot at capture, and compare the reference with the resimulated frame's hashes.
+  void HashMemory(Slot& slot, const Command& command);
+  void HashCheck(const Slot& reference, const Slot& live, u32 frame);
   // "0xSTART-0xEND" of the current snapshot range that holds [addr, addr + 4); empty when none does.
   std::string RangeContaining(u32 addr) const;
   // Same, plus the slot's stack window ("stack_window 0x..-0x.."); empty when none holds it.
@@ -1049,6 +1236,14 @@ private:
   std::vector<PtrExclusion> m_include_ptrs;     // REV3_SNAPSHOT_INCLUDE pointer entries (resolved at arm)
   std::vector<Range> m_forced;                  // resolved at the latest arm: ef pool + the user entries, merged
   std::unique_ptr<RestoreVerifier> m_verify;    // null = restore verify off (options.verify.restores == 0)
+  WriteWatch* m_watch = nullptr;                // null = no write tracking
+  bool m_watching = false;                      // tracking is on (SetWatched succeeded and Stop() has not been called)
+  bool m_watch_failed = false;                  // "not possible" was logged: the hash scan does the learning
+  std::vector<u8> m_page_buf;                   // one page of live memory (PollWrites)
+  u32 m_dirty_logged = 0;                       // DIRTY lines written (limit options.dirty_log)
+  std::unique_ptr<MemoryHasher> m_hasher;       // null = hash check off
+  u32 m_hc_diff_logs = 0;
+  u32 m_hc_ok_logs = 0;
   std::vector<Range> m_verify_ignore;           // REV3_RB_VERIFY_IGNORE: never compared
   std::vector<Range> m_verify_extra;            // pages the heal found missing: part of every ComputeRanges() from then on
   bool m_verify_dirty = false;                  // m_verify_extra has pages the current layout (m_ranges) lacks
@@ -1132,6 +1327,10 @@ private:
   bool m_net_active = false;       // slots have been captured since the latest NetClear
   u32 m_net_calls = 0;             // NetObserve calls with slots in use (paces the hardware re-check)
   bool m_net_mode = false;         // NetObserve has been called: this is a netplay run (the restore verify heal then asks for a relayout)
+  bool m_net_resim = false;        // the latest NetObserve was a resimulated call (the session's, m_resim is SyncTest's own)
+  bool m_net_left = false;         // NetLeave: write tracking is not started again
+  bool m_net_restore_check = false;  // NetRestore ran and the next NetCapture is the target frame (REV3_RB_HASHCHECK compares it with the first run)
+  u32 m_net_restore_target = 0;
   bool m_net_armed_once = false;   // a set has been installed in this match: pages joining later are learned pages (the first one learns nothing)
   ResimHideFlags* m_hide = nullptr;                // SyncTest: REV3_SYNCTEST_HIDE
   bool m_hide_on = false;                          // the latest value passed to m_hide->Set
@@ -1272,6 +1471,14 @@ bool NetplayRequested();
 // REV3_RB_VERIFY_IGNORE (a {"ranges":[..]} file) into *ignore; problems are logged to `sink` as ERROR lines and that variable stays at its
 // default. Shared by SyncTest and the netplay session's options code. Defined in the Dolphin glue (needs the environment and files).
 void ParseVerifyEnv(SyncTestOptions* options, std::vector<Range>* ignore, Sink& sink);
+
+// Reads REV3_RB_WRITE_TRACK (0 / 1 / 2), REV3_RB_DIRTY_LOG and REV3_RB_WRITE_TRACK_REARM into options->write_track / dirty_log /
+// write_track_rearm_max; problems are logged to `sink` as ERROR lines and tracking stays off. Needs options->adaptive already set. The caller
+// then gives SyncTest a DolphinWriteWatch (SetWriteWatch). Defined in the Dolphin glue.
+void ParseWriteTrackEnv(SyncTestOptions* options, Sink& sink);
+
+// Reads REV3_RB_HASHCHECK (frames, 0 = off) into options->hash_check_every. Defined in the Dolphin glue.
+void ParseHashCheckEnv(SyncTestOptions* options, Sink& sink);
 
 // Writes the final summary and closes the log; the next command starts a fresh session. Safe to call any time.
 void Shutdown();
