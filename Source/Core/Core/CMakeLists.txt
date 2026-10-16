@@ -558,6 +558,8 @@ add_library(core
   PowerPC/Interpreter/Interpreter_Paired.cpp
   PowerPC/Interpreter/Interpreter_SystemRegisters.cpp
   PowerPC/Interpreter/Interpreter_Tables.cpp
+  Slippi/Rev3Bot.cpp
+  Slippi/Rev3Bot.h
   Slippi/Rev3Net.cpp
   Slippi/Rev3Net.h
   Slippi/Rev3NetLink.cpp

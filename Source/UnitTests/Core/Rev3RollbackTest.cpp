@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -6791,4 +6792,108 @@ TEST(Rev3Rollback, NetModeHashCheckOnlyLooksAtFramesItHashed)
   ASSERT_TRUE(NetReplayCall(rig, even));
   EXPECT_EQ(1u, rig.test.Stats().hc_compared);
   EXPECT_EQ(0u, rig.test.Stats().hc_differ);
+}
+
+// ---- soak bot glue: ReadGameObs and the bot inside the determinism kit (Rev3Bot.h) ------------------------------------------------
+
+TEST(Rev3Rollback, ReadGameObsSeesFightersHealthAndScene)
+{
+  {
+    FakeMemory mem;  // a menu: no fighters, scene words 0
+    const Bot::GameObs obs = ReadGameObs(mem);
+    EXPECT_FALSE(obs.fighters_found);
+    EXPECT_FALSE(obs.health_zero);
+    EXPECT_TRUE(obs.scene_valid);
+    EXPECT_EQ(obs.scene_type, 0u);
+  }
+  FakeMemory mem;
+  CsWorld(&mem);
+  mem.SetU32(Bot::SCENE_TYPE_ADDR, 2);
+  mem.SetU32(Bot::SCENE_SUB_ADDR, 1);
+  mem.SetU32(CS_A1 + Bot::FIGHTER_HEALTH_OFFSET, 10000);
+  mem.SetU32(CS_A2 + Bot::FIGHTER_HEALTH_OFFSET, 10000);
+  Bot::GameObs obs = ReadGameObs(mem);
+  EXPECT_TRUE(obs.fighters_found);
+  EXPECT_FALSE(obs.health_zero);
+  EXPECT_TRUE(obs.scene_valid);
+  EXPECT_EQ(obs.scene_type, 2u);
+  EXPECT_EQ(obs.scene_sub, 1u);
+  mem.SetU32(CS_A2 + Bot::FIGHTER_HEALTH_OFFSET, 0);  // either fighter at 0 counts (as the arm gate's HealthZero)
+  EXPECT_TRUE(ReadGameObs(mem).health_zero);
+  mem.SetU32(CS_A2 + Bot::FIGHTER_HEALTH_OFFSET, 10000);
+  mem.SetU32(CS_A1 + Bot::FIGHTER_HEALTH_OFFSET, 0);
+  EXPECT_TRUE(ReadGameObs(mem).health_zero);
+  mem.SetU32(0x8038FE50 + 4, 0);  // one fighter only (loading): not "found"
+  obs = ReadGameObs(mem);
+  EXPECT_FALSE(obs.fighters_found);
+  EXPECT_FALSE(obs.health_zero);  // health is only read for a found pair
+}
+
+TEST(Rev3Rollback, KitBotLeavesTheScriptAloneUntilTheFightersAppearThenPlaysTheLocalPad)
+{
+  KitRig rig;
+  FakeMemory menu_mem;  // the rig's memory has fighters from the start; the bot test needs a menu first
+  std::string error;
+  ASSERT_TRUE(ParsePadScript(FormatPadRecordLine(10, {Pad(1), Pad(2)}, 0) + "\n" + FormatPadRecordLine(11, {Pad(3), Pad(4)}, 0) + "\n" +
+                                 FormatPadRecordLine(12, {Pad(5), Pad(6)}, 0) + "\n",
+                             &rig.options.script, &error));
+  rig.options.script_path = "s.txt";
+  FakeSink sink;
+  DeterminismKit kit(rig.options, menu_mem, sink, nullptr, nullptr);
+  std::vector<std::string> bot_log;
+  Bot::PadBotController bot(5, 1, [&bot_log](const std::string& s) { bot_log.push_back(s); });
+  kit.SetBot(&bot);
+  EXPECT_TRUE(kit.HasBot());
+
+  Command c = rig.Cmd(10);
+  kit.OnCommand(&c, false);  // inside the script, no fighters: the scripted pad
+  EXPECT_EQ(c.pads[0], Pad(1));
+  c = rig.Cmd(13);  // past the script's end, no fighters: the menu presser
+  kit.OnCommand(&c, false);
+  EXPECT_EQ(c.pads[0], bot.generator().MenuPad(13));
+  EXPECT_EQ(c.pad_return, std::numeric_limits<s32>::min());
+  EXPECT_EQ(c.pads[1], rig.Cmd(13).pads[1]);  // only the local pad is the bot's
+  EXPECT_EQ(c.pads[0][10], 0);
+
+  CsWorld(&menu_mem);  // the fight starts while the script has not even begun to end
+  Command d = rig.Cmd(11);
+  kit.OnCommand(&d, false);
+  EXPECT_EQ(d.pads[0], bot.generator().FightPad(11));
+  EXPECT_TRUE(bot.FightFound());
+  EXPECT_EQ(bot.FightFrame(), 11u);
+  Command e = rig.Cmd(12);  // still inside the script's frames: the bot keeps the pad
+  kit.OnCommand(&e, false);
+  EXPECT_EQ(e.pads[0], bot.generator().FightPad(12));
+}
+
+TEST(Rev3Rollback, KitBotNeverTouchesAResimulatedCallAndSetBotNullRestoresThePlainKit)
+{
+  KitRig rig;  // fighters present
+  auto kit = rig.Make();
+  Bot::PadBotController bot(9, 0, Bot::LogFn());
+  kit->SetBot(&bot);
+  Command c = rig.Cmd(100);
+  kit->OnCommand(&c, /*resimulating=*/true);
+  EXPECT_EQ(c.pads, rig.Cmd(100).pads);  // the session replays its own stored pad there
+  EXPECT_FALSE(bot.FightFound());
+  kit->OnCommand(&c, false);
+  EXPECT_EQ(c.pads[0], bot.generator().FightPad(100));
+  kit->SetBot(nullptr);
+  Command d = rig.Cmd(101);
+  kit->OnCommand(&d, false);
+  EXPECT_EQ(d.pads, rig.Cmd(101).pads);
+}
+
+TEST(Rev3Rollback, KitBotMakesTheRecordHoldTheBotsPadsInOfflineRuns)
+{
+  KitRig rig;
+  rig.options.record_path = "pads.txt";
+  auto kit = rig.Make();
+  Bot::PadBotController bot(9, 0, Bot::LogFn());
+  kit->SetBot(&bot);
+  Command c = rig.Cmd(50);
+  kit->OnCommand(&c, false);
+  ASSERT_EQ(rig.record.lines.size(), 2u);  // header + the call
+  const PadBytes want = bot.generator().FightPad(50);
+  EXPECT_EQ(rig.record.lines[1], FormatPadRecordLine(50, {want, rig.Cmd(50).pads[1]}, std::numeric_limits<s32>::min()));
 }

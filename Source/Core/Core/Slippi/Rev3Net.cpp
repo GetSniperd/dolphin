@@ -877,7 +877,7 @@ void NetModule::Shutdown()
   if (m_session != nullptr)
   {
     if (m_session->mode() != Mode::OFFLINE)
-      m_session->Abort("the emulator was closed");  // BYE to the peer, SUMMARY
+      m_session->Abort(m_exit_reason);  // BYE to the peer, SUMMARY
     m_session->Finish();
   }
   if (m_sync != nullptr && m_started && m_session != nullptr)

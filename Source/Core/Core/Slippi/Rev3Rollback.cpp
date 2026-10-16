@@ -19,6 +19,7 @@
 #include <ctime>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -41,6 +42,7 @@
 #include "Core/Core.h"
 #include "Core/CoreTiming.h"
 #include "Core/DSPEmulator.h"
+#include "Core/Host.h"
 #include "Core/HW/AudioInterface.h"
 #include "Core/HW/CPU.h"
 #include "Core/HW/DSP.h"
@@ -3805,6 +3807,31 @@ size_t FindFighterStructs(const GuestMemory& memory, std::array<u32, 2>* addrs)
   return found;
 }
 
+Bot::GameObs ReadGameObs(const GuestMemory& memory)
+{
+  Bot::GameObs obs;
+  std::array<u32, 2> fighters{};
+  obs.fighters_found = FindFighterStructs(memory, &fighters) == 2;
+  if (obs.fighters_found)
+  {
+    for (const u32 fighter : fighters)
+    {
+      u8 word[4];
+      if (memory.Read(fighter + Bot::FIGHTER_HEALTH_OFFSET, word, 4) && ReadBE32(word) == 0)
+        obs.health_zero = true;
+    }
+  }
+  u8 type[4];
+  u8 sub[4];
+  if (memory.Read(Bot::SCENE_TYPE_ADDR, type, 4) && memory.Read(Bot::SCENE_SUB_ADDR, sub, 4))
+  {
+    obs.scene_valid = true;
+    obs.scene_type = ReadBE32(type);
+    obs.scene_sub = ReadBE32(sub);
+  }
+  return obs;
+}
+
 size_t FighterChecksum(const GuestMemory& memory, u32 frame, u32* checksum)
 {
   std::array<u32, 2> fighters{};
@@ -4060,6 +4087,17 @@ void DeterminismKit::OnCommand(Command* command, bool resimulating)
   }
   if (resimulating)
     return;
+
+  if (m_bot != nullptr)
+  {
+    Bot::BotPad bot_pad;
+    const bool script_active = scripted && frame <= m_options.script.last;
+    if (m_bot->Choose(frame, script_active, ReadGameObs(m_memory), &bot_pad))
+    {
+      command->pads[0] = bot_pad;
+      command->pad_return = std::numeric_limits<s32>::min();  // 0x80000000 = port 0 has data (D's pad record: PADRead's usual return)
+    }
+  }
 
   if (scripted && !m_script_ended && frame > m_options.script.last)
   {
@@ -5475,6 +5513,128 @@ private:
   std::thread m_thread;
 };
 
+// The soak's host-side exits (Rev3Bot.h): a thread that wakes every 250 ms and applies the pure decisions of Rev3Bot.h.
+//   REV3_NET_FREEZE_EXIT_S  the freeze dump's stall limit plus this many seconds without a hook command (the net session's deliberate waits for
+//                           the peer excluded): write a last dump, `LEAVE ... reason=freeze`, and end the process hard with EXIT_CODE_FREEZE. A
+//                           frozen game is usually a CPU thread that never comes back, so a polite stop would not finish.
+//   REV3_NET_MAX_S          wall seconds since the watcher started (the first hook command): request a stop; if the process is still there
+//                           STOP_GRACE_MS later, end it with EXIT_CODE_MAX_S.
+//   a planned stop          NoteStop() is called by the CPU thread when it asked the host to stop; if the process is still there STOP_GRACE_MS
+//                           later it is ended with EXIT_CODE_STOP_HANG (a clean stop takes about a second).
+// Ending the process is std::_Exit: no destructors run (the logs are flushed per line; the pad record / trace may lose their last lines).
+class ExitWatcher
+{
+public:
+  using StopFn = std::function<void()>;
+  ExitWatcher(FreezeDump* dump, Sink& sink, u32 freeze_exit_s, u32 max_s, StopFn request_stop)
+      : m_shared(std::make_shared<Shared>())
+  {
+    m_shared->start = std::chrono::steady_clock::now();
+    std::shared_ptr<Shared> shared = m_shared;
+    Sink* const log = &sink;
+    m_thread = std::thread([shared, dump, log, freeze_exit_s, max_s, request_stop]() { Run(*shared, dump, *log, freeze_exit_s, max_s, request_stop); });
+  }
+
+  ~ExitWatcher()
+  {
+    if (m_thread.joinable())
+      m_thread.detach();
+  }
+
+  // CPU thread: a stop was asked for (the first call counts).
+  void NoteStop()
+  {
+    s64 expected = -1;
+    m_shared->stop_at_ms.compare_exchange_strong(expected, ElapsedMs(*m_shared));
+  }
+
+  bool Stop(std::chrono::milliseconds wait)
+  {
+    {
+      std::lock_guard<std::mutex> lock(m_shared->mutex);
+      m_shared->stop.store(true);
+    }
+    m_shared->cv.notify_all();
+    std::unique_lock<std::mutex> lock(m_shared->mutex);
+    const bool done = m_shared->cv.wait_for(lock, wait, [this]() { return m_shared->finished; });
+    lock.unlock();
+    if (!m_thread.joinable())
+      return done;
+    if (done)
+      m_thread.join();
+    else
+      m_thread.detach();
+    return done;
+  }
+
+private:
+  struct Shared
+  {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::atomic<bool> stop{false};
+    bool finished = false;  // under mutex
+    std::chrono::steady_clock::time_point start;
+    std::atomic<s64> stop_at_ms{-1};       // elapsed ms of the first stop request, -1 = none
+    std::atomic<bool> stop_for_max{false};  // that request was the wall-clock cap's
+  };
+
+  static s64 ElapsedMs(const Shared& shared)
+  {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - shared.start).count();
+  }
+
+  static void Run(Shared& shared, FreezeDump* dump, Sink& sink, u32 freeze_exit_s, u32 max_s, const StopFn& request_stop)
+  {
+    constexpr std::chrono::milliseconds POLL(250);  // watcher poll period
+    while (true)
+    {
+      {
+        std::unique_lock<std::mutex> lock(shared.mutex);
+        shared.cv.wait_for(lock, POLL, [&shared]() { return shared.stop.load(); });
+      }
+      if (shared.stop.load())
+        break;
+      const s64 elapsed = ElapsedMs(shared);
+      if (dump != nullptr && Bot::FreezeExitDue(dump->LastAgeMs(), dump->Seen(), dump->Blocked(), dump->StallMs(), freeze_exit_s))
+      {
+        const u64 age = dump->LastAgeMs();
+        const u32 frame = dump->LastFrame();
+        sink.Line(Format("EXIT freeze: no hook command for %llu ms (last frame %u; REV3_NET_FREEZE_EXIT_S=%u after the %u ms stall limit)",
+                         static_cast<unsigned long long>(age), frame, freeze_exit_s, dump->StallMs()));
+        dump->Dump("freeze", true, false, "REV3_NET_FREEZE_EXIT_S");
+        sink.Line(Format("LEAVE frame=%u from=WATCHDOG reason=freeze (no hook command for %llu ms)", frame, static_cast<unsigned long long>(age)));
+        sink.Line(Format("EXIT code=%d (freeze)", Bot::EXIT_CODE_FREEZE));
+        std::_Exit(Bot::EXIT_CODE_FREEZE);
+      }
+      if (shared.stop_at_ms.load() < 0 && Bot::MaxSecondsDue(static_cast<u64>(elapsed), max_s))
+      {
+        sink.Line(Format("EXIT max_s: REV3_NET_MAX_S=%u wall seconds are up; stop requested", max_s));
+        s64 expected = -1;
+        shared.stop_at_ms.compare_exchange_strong(expected, elapsed);
+        shared.stop_for_max.store(true);
+        if (request_stop)
+          request_stop();
+      }
+      const s64 stop_at = shared.stop_at_ms.load();
+      if (stop_at >= 0 && Bot::StopHangDue(static_cast<u64>(elapsed - stop_at)))
+      {
+        const int code = shared.stop_for_max.load() ? Bot::EXIT_CODE_MAX_S : Bot::EXIT_CODE_STOP_HANG;
+        sink.Line(Format("EXIT stop did not end the process within %u ms; ending it (code %d)", Bot::STOP_GRACE_MS, code));
+        std::_Exit(code);
+      }
+    }
+    {
+      std::lock_guard<std::mutex> lock(shared.mutex);
+      shared.finished = true;
+    }
+    shared.cv.notify_all();
+  }
+
+  std::shared_ptr<Shared> m_shared;
+  std::thread m_thread;
+};
+
 class FileSink final : public Sink
 {
 public:
@@ -5632,6 +5792,10 @@ struct Module
   std::unique_ptr<DolphinDumpSource> dump_source;  // freeze dump (REV3_SYNCTEST_DUMP); null = off
   std::unique_ptr<FreezeDump> dump;
   std::unique_ptr<StallWatchdog> watchdog;
+  Bot::BotOptions bot_options;                      // REV3_PAD_BOT / REV3_NET_EXIT / REV3_NET_EXIT_WAIT_S / REV3_NET_FREEZE_EXIT_S / REV3_NET_MAX_S
+  std::unique_ptr<Bot::PadBotController> bot;       // REV3_PAD_BOT; also held by the kit (SetBot)
+  std::unique_ptr<Bot::ExitController> exit_ctl;    // REV3_NET_EXIT
+  std::unique_ptr<ExitWatcher> exit_watcher;        // freeze exit, wall-clock cap, stop hang
 };
 
 Module& GetModule()
@@ -5696,7 +5860,8 @@ void InitializeKit(Module& module)
   const std::string record_path = GetEnv("REV3_PAD_RECORD");
   const std::string script_path = GetEnv("REV3_PAD_SCRIPT");
   const std::string trace_path = GetEnv("REV3_TRACE");
-  if (record_path.empty() && script_path.empty() && trace_path.empty())
+  const bool bot_wanted = !GetEnv("REV3_PAD_BOT").empty();  // the kit carries the bot (InitializeBot attaches it)
+  if (record_path.empty() && script_path.empty() && trace_path.empty() && !bot_wanted)
     return;
   FileSink& sink = EnsureSink(module);
   const auto fail = [&sink](const std::string& what) {
@@ -5766,7 +5931,7 @@ void InitializeKit(Module& module)
       module.trace.reset();
     }
   }
-  if (module.pad_record == nullptr && module.trace == nullptr && options.script_path.empty())
+  if (module.pad_record == nullptr && module.trace == nullptr && options.script_path.empty() && !bot_wanted)
     return;
   module.kit = std::make_unique<DeterminismKit>(std::move(options), *module.memory, sink, module.pad_record.get(), module.trace.get());
 }
@@ -6218,6 +6383,52 @@ void InitializeNet(Module& module, Core::System& system)
     module.synctest->SetHideCounters(module.hide.get());  // the hidden iteration / skipped sound counters go into the SUMMARY lines
 }
 
+// The soak bot and exits (Rev3Bot.h): REV3_PAD_BOT, REV3_NET_EXIT, REV3_NET_EXIT_WAIT_S, REV3_NET_FREEZE_EXIT_S, REV3_NET_MAX_S. Their lines (BOT ..., EXIT ...)
+// go to the net log in a netplay run, else to the Rev3 log. A variable that is set but unusable is an ERROR line and that part stays off.
+void InitializeBot(Module& module)
+{
+  const Bot::BotOptions options = Bot::ParseBotOptions([](const char* name) { return GetEnv(name); });
+  if (!options.Any() && options.warnings.empty())
+    return;
+  Sink& log = module.net_sink != nullptr ? static_cast<Sink&>(*module.net_sink) : static_cast<Sink&>(EnsureSink(module));
+  for (const std::string& warning : options.warnings)
+  {
+    log.Line("ERROR " + warning);
+    ERROR_LOG_FMT(SLIPPI, "Rev3: {}", warning);
+  }
+  module.bot_options = options;
+  Sink* const sink = &log;
+  const Bot::LogFn line = [sink](const std::string& text) { sink->Line(text); };
+  const u32 port = GetEnv("REV3_NET_ROLE") == "guest" ? 1 : 0;  // the game port of this side (host 0, guest 1); offline: 0
+  if (options.bot && module.kit != nullptr)
+  {
+    module.bot = std::make_unique<Bot::PadBotController>(options.seed, port, line);
+    module.kit->SetBot(module.bot.get());
+    log.Line(Format("NOTE bot on (REV3_PAD_BOT=%llu): the local pad is played by the bot, port %u; scripted menus first if REV3_PAD_SCRIPT is set; "
+                    "it takes over at the first call with both fighters found or past the script's end",
+                    static_cast<unsigned long long>(options.seed), port));
+  }
+  if (options.exit.enabled)
+  {
+    module.exit_ctl = std::make_unique<Bot::ExitController>(options.exit, options.tuning, line);
+    log.Line(Format("NOTE automatic exit %s: %u s after the decision the emulator is asked to stop (BYE to the peer, SUMMARY, logs flushed)",
+                    Bot::ExitSpecText(options.exit).c_str(), options.tuning.wait_calls / Bot::EXIT_CALLS_PER_SECOND));
+  }
+  if (options.freeze_exit_s != 0 && module.dump == nullptr)
+  {
+    log.Line("ERROR REV3_NET_FREEZE_EXIT_S needs the freeze dump (REV3_SYNCTEST_DUMP is 0); no freeze exit");
+  }
+  const bool freeze = options.freeze_exit_s != 0 && module.dump != nullptr;
+  if (options.exit.enabled || freeze || options.max_s != 0)
+  {
+    module.exit_watcher = std::make_unique<ExitWatcher>(freeze ? module.dump.get() : nullptr, log, freeze ? options.freeze_exit_s : 0, options.max_s,
+                                                        []() { Host_Message(HostMessageID::WMUserStop); });
+    log.Line(Format("NOTE exit watcher: freeze_exit_s=%u max_s=%u stop_grace_ms=%u (exit codes: freeze %d, max_s %d, stop hang %d)",
+                    freeze ? options.freeze_exit_s : 0, options.max_s, Bot::STOP_GRACE_MS, Bot::EXIT_CODE_FREEZE, Bot::EXIT_CODE_MAX_S,
+                    Bot::EXIT_CODE_STOP_HANG));
+  }
+}
+
 void Initialize(Module& module, Core::System& system)
 {
   module.initialized = true;
@@ -6229,9 +6440,11 @@ void Initialize(Module& module, Core::System& system)
   if (NetplayRequested())
   {
     InitializeNet(module, system);  // creates the freeze dump too, on the net log
+    InitializeBot(module);
     return;
   }
   InitializeDump(module, system, EnsureSink(module));  // the freeze dump works with SyncTest off too
+  InitializeBot(module);
 
   const std::string k_text = GetEnv("REV3_SYNCTEST");
   if (k_text.empty())
@@ -6371,6 +6584,27 @@ void ParseWriteTrackEnv(SyncTestOptions* options, Sink& sink)
                    options->write_track_rearm_max));
 }
 
+// REV3_NET_EXIT: one hook call that is not a resimulation. When the controller says the run is over: tell the session why (the BYE to the peer
+// carries it), note the stop for the watcher's grace timer, and ask the host to stop the emulation the normal way (Host_Message WMUserStop: the Qt
+// main window's RequestStop; the process ends when it was started with -b, rev3-mod soak.py does that). Dolphin then destroys the EXI device,
+// which runs Rev3::Shutdown (BYE, SUMMARY, logs flushed).
+void ObserveExit(Module& module, u32 frame)
+{
+  if (module.exit_ctl == nullptr || module.memory == nullptr)
+    return;
+  const Bot::ExitStep step = module.exit_ctl->OnCall(frame, ReadGameObs(*module.memory));
+  if (!step.stop)
+    return;
+  Sink* const log = module.net_sink != nullptr ? static_cast<Sink*>(module.net_sink.get()) : static_cast<Sink*>(module.sink.get());
+  if (log != nullptr)
+    log->Line(Format("EXIT stop requested frame=%u reason=\"%s\" ko=%u", frame, step.reason.c_str(), module.exit_ctl->Kos()));
+  if (module.net != nullptr)
+    module.net->SetExitReason("planned exit: " + step.reason);
+  if (module.exit_watcher != nullptr)
+    module.exit_watcher->NoteStop();
+  Host_Message(HostMessageID::WMUserStop);
+}
+
 void HandleCommand(Core::System& system, const u8* command, size_t size, std::vector<u8>* read_queue)
 {
   Module& module = GetModule();
@@ -6400,6 +6634,8 @@ void HandleCommand(Core::System& system, const u8* command, size_t size, std::ve
     const bool resimulating = module.net->Resimulating();
     if (module.kit != nullptr)
       module.kit->OnCommand(&parsed, resimulating);
+    if (!resimulating)
+      ObserveExit(module, parsed.frame);
     reply = module.net->OnCommand(parsed);
     if (module.kit != nullptr)
       module.kit->OnReply(parsed, reply, resimulating);
@@ -6413,6 +6649,8 @@ void HandleCommand(Core::System& system, const u8* command, size_t size, std::ve
   const bool resimulating = module.synctest != nullptr && module.synctest->Resimulating();
   if (module.kit != nullptr && Core::IsCPUThread())
     module.kit->OnCommand(&parsed, resimulating);
+  if (!resimulating && Core::IsCPUThread())
+    ObserveExit(module, parsed.frame);
 
   if (module.synctest != nullptr && Core::IsCPUThread())
     reply = module.synctest->OnCommand(parsed);
@@ -6444,6 +6682,16 @@ void Shutdown()
     module.net.reset();
   }
   module.pacer.reset();
+  bool exit_watcher_stuck = false;
+  if (module.exit_watcher != nullptr)
+  {
+    exit_watcher_stuck = !module.exit_watcher->Stop(std::chrono::milliseconds(1500));  // before the freeze dump it reads goes away
+    module.exit_watcher.reset();
+  }
+  module.exit_ctl.reset();
+  if (module.kit != nullptr)
+    module.kit->SetBot(nullptr);
+  module.bot.reset();
   module.hider.reset();  // hiding off (a no-op when the session already restored it): the flag word is 0 again
   // Freeze dump: stop the watchdog first (it may be waiting to pause the CPU), then dump once more while the guest memory is still
   // mapped (HW::Shutdown destroys the EXI devices before Memory::Shutdown; the DSP is already gone, the PPC state is still readable).
@@ -6473,7 +6721,7 @@ void Shutdown()
     module.hide.reset();
   }
   module.watch.reset();  // everything writable again, the fault hook removed (the guest memory is still mapped)
-  if (watchdog_stuck)
+  if (watchdog_stuck || exit_watcher_stuck)
   {
     // The detached watchdog thread still points at these (it only touches them after the CPU pause returns, and then checks its stop
     // flag first). Leak them instead of freeing them under it.
