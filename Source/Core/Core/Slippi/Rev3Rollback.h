@@ -47,6 +47,11 @@
 //                            memory with the shadow of the frame restored to, in 32-byte blocks; the blocks that differ are pages the snapshot set
 //                            misses (see "restore verify" below, REV3.md "Restore verify"). Also REV3_RB_VERIFY_EVERY / _SLOTS / _HEAL / _STACK_BELOW /
 //                            _IGNORE (ParseVerifyEnv)
+//   REV3_RB_WRITE_TRACK=0|1|2  host write tracking (default 0 = off): the pages the game writes are found by write-protecting guest RAM in every host
+//                            view and catching the first write (instead of hashing pages), so the snapshot set grows WITHOUT dropping the
+//                            snapshot history; 2 = also keep the hash scan and report every page it finds that no fault announced
+//                            ("WRITE TRACK MISS"). Also REV3_RB_DIRTY_LOG=N (name the first N dirty pages with the pc / lr of the store) and
+//                            REV3_RB_WRITE_TRACK_REARM=N (equal rewrites before a page is learned anyway, default 4). REV3.md "Host write tracking"
 //   SyncTest only runs once armed (both fighters found through the TEAMS pointers); menus and loading screens are never
 //   rolled back. See REV3.md for what a clean run looks like.
 //
@@ -886,7 +891,7 @@ public:
 
   // Host write tracking (REV3_RB_WRITE_TRACK; REV3.md "Host write tracking"). `watch` is not owned and must outlive this object; null (the
   // default) or options.write_track == 0 leaves the hash scan in charge. Call before the first command.
-  void SetWriteWatch(WriteWatch* watch) { m_watch = watch; }
+  void SetWriteWatch(WriteWatch* watch);
   bool WriteTrackingOn() const { return m_watching; }
   // "SNAPSHOT kind=write_track|adaptive|classic last=.. MB max=.. MB pages=.. of watched=.. faults=.. arms=.. | restores checked=.. wrong=..
   // blocks=.. first_wrong_frame=.. shadow_ms=.." (also written after every SUMMARY line).
@@ -1195,6 +1200,11 @@ void HandleCommand(Core::System& system, const u8* command, size_t size, std::ve
 // REV3_RB_VERIFY_IGNORE (a {"ranges":[..]} file) into *ignore; problems are logged to `sink` as ERROR lines and that variable stays at its
 // default. Shared by SyncTest and the netplay session's options code. Defined in the Dolphin glue (needs the environment and files).
 void ParseVerifyEnv(SyncTestOptions* options, std::vector<Range>* ignore, Sink& sink);
+
+// Reads REV3_RB_WRITE_TRACK (0 / 1 / 2), REV3_RB_DIRTY_LOG and REV3_RB_WRITE_TRACK_REARM into options->write_track / dirty_log /
+// write_track_rearm_max; problems are logged to `sink` as ERROR lines and tracking stays off. Needs options->adaptive already set. The caller
+// then gives SyncTest a DolphinWriteWatch (SetWriteWatch). Defined in the Dolphin glue.
+void ParseWriteTrackEnv(SyncTestOptions* options, Sink& sink);
 
 // Writes the final summary and closes the log; the next command starts a fresh session. Safe to call any time.
 void Shutdown();

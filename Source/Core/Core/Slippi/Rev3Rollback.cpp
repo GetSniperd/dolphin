@@ -44,8 +44,10 @@
 #include "Core/HW/VideoInterface.h"
 #include "Core/IOS/DI/DI.h"
 #include "Core/IOS/IOS.h"
+#include "Core/MemTools.h"
 #include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/PowerPC.h"
+#include "Core/Slippi/Rev3WriteTrack.h"
 #include "Core/System.h"
 #include "VideoCommon/CommandProcessor.h"
 #include "VideoCommon/OnScreenDisplay.h"
@@ -2144,6 +2146,16 @@ size_t EdgePageCount(const std::vector<Range>& keep)
 }
 }  // namespace
 
+void SyncTest::SetWriteWatch(WriteWatch* watch)
+{
+  m_watch = watch;
+  if (watch != nullptr && m_options.write_track != 0)
+  {
+    m_ranges = ComputeRanges();  // the set is page-aligned from now on
+    RebuildLayout();
+  }
+}
+
 std::vector<Range> SyncTest::KeepRanges() const
 {
   std::vector<Range> all = ComputeRanges();
@@ -2927,6 +2939,12 @@ Reply SyncTest::OnCommand(const Command& command)
       m_scan_iv_total = 0;
       m_scan_iv_n = 0;
       m_scan_iv_max = 0;
+    }
+    if (m_watching)
+    {
+      const WriteWatchStats ws = m_watch->Stats();
+      line += Format(" wt_faults=%llu wt_pages=%u wt_poll_us_max=%llu", static_cast<unsigned long long>(ws.faults), m_stats.wt_pages_learned,
+                     static_cast<unsigned long long>(m_stats.wt_poll_us_max));
     }
     m_sink.Line(line + (m_dsp_state ? " " + m_dsp_state() : std::string()));
   }
@@ -4671,6 +4689,86 @@ private:
   std::ofstream m_file;
 };
 
+// Host write tracking (REV3_RB_WRITE_TRACK; Rev3WriteTrack.h, REV3.md "Host write tracking"). The WriteTracker does the protecting; this class
+// tells it where Dolphin's host views of guest RAM are (MemoryManager::GetRamViews()), receives the faults through EMM::SetWriteFaultHook and
+// follows the views when Dolphin rebuilds them: MemoryManager calls ViewsChanging right BEFORE it unmaps a view, which makes all guest RAM
+// writable again; the next SetWatched (a restart, logged by SyncTest) fetches the new views.
+class DolphinWriteWatch final : public WriteWatch
+{
+public:
+  explicit DolphinWriteWatch(Core::System& system) : m_system(system)
+  {
+    s_self = this;
+    m_tracker.MakeCurrent();
+    m_tracker.SetContextProbe(&Probe);
+    m_hook_installed = EMM::IsExceptionHandlerSupported() && EMM::SetWriteFaultHook(&WriteTracker::HandleFault);
+    m_tracker.SetHandlerInstalled(m_hook_installed);
+    system.GetMemory().SetViewsChangingCallback(&ViewsChanging);
+  }
+  ~DolphinWriteWatch() override
+  {
+    m_tracker.Stop();  // everything writable BEFORE the hook goes away: a fault with nobody to answer it would be handed to the JIT
+    m_system.GetMemory().SetViewsChangingCallback(nullptr);
+    EMM::SetWriteFaultHook(nullptr);
+    s_self = nullptr;
+  }
+
+  std::string Describe() const override { return m_tracker.Describe(); }
+  bool SetWatched(const std::vector<Range>& keep, std::string* why) override
+  {
+    if (!m_hook_installed)
+    {
+      *why = "no fault handler installed (this platform's exception handler cannot call the write tracker)";
+      return false;
+    }
+    Memory::MemoryManager& memory = m_system.GetMemory();
+    if (!m_views_set || m_generation != memory.GetViewGeneration())
+    {
+      std::vector<WriteView> views;
+      for (const Memory::RamView& v : memory.GetRamViews())
+        views.push_back({v.guest_address, v.host, v.size});
+      m_generation = memory.GetViewGeneration();
+      m_views_set = m_tracker.SetViews(views, why);
+      if (!m_views_set)
+        return false;
+    }
+    return m_tracker.SetWatched(keep, why);
+  }
+  void Stop() override { m_tracker.Stop(); }
+  void Poll(std::vector<DirtyPage>* out) override { m_tracker.Poll(out); }
+  std::vector<u32> Rearm(const std::vector<u32>& pages) override { return m_tracker.Rearm(pages); }
+  void Release(const std::vector<u32>& pages) override { m_tracker.Release(pages); }
+  bool IsClean(u32 page_addr) const override { return m_tracker.IsClean(page_addr); }
+  bool Active() const override { return m_tracker.Active(); }
+  WriteWatchStats Stats() const override { return m_tracker.Stats(); }
+  bool SelfTest(std::string* why) override { return m_tracker.SelfTest(why); }
+
+private:
+  // Runs inside the fault handler: no allocation, no locks. The guest pc is the start of the JIT block that stores (the JIT keeps pc per
+  // block), lr is exact. Only the CPU thread has a PPC context.
+  static bool Probe(u32* pc, u32* lr)
+  {
+    if (!Core::IsCPUThread())
+      return false;
+    const PowerPC::PowerPCState& ppc = Core::System::GetInstance().GetPPCState();
+    *pc = ppc.pc;
+    *lr = LR(ppc);
+    return true;
+  }
+  static void ViewsChanging()
+  {
+    if (s_self != nullptr)
+      s_self->m_tracker.Stop();
+  }
+
+  Core::System& m_system;
+  WriteTracker m_tracker;
+  bool m_hook_installed = false;
+  bool m_views_set = false;
+  u32 m_generation = 0;
+  static inline DolphinWriteWatch* s_self = nullptr;
+};
+
 // What the game sees when SyncTest is off: the module is created on the first command and then only echoes.
 struct Module
 {
@@ -4678,6 +4776,7 @@ struct Module
   std::unique_ptr<DolphinMemory> memory;
   std::unique_ptr<DolphinHardware> hardware;
   std::unique_ptr<DolphinAudioHw> audio;
+  std::unique_ptr<DolphinWriteWatch> watch;  // REV3_RB_WRITE_TRACK; null = off
   std::unique_ptr<FileSink> sink;
   std::unique_ptr<SyncTest> synctest;  // null = off
   std::unique_ptr<FileLineWriter> pad_record;
@@ -4967,6 +5066,7 @@ void Initialize(Module& module, Core::System& system)
   EnsureSink(module, &log_path);
   std::vector<Range> verify_ignore;
   ParseVerifyEnv(&options, &verify_ignore, *module.sink);  // REV3_RB_VERIFY*: restore verify (off unless REV3_RB_VERIFY is set)
+  ParseWriteTrackEnv(&options, *module.sink);               // REV3_RB_WRITE_TRACK*: host write tracking (off unless REV3_RB_WRITE_TRACK is 1 / 2)
 
   const std::string whitelist_path = GetEnv("REV3_WHITELIST");
   options.whitelist_path = whitelist_path.empty() ? "(none)" : whitelist_path;
@@ -5062,6 +5162,11 @@ void Initialize(Module& module, Core::System& system)
   module.synctest->SetUserExclusions(std::move(user_exclusions), std::move(ptr_exclusions));
   module.synctest->SetUserInclusions(std::move(include_ranges), std::move(include_ptrs));
   module.synctest->SetVerifyIgnore(std::move(verify_ignore));
+  if (options.write_track != 0 && options.adaptive)
+  {
+    module.watch = std::make_unique<DolphinWriteWatch>(system);
+    module.synctest->SetWriteWatch(module.watch.get());
+  }
   if (options.restore_timebase)
   {
     module.sink->Line("NOTE timebase accessor: read SystemTimers::GetFakeTimeBase(); write CoreTiming::SetFakeTBStartValue(start + (value - now)) "
@@ -5145,6 +5250,50 @@ void ParseVerifyEnv(SyncTestOptions* options, std::vector<Range>* ignore, Sink& 
   }
 }
 
+// REV3_RB_WRITE_TRACK=0|1|2 (default 0; 1 = faults learn the pages and the hash scan is skipped, 2 = faults and the hash scan, misses reported),
+// REV3_RB_DIRTY_LOG=N (log the first N dirty pages with the pc / lr of the store), REV3_RB_WRITE_TRACK_REARM=N (1..200).
+void ParseWriteTrackEnv(SyncTestOptions* options, Sink& sink)
+{
+  const auto fail = [&sink](const std::string& what) {
+    sink.Line("ERROR " + what);
+    ERROR_LOG_FMT(SLIPPI, "Rev3: {}", what);
+  };
+  long value = 0;
+  const std::string mode = GetEnv("REV3_RB_WRITE_TRACK");
+  if (mode.empty())
+    return;
+  if (ParseInt(mode, &value) && value >= 0 && value <= 2)
+    options->write_track = static_cast<u32>(value);
+  else
+    fail("REV3_RB_WRITE_TRACK=" + mode + " is not 0, 1 or 2; write tracking is off");
+  if (options->write_track == 0)
+    return;
+  if (!options->adaptive)
+  {
+    fail("REV3_RB_WRITE_TRACK needs the adaptive snapshot set (REV3_SYNCTEST_ADAPTIVE is 0); write tracking is off");
+    options->write_track = 0;
+    return;
+  }
+  const std::string dirty = GetEnv("REV3_RB_DIRTY_LOG");
+  if (!dirty.empty())
+  {
+    if (ParseInt(dirty, &value) && value >= 0 && value <= 1000000)
+      options->dirty_log = static_cast<u32>(value);
+    else
+      fail("REV3_RB_DIRTY_LOG=" + dirty + " is not 0..1000000; the dirty log is off");
+  }
+  const std::string rearm = GetEnv("REV3_RB_WRITE_TRACK_REARM");
+  if (!rearm.empty())
+  {
+    if (ParseInt(rearm, &value) && value >= 1 && value <= 200)
+      options->write_track_rearm_max = static_cast<u32>(value);
+    else
+      fail("REV3_RB_WRITE_TRACK_REARM=" + rearm + " is not 1..200; using 4");
+  }
+  sink.Line(Format("NOTE write tracking requested: REV3_RB_WRITE_TRACK=%u dirty_log=%u rearm_max=%u", options->write_track, options->dirty_log,
+                   options->write_track_rearm_max));
+}
+
 void HandleCommand(Core::System& system, const u8* command, size_t size, std::vector<u8>* read_queue)
 {
   Module& module = GetModule();
@@ -5207,6 +5356,7 @@ void Shutdown()
   if (module.synctest != nullptr)
     module.synctest->Finish();
   module.synctest.reset();
+  module.watch.reset();  // everything writable again, the fault hook removed (the guest memory is still mapped)
   if (watchdog_stuck)
   {
     // The detached watchdog thread still points at these (it only touches them after the CPU pause returns, and then checks its stop

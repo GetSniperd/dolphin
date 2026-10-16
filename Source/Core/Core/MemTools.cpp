@@ -3,6 +3,7 @@
 
 #include "Core/MemTools.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -41,6 +42,9 @@
 
 namespace EMM
 {
+// Rev3 write tracking (see MemTools.h). Read by the handler on any thread, set from the CPU thread.
+static std::atomic<WriteFaultHook> s_write_fault_hook{nullptr};
+
 #ifdef _WIN32
 
 static PVOID s_veh_handle;
@@ -60,6 +64,14 @@ static LONG NTAPI Handler(PEXCEPTION_POINTERS pPtrs)
     // virtual address of the inaccessible data
     uintptr_t fault_address = (uintptr_t)pPtrs->ExceptionRecord->ExceptionInformation[1];
     SContext* ctx = pPtrs->ContextRecord;
+
+    // Rev3 write tracking: a write to a page it write-protected (access_type 1 = write) is resumed without the JIT looking at it.
+    if (access_type == 1)
+    {
+      const WriteFaultHook hook = s_write_fault_hook.load(std::memory_order_acquire);
+      if (hook != nullptr && hook(fault_address))
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
 
     if (Core::System::GetInstance().GetJitInterface().HandleFault(fault_address, ctx))
     {
@@ -116,6 +128,12 @@ void UninstallExceptionHandler()
 
 bool IsExceptionHandlerSupported()
 {
+  return true;
+}
+
+bool SetWriteFaultHook(WriteFaultHook hook)
+{
+  s_write_fault_hook.store(hook, std::memory_order_release);
   return true;
 }
 
@@ -255,6 +273,11 @@ bool IsExceptionHandlerSupported()
   return true;
 }
 
+bool SetWriteFaultHook(WriteFaultHook)
+{
+  return false;  // the Mach exception thread does not call it: write tracking is not available here
+}
+
 #elif defined(_POSIX_VERSION) && !defined(_M_GENERIC)
 
 static struct sigaction old_sa_segv;
@@ -275,6 +298,15 @@ static void sigsegv_handler(int sig, siginfo_t* info, void* raw_context)
     return;
   }
   uintptr_t bad_address = (uintptr_t)info->si_addr;
+
+  // Rev3 write tracking: a write to a page it write-protected is resumed without the JIT looking at it. (A protected page is read-only,
+  // so the only faults on it are writes.)
+  if (sicode == SEGV_ACCERR)
+  {
+    const WriteFaultHook hook = s_write_fault_hook.load(std::memory_order_acquire);
+    if (hook != nullptr && hook(bad_address))
+      return;
+  }
 
 // Get all the information we can out of the context.
 #ifdef __OpenBSD__
@@ -369,6 +401,12 @@ bool IsExceptionHandlerSupported()
   return true;
 }
 
+bool SetWriteFaultHook(WriteFaultHook hook)
+{
+  s_write_fault_hook.store(hook, std::memory_order_release);
+  return true;
+}
+
 #else  // _M_GENERIC or unsupported platform
 
 void InstallExceptionHandler()
@@ -380,6 +418,11 @@ void UninstallExceptionHandler()
 }
 
 bool IsExceptionHandlerSupported()
+{
+  return false;
+}
+
+bool SetWriteFaultHook(WriteFaultHook)
 {
   return false;
 }

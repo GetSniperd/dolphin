@@ -560,6 +560,8 @@ add_library(core
   PowerPC/Interpreter/Interpreter_Tables.cpp
   Slippi/Rev3Rollback.cpp
   Slippi/Rev3Rollback.h
+  Slippi/Rev3WriteTrack.cpp
+  Slippi/Rev3WriteTrack.h
   Slippi/SlippiGameFileLoader.cpp
   Slippi/SlippiGameFileLoader.h
   Slippi/SlippiMatchmaking.cpp

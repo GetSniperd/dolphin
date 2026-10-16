@@ -24,6 +24,7 @@
 #include <unistd.h>
 #endif
 
+#include "Core/MemTools.h"
 #include "Core/Slippi/Rev3Rollback.h"
 #include "Core/Slippi/Rev3WriteTrack.h"
 
@@ -582,4 +583,66 @@ TEST(Rev3WriteTrack, AFaultNobodyOwnsStillKillsTheProcess)
       "");
 }
 #endif
+
+// Dolphin's own exception handler (Core/MemTools.cpp) with the tracker hooked in through EMM::SetWriteFaultHook: a tracked write is answered
+// by the hook before the JIT sees the fault, every other fault takes Dolphin's usual path (here: no JIT, so on to the handler that was
+// installed before Dolphin's).
+TEST(Rev3WriteTrack, DolphinsExceptionHandlerAsksTheHookFirstAndPassesTheRestOn)
+{
+  if (!EMM::IsExceptionHandlerSupported())
+    GTEST_SKIP() << "no exception handler on this platform";
+#ifndef _WIN32
+  void* other = mmap(nullptr, kPageBytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  ASSERT_NE(MAP_FAILED, other);
+  PreviousHandlerState::page = other;
+  PreviousHandlerState::calls = 0;
+  struct sigaction mine;
+  std::memset(&mine, 0, sizeof(mine));
+  mine.sa_sigaction = PreviousHandler;
+  mine.sa_flags = SA_SIGINFO | SA_NODEFER;
+  sigemptyset(&mine.sa_mask);
+  struct sigaction before;
+  ASSERT_EQ(0, sigaction(SIGSEGV, &mine, &before));
+#endif
+  EMM::InstallExceptionHandler();
+  {
+    Backing mem;
+    ASSERT_TRUE(mem.Ok());
+    WriteTracker tracker;
+    std::string why;
+    tracker.MakeCurrent();
+    const bool hooked = EMM::SetWriteFaultHook(&WriteTracker::HandleFault);
+    if (hooked)
+    {
+      tracker.SetHandlerInstalled(true);
+      ASSERT_TRUE(tracker.SetViews(mem.Views(), &why)) << why;
+      ASSERT_TRUE(tracker.SetWatched({}, &why)) << why;
+      volatile u8* a = mem.A() + 2 * kPageBytes;
+      volatile u8* b = mem.B() + 6 * kPageBytes;
+      *a = 1;
+      *b = 2;
+      std::vector<DirtyPage> dirty;
+      tracker.Poll(&dirty);
+      EXPECT_EQ(2u, dirty.size());
+      EXPECT_EQ(2u, tracker.Stats().faults);
+#ifndef _WIN32
+      EXPECT_EQ(0, PreviousHandlerState::calls.load()) << "tracked writes never reach the rest of the chain";
+      *static_cast<volatile u8*>(other) = 5;  // not ours: the hook declines, there is no JIT, the previous handler repairs the page
+      EXPECT_EQ(1, PreviousHandlerState::calls.load());
+      EXPECT_EQ(5, *static_cast<volatile u8*>(other));
+      *(mem.A() + 9 * kPageBytes) = 1;  // and the hook still answers its own afterwards
+      EXPECT_EQ(3u, tracker.Stats().faults);
+      EXPECT_EQ(1, PreviousHandlerState::calls.load());
+#endif
+      tracker.Stop();
+      EMM::SetWriteFaultHook(nullptr);
+    }
+  }
+  EMM::UninstallExceptionHandler();
+#ifndef _WIN32
+  sigaction(SIGSEGV, &before, nullptr);
+  munmap(other, kPageBytes);
+#endif
+}
+
 }  // namespace

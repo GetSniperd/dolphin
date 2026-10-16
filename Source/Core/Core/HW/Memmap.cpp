@@ -230,11 +230,14 @@ bool MemoryManager::InitFastmemArena()
 
   m_is_fastmem_arena_initialized = true;
   m_fastmem_arena_size = memory_size;
+  m_view_generation.fetch_add(1, std::memory_order_release);
   return true;
 }
 
 void MemoryManager::UpdateLogicalMemory(const PowerPC::BatTable& dbat_table)
 {
+  if (m_views_changing != nullptr)
+    m_views_changing();  // Rev3 write tracking: the views it protected are about to be unmapped
   for (auto& entry : m_logical_mapped_entries)
   {
     m_arena.UnmapFromMemoryRegion(entry.mapped_pointer, entry.mapped_size);
@@ -279,7 +282,7 @@ void MemoryManager::UpdateLogicalMemory(const PowerPC::BatTable& dbat_table)
                   intersection_start, mapped_size, logical_address);
               exit(0);
             }
-            m_logical_mapped_entries.push_back({mapped_pointer, mapped_size});
+            m_logical_mapped_entries.push_back({mapped_pointer, mapped_size, intersection_start});
           }
 
           m_logical_page_mappings[i] =
@@ -288,6 +291,42 @@ void MemoryManager::UpdateLogicalMemory(const PowerPC::BatTable& dbat_table)
       }
     }
   }
+
+  m_view_generation.fetch_add(1, std::memory_order_release);
+}
+
+std::vector<RamView> MemoryManager::GetRamViews() const
+{
+  constexpr u32 mem1_guest = 0x80000000;
+  constexpr u32 mem2_guest = 0x90000000;
+  constexpr u32 exram_physical = 0x10000000;
+  std::vector<RamView> views;
+  // `physical` is the physical address of the first byte; only the real 24 MB / 64 MB count (the views are 32 MB / 64 MB wide).
+  const auto add = [&](u32 physical, u8* host, u32 size) {
+    if (host == nullptr || size == 0)
+      return;
+    if (physical < m_ram_size_real)
+    {
+      size = std::min<u32>(size, m_ram_size_real - physical);
+      views.push_back({mem1_guest + physical, host, size});
+    }
+    else if (physical >= exram_physical && physical - exram_physical < m_exram_size_real)
+    {
+      size = std::min<u32>(size, m_exram_size_real - (physical - exram_physical));
+      views.push_back({mem2_guest + (physical - exram_physical), host, size});
+    }
+  };
+  add(0, m_ram, m_ram_size);
+  add(exram_physical, m_exram, m_exram_size);
+  if (m_is_fastmem_arena_initialized)
+  {
+    add(0, m_physical_base, m_ram_size);
+    if (m_exram != nullptr)
+      add(exram_physical, m_physical_base + exram_physical, m_exram_size);
+    for (const LogicalMemoryView& entry : m_logical_mapped_entries)
+      add(entry.physical_address, static_cast<u8*>(entry.mapped_pointer), entry.mapped_size);
+  }
+  return views;
 }
 
 void MemoryManager::DoState(PointerWrap& p)
@@ -341,6 +380,8 @@ void MemoryManager::DoState(PointerWrap& p)
 
 void MemoryManager::Shutdown()
 {
+  if (m_views_changing != nullptr)
+    m_views_changing();  // Rev3 write tracking: every view goes away
   ShutdownFastmemArena();
 
   m_is_initialized = false;
@@ -361,6 +402,9 @@ void MemoryManager::ShutdownFastmemArena()
 {
   if (!m_is_fastmem_arena_initialized)
     return;
+  if (m_views_changing != nullptr)
+    m_views_changing();  // Rev3 write tracking: the fastmem views go away
+  m_view_generation.fetch_add(1, std::memory_order_release);
 
   for (const PhysicalMemoryRegion& region : m_physical_regions)
   {

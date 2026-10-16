@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <memory>
 #include <span>
 #include <string>
@@ -54,6 +55,16 @@ struct LogicalMemoryView
 {
   void* mapped_pointer;
   u32 mapped_size;
+  u32 physical_address;  // the physical address of the first mapped byte (Rev3 write tracking maps views back to guest RAM)
+};
+
+// One host view of guest RAM, for Rev3 write tracking: `size` bytes at host address `host` hold the guest bytes from effective address
+// `guest_address` on (MEM1 0x80000000-0x817FFFFF, MEM2 0x90000000-0x93FFFFFF). See MemoryManager::GetRamViews().
+struct RamView
+{
+  u32 guest_address;
+  u8* host;
+  u32 size;
 };
 
 class MemoryManager
@@ -100,6 +111,17 @@ public:
   void DoState(PointerWrap& p);
 
   void UpdateLogicalMemory(const PowerPC::BatTable& dbat_table);
+
+  // Rev3 write tracking: every host view of the 24 MB MEM1 and 64 MB MEM2 as they are right now: the linear views (m_ram, m_exram), the
+  // fastmem physical view and one view per BAT-mapped piece of the fastmem logical view. Protecting a page in only one of them leaves
+  // the others writable, so the tracker needs all of them. Call from the CPU thread.
+  std::vector<RamView> GetRamViews() const;
+  // Counts every change of those views (fastmem arena set up / torn down, BAT update). The views are rebuilt without notice otherwise.
+  u32 GetViewGeneration() const { return m_view_generation.load(std::memory_order_acquire); }
+  // Called right BEFORE views are unmapped or remapped (the old ones are still valid then), from the thread that changes them. The Rev3
+  // tracker uses it to make guest RAM writable again before the views it protected go away. nullptr = none.
+  using ViewsChangingCallback = void (*)();
+  void SetViewsChangingCallback(ViewsChangingCallback callback) { m_views_changing = callback; }
 
   void Clear();
 
@@ -248,6 +270,8 @@ private:
   std::array<PhysicalMemoryRegion, 4> m_physical_regions{};
 
   std::vector<LogicalMemoryView> m_logical_mapped_entries;
+  std::atomic<u32> m_view_generation{0};
+  ViewsChangingCallback m_views_changing = nullptr;
 
   std::array<void*, PowerPC::BAT_PAGE_COUNT> m_physical_page_mappings{};
   std::array<void*, PowerPC::BAT_PAGE_COUNT> m_logical_page_mappings{};
