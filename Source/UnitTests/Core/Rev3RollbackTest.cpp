@@ -13,6 +13,7 @@
 
 #include <gtest/gtest.h>
 
+#include "Common/Hash.h"
 #include "Core/Slippi/Rev3Rollback.h"
 
 namespace
@@ -273,6 +274,8 @@ public:
       c.pads[0][1] = *m_z ? 0x10 : 0x00;
     }
     c.sp = sp;
+    if (m_kit != nullptr)
+      m_kit->OnCommand(&c, test.Resimulating());  // the determinism kit sees the hook call first, as Rev3::HandleCommand does
     const Reply r = test.OnCommand(c);
     if (r.flags & REPLY_FLAG_RESTORED)
     {
@@ -301,6 +304,7 @@ public:
   }
 
   void AttachAudio(FakeAudio* audio) { m_audio = audio; }
+  void AttachKit(DeterminismKit* kit) { m_kit = kit; }
   int AudioRight() const { return m_audio_right; }  // RESTORED replies after which the audio hardware equalled its state at capture
   int AudioWrong() const { return m_audio_wrong; }
 
@@ -358,6 +362,7 @@ private:
   u32 m_walk_from = 0;
   u32 m_walk_stride = 0;
   FakeAudio* m_audio = nullptr;
+  DeterminismKit* m_kit = nullptr;
   std::map<u32, std::string> m_audio_seen;
   int m_audio_right = 0;
   int m_audio_wrong = 0;
@@ -2030,4 +2035,659 @@ TEST(Rev3Rollback, AudioIsLeftAloneWhenTheRestoreIsRefused)
   EXPECT_EQ(audio.loads, loads);
   EXPECT_EQ(audio.replaces, loads);
   EXPECT_TRUE(test.AudioHardwareOn());
+}
+
+// ---- determinism kit (milestone M1) -----------------------------------------------------------------------------------------
+
+namespace
+{
+// An in-memory LineWriter: the lines, and how often it was flushed (and how many lines were written by then).
+class FakeLines final : public LineWriter
+{
+public:
+  void Line(const std::string& text) override { lines.push_back(text); }
+  void Flush() override { flushed_at.push_back(lines.size()); }
+  std::vector<std::string> lines;
+  std::vector<size_t> flushed_at;  // lines.size() at each Flush
+};
+
+// The invented fighter pair of rev3-mod tests/test_rbchecksum.py: the same bytes at the same addresses.
+constexpr u32 CS_A1 = 0x80500000;
+constexpr u32 CS_A2 = 0x80510000;
+constexpr size_t CS_FIGHTER_SIZE = 0x1800;
+constexpr u32 CS_GOLDEN = 0xCDD50D8D;  // checksum(frame 300, pattern(1) as player 1, pattern(2) as player 2), frozen in test_rbchecksum.py
+constexpr u32 CS_GOLDEN_FRAME = 300;
+
+// pattern(seed) of test_rbchecksum.py: bytes((seed * 131 + i * 7 + (i >> 8) * 13) & 0xFF for i in range(0x1800)).
+std::vector<u8> CsPattern(u32 seed)
+{
+  std::vector<u8> v(CS_FIGHTER_SIZE);
+  for (size_t i = 0; i < v.size(); ++i)
+    v[i] = static_cast<u8>((seed * 131 + i * 7 + (i >> 8) * 13) & 0xFF);
+  return v;
+}
+
+// world() of test_rbchecksum.py: team pointers at 0x8038FE50 -> team struct (+0x0C -> node, node word 0 = fighter) for two teams.
+void CsWorld(FakeMemory* m, u32 a1 = CS_A1, u32 a2 = CS_A2)
+{
+  const u32 addrs[2] = {a1, a2};
+  for (u32 team = 0; team < 2; ++team)
+  {
+    const u32 t = 0x80400000 + 0x100 * team;
+    const u32 node = 0x80401000 + 0x100 * team;
+    m->SetU32(0x8038FE50 + 4 * team, t);
+    m->SetU32(t + 0x0C, node);
+    m->SetU32(node, addrs[team]);
+    const std::vector<u8> pattern = CsPattern(team + 1);
+    m->Write(addrs[team], pattern.data(), pattern.size());
+  }
+}
+
+// The byte stream of rbchecksum.py's docstring built here, independent of FighterChecksum: u32 BE frame, per player u32 BE id and
+// the 4 bytes at each offset of the table, in the table's order. `offsets` is rbchecksum.cpp_offsets() as it was when written.
+const u16 CS_OFFSETS[61] = {
+    0x140, 0x150, 0x158, 0x134, 0x50,  0x54,  0x58,  0x5C,  0x60,  0x64,  0x68,  0x6C,  0x70,  0x84,  0x88,  0x8C,
+    0x9C,  0xA0,  0xC4,  0xC8,  0xCC,  0xE8,  0xEC,  0xF0,  0xF4,  0xF8,  0xFC,  0x100, 0x108, 0x10C, 0x110, 0x12C,
+    0x24,  0x28,  0x44,  0x4C,  0x2C,  0x38,  0x9A4, 0x9D0, 0x9D4, 0x9DC, 0x9C0, 0x9B8, 0x9AC, 0x9B0, 0x1640, 0x1644,
+    0x184, 0x178, 0x17C, 0x180, 0x3D8, 0x3E4, 0x1CC, 0x1D0, 0x13CC, 0x13D0, 0x13E4, 0x13E8, 0x13EC};
+
+void PutBE32(std::vector<u8>* v, u32 x)
+{
+  v->push_back(u8(x >> 24));
+  v->push_back(u8(x >> 16));
+  v->push_back(u8(x >> 8));
+  v->push_back(u8(x));
+}
+
+u32 HandBuiltChecksum(u32 frame, const std::vector<std::pair<u32, std::vector<u8>>>& players)
+{
+  std::vector<u8> stream;
+  PutBE32(&stream, frame);
+  for (const auto& [id, data] : players)
+  {
+    PutBE32(&stream, id);
+    for (const u16 off : CS_OFFSETS)
+      stream.insert(stream.end(), data.begin() + off, data.begin() + off + 4);
+  }
+  return Common::ComputeCRC32(stream.data(), stream.size());
+}
+
+PadBytes Pad(u8 seed)
+{
+  PadBytes p{};
+  for (size_t i = 0; i < p.size(); ++i)
+    p[i] = static_cast<u8>(seed + 17 * i);
+  return p;
+}
+
+std::string TextOf(const std::vector<std::string>& lines)
+{
+  std::string s;
+  for (const std::string& l : lines)
+    s += l + "\n";
+  return s;
+}
+}  // namespace
+
+TEST(Rev3Rollback, ChecksumTableIsRbchecksumsTable)
+{
+  // rbchecksum.py: cpp_offsets() in FIELDS order, FIELDS_VERSION 1, fields_digest() = crc32("name:offset:size;" per field + "v1").
+  ASSERT_EQ(FIELDS.size(), 61u);
+  std::string digest_text;
+  for (size_t i = 0; i < FIELDS.size(); ++i)
+  {
+    EXPECT_EQ(FIELDS[i].offset, CS_OFFSETS[i]) << FIELDS[i].name;
+    digest_text += std::string(FIELDS[i].name) + ":" + std::to_string(FIELDS[i].offset) + ":4;";
+  }
+  digest_text += "v1";
+  EXPECT_EQ(Common::ComputeCRC32(reinterpret_cast<const u8*>(digest_text.data()), digest_text.size()), 0xD4076EF2u);
+}
+
+TEST(Rev3Rollback, FighterChecksumGoldenValue)
+{
+  FakeMemory mem;
+  CsWorld(&mem);
+  u32 chk = 0;
+  EXPECT_EQ(FighterChecksum(mem, CS_GOLDEN_FRAME, &chk), 2u);
+  EXPECT_EQ(chk, CS_GOLDEN);
+  // And the stream built by hand here gives the same number (test_equals_hand_built_stream).
+  EXPECT_EQ(HandBuiltChecksum(CS_GOLDEN_FRAME, {{1, CsPattern(1)}, {2, CsPattern(2)}}), CS_GOLDEN);
+}
+
+TEST(Rev3Rollback, FighterChecksumWithOneOrNoFighter)
+{
+  u32 chk = 0;
+  {
+    FakeMemory mem;
+    CsWorld(&mem);
+    mem.SetU32(0x8038FE50 + 4, 0);  // team 1 gone: player 2 is skipped, not zero filled
+    EXPECT_EQ(FighterChecksum(mem, 4, &chk), 1u);
+    EXPECT_EQ(chk, 0x5B93E4F5u);  // rbchecksum.checksum(4, [(1, ...)]) of the same invented memory
+    EXPECT_EQ(chk, HandBuiltChecksum(4, {{1, CsPattern(1)}}));
+  }
+  {
+    FakeMemory mem;
+    CsWorld(&mem);
+    mem.SetU32(0x8038FE50, 0);  // team 0 gone: only player 2, id 2
+    EXPECT_EQ(FighterChecksum(mem, 4, &chk), 1u);
+    EXPECT_EQ(chk, 0x87810635u);  // rbchecksum.checksum(4, [(2, ...)])
+  }
+  {
+    FakeMemory mem;  // a menu: nothing there
+    EXPECT_EQ(FighterChecksum(mem, 7, &chk), 0u);
+    EXPECT_EQ(chk, 0xBF204ABFu);  // rbchecksum.checksum(7, []) = crc32 of the frame alone
+  }
+}
+
+TEST(Rev3Rollback, FighterChecksumSeesEveryHashedBitAndNothingElse)
+{
+  FakeMemory base;
+  CsWorld(&base);
+  u32 want = 0;
+  FighterChecksum(base, 9, &want);
+  // every bit of every one of the 61 fields of either player changes it
+  for (const u32 fighter : {CS_A1, CS_A2})
+  {
+    for (const u16 off : CS_OFFSETS)
+    {
+      for (u32 bit = 0; bit < 32; ++bit)
+      {
+        FakeMemory m;
+        CsWorld(&m);
+        m.SetU32(fighter + off, m.U32(fighter + off) ^ (1u << bit));
+        u32 got = 0;
+        FighterChecksum(m, 9, &got);
+        ASSERT_TRUE(got != want);
+      }
+    }
+  }
+  // the excluded fields (held, press, pressed, ground_y, the string route pointers) and unlisted bytes do not
+  std::vector<u32> excluded = {0xB94, 0xB98, 0xBA0, 0xA20, 0x0, 0x4, 0x1000, 0x1700};
+  for (u32 r = 0; r < 12; ++r)
+    excluded.push_back(0xEC0 + 0x14 * r);
+  for (const u32 off : excluded)
+  {
+    FakeMemory m;
+    CsWorld(&m);
+    m.SetU32(CS_A1 + off, ~m.U32(CS_A1 + off));
+    m.SetU32(CS_A2 + off, ~m.U32(CS_A2 + off));
+    u32 got = 0;
+    FighterChecksum(m, 9, &got);
+    EXPECT_EQ(got, want) << off;
+  }
+  // fighter addresses are not hashed, the frame and the player order are
+  FakeMemory moved;
+  CsWorld(&moved, 0x80600000, 0x80620000);
+  u32 got = 0;
+  FighterChecksum(moved, 9, &got);
+  EXPECT_EQ(got, want);
+  FighterChecksum(base, 10, &got);
+  EXPECT_TRUE(got != want);
+  FakeMemory swapped;
+  CsWorld(&swapped);
+  const std::vector<u8> first = CsPattern(1), second = CsPattern(2);
+  swapped.Write(CS_A1, second.data(), second.size());  // player 1 now has player 2's data and the other way round
+  swapped.Write(CS_A2, first.data(), first.size());
+  FighterChecksum(swapped, 9, &got);
+  EXPECT_TRUE(got != want);
+}
+
+TEST(Rev3Rollback, FighterChecksumHashesRawFloatBits)
+{
+  u32 plus_zero = 0, minus_zero = 0;
+  FakeMemory a;
+  CsWorld(&a);
+  a.SetU32(CS_A1 + 0x84, 0x00000000);
+  FighterChecksum(a, 1, &plus_zero);
+  a.SetU32(CS_A1 + 0x84, 0x80000000);  // -0.0 == +0.0 as values, but a different fighter state
+  FighterChecksum(a, 1, &minus_zero);
+  EXPECT_TRUE(plus_zero != minus_zero);
+}
+
+TEST(Rev3Rollback, MemoryCrcIsZlibOverTheRangesInOrder)
+{
+  FakeMemory mem;
+  const char digits[] = "123456789";
+  mem.Write(0x80900000, digits, 9);
+  EXPECT_EQ(MemoryCrc(mem, {{0x80900000, 0x80900009}}), 0xCBF43926u);  // the standard CRC-32 check value
+  EXPECT_EQ(MemoryCrc(mem, {}), 0u);
+  // two ranges = the CRC of their bytes back to back, in file order
+  mem.Write(0x80900100, "ABC", 3);
+  const u32 ab = MemoryCrc(mem, {{0x80900000, 0x80900004}, {0x80900100, 0x80900103}});
+  const u8 joined[] = {'1', '2', '3', '4', 'A', 'B', 'C'};
+  EXPECT_EQ(ab, Common::ComputeCRC32(joined, sizeof(joined)));
+  EXPECT_TRUE(ab != MemoryCrc(mem, {{0x80900100, 0x80900103}, {0x80900000, 0x80900004}}));
+  // without Peek the copy path gives the same number, including ranges bigger than one copy chunk
+  mem.peek_enabled = false;
+  EXPECT_EQ(MemoryCrc(mem, {{0x80900000, 0x80900004}, {0x80900100, 0x80900103}}), ab);
+  const u32 big_direct = [&] {
+    mem.peek_enabled = true;
+    return MemoryCrc(mem, {{0x80A00000, 0x80C80000}});
+  }();
+  mem.peek_enabled = false;
+  EXPECT_EQ(MemoryCrc(mem, {{0x80A00000, 0x80C80000}}), big_direct);
+  // an unreadable range (outside MEM1 of the fake) is skipped and counted
+  size_t unreadable = 0;
+  EXPECT_EQ(MemoryCrc(mem, {{0x90000000, 0x90000010}}, &unreadable), 0u);
+  EXPECT_EQ(unreadable, 1u);
+}
+
+TEST(Rev3Rollback, PadRecordLineFormat)
+{
+  std::array<PadBytes, 2> pads{};
+  pads[0] = {0x12, 0x34, 0x00, 0xFF, 0x7F, 0x80, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06};
+  pads[1] = {0xAB, 0xCD, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFE};
+  EXPECT_STREQ(FormatPadRecordLine(4000000000u, pads, 1).c_str(), "4000000000 123400ff7f80010203040506 abcdef0000000000000000fe 1");
+  EXPECT_STREQ(FormatPadRecordLine(0, pads, -1).c_str(), "0 123400ff7f80010203040506 abcdef0000000000000000fe -1");
+  EXPECT_STREQ(PAD_RECORD_HEADER, "# rev3 pad record v1");
+}
+
+TEST(Rev3Rollback, TraceLineFormat)
+{
+  EXPECT_STREQ(FormatTraceLine(300, 2, 0xCDD50D8D, 0x0000BEEF).c_str(), "T frame=300 fighters=2 chk=0xCDD50D8D mem=0x0000BEEF");
+  EXPECT_STREQ(FormatTraceLine(0, 0, 0, 0).c_str(), "T frame=0 fighters=0 chk=0x00000000 mem=0x00000000");
+}
+
+TEST(Rev3Rollback, PadScriptParsing)
+{
+  const std::array<PadBytes, 2> p1 = {Pad(1), Pad(2)};
+  const std::array<PadBytes, 2> p2 = {Pad(3), Pad(4)};
+  // what the record writes: header, lines; plus CRLF, upper-case hex, a blank line, a comment, a line without the return field,
+  // junk, and no newline after the last line
+  std::string text = std::string(PAD_RECORD_HEADER) + "\n" + FormatPadRecordLine(10, p1, 0) + "\r\n\n# a comment\n";
+  text += "garbage here\n";
+  text += "12 0000000000000000000000AB 0000000000000000000000cd\n";
+  text += "11 short 0\n";
+  text += FormatPadRecordLine(20, p2, -7);
+  PadScript script;
+  std::string error;
+  ASSERT_TRUE(ParsePadScript(text, &script, &error));
+  EXPECT_EQ(script.frames.size(), 3u);
+  EXPECT_EQ(script.first, 10u);
+  EXPECT_EQ(script.last, 20u);
+  EXPECT_EQ(script.ignored_lines, 2u);  // "garbage here" and "11 short 0"
+  EXPECT_EQ(script.frames[10].pads, p1);
+  EXPECT_EQ(script.frames[10].pad_return, 0);
+  EXPECT_EQ(script.frames[20].pads, p2);
+  EXPECT_EQ(script.frames[20].pad_return, -7);
+  EXPECT_EQ(script.frames[12].pads[0][11], 0xABu);
+  EXPECT_EQ(script.frames[12].pads[1][11], 0xCDu);
+  EXPECT_EQ(script.frames[12].pad_return, 0);
+
+  // a frame listed twice keeps the later line; the order of the lines does not matter for first / last
+  PadScript twice;
+  ASSERT_TRUE(ParsePadScript(FormatPadRecordLine(5, p1, 1) + "\n" + FormatPadRecordLine(3, p1, 2) + "\n" + FormatPadRecordLine(5, p2, 3) + "\n",
+                             &twice, &error));
+  EXPECT_EQ(twice.frames.size(), 2u);
+  EXPECT_EQ(twice.first, 3u);
+  EXPECT_EQ(twice.last, 5u);
+  EXPECT_EQ(twice.frames[5].pads, p2);
+
+  // nothing usable
+  PadScript none;
+  EXPECT_FALSE(ParsePadScript("", &none, &error));
+  EXPECT_FALSE(ParsePadScript(std::string(PAD_RECORD_HEADER) + "\n# nothing else\n", &none, &error));
+  EXPECT_FALSE(error.empty());
+  EXPECT_FALSE(ParsePadScript("99999999999 " + std::string(24, '0') + " " + std::string(24, '0') + " 0\n", &none, &error));  // frame > u32
+  EXPECT_FALSE(ParsePadScript("1 " + std::string(24, 'g') + " " + std::string(24, '0') + " 0\n", &none, &error));
+}
+
+namespace
+{
+// Kit setup for the tests: a fake memory with the invented fighters, options for record / script / trace.
+struct KitRig
+{
+  KitRig() { CsWorld(&mem); }
+  std::unique_ptr<DeterminismKit> Make()
+  {
+    return std::make_unique<DeterminismKit>(options, mem, sink, options.record_path.empty() ? nullptr : &record,
+                                            options.trace_path.empty() ? nullptr : &trace);
+  }
+  Command Cmd(u32 frame) const
+  {
+    Command c;
+    c.frame = frame;
+    c.pads = {Pad(static_cast<u8>(frame)), Pad(static_cast<u8>(frame + 100))};
+    c.pad_return = 1;
+    return c;
+  }
+  FakeMemory mem;
+  FakeSink sink;
+  FakeLines record;
+  FakeLines trace;
+  DeterminismOptions options;
+};
+}  // namespace
+
+TEST(Rev3Rollback, PadRecordWritesHeaderAndOneLinePerHookCall)
+{
+  KitRig rig;
+  rig.options.record_path = "pads.txt";
+  auto kit = rig.Make();
+  EXPECT_TRUE(rig.sink.Contains("NOTE pad record -> pads.txt"));
+  ASSERT_EQ(rig.record.lines.size(), 1u);
+  EXPECT_STREQ(rig.record.lines[0].c_str(), "# rev3 pad record v1");
+
+  for (u32 f = 100; f < 110; ++f)
+  {
+    Command c = rig.Cmd(f);
+    const Command before = c;
+    kit->OnCommand(&c, false);
+    EXPECT_EQ(c.pads, before.pads);  // no script: the live pads are left alone
+  }
+  ASSERT_EQ(rig.record.lines.size(), 11u);
+  EXPECT_STREQ(rig.record.lines[1].c_str(), FormatPadRecordLine(100, rig.Cmd(100).pads, 1).c_str());
+  EXPECT_STREQ(rig.record.lines[10].c_str(), FormatPadRecordLine(109, rig.Cmd(109).pads, 1).c_str());
+
+  // a resimulated call is not recorded
+  Command c = rig.Cmd(105);
+  kit->OnCommand(&c, true);
+  EXPECT_EQ(rig.record.lines.size(), 11u);
+  EXPECT_EQ(kit->RecordedLines(), 10u);
+
+  // the file the record wrote is a valid script
+  PadScript script;
+  std::string error;
+  ASSERT_TRUE(ParsePadScript(TextOf(rig.record.lines), &script, &error));
+  EXPECT_EQ(script.frames.size(), 10u);
+  EXPECT_EQ(script.frames[103].pads, rig.Cmd(103).pads);
+  EXPECT_EQ(script.frames[103].pad_return, 1);
+}
+
+TEST(Rev3Rollback, PadRecordHeaderIsOptionalWhenAppending)
+{
+  KitRig rig;
+  rig.options.record_path = "pads.txt";
+  rig.options.record_header = false;
+  auto kit = rig.Make();
+  EXPECT_TRUE(rig.record.lines.empty());
+}
+
+TEST(Rev3Rollback, PadRecordFlushesEverySixtyLinesAndAtFinish)
+{
+  KitRig rig;
+  rig.options.record_path = "pads.txt";
+  auto kit = rig.Make();
+  for (u32 f = 0; f < 59; ++f)
+  {
+    Command c = rig.Cmd(f);
+    kit->OnCommand(&c, false);
+  }
+  EXPECT_TRUE(rig.record.flushed_at.empty());
+  Command c = rig.Cmd(59);
+  kit->OnCommand(&c, false);
+  ASSERT_EQ(rig.record.flushed_at.size(), 1u);
+  EXPECT_EQ(rig.record.flushed_at[0], 61u);  // header + 60 lines
+  for (u32 f = 60; f < 150; ++f)
+  {
+    Command d = rig.Cmd(f);
+    kit->OnCommand(&d, false);
+  }
+  EXPECT_EQ(rig.record.flushed_at.size(), 2u);  // 120 calls so far: the second flush
+  kit->Finish();
+  EXPECT_EQ(rig.record.flushed_at.size(), 3u);
+  EXPECT_EQ(rig.record.flushed_at.back(), rig.record.lines.size());
+}
+
+TEST(Rev3Rollback, PadScriptReplacesThePadsOfListedFramesOnly)
+{
+  KitRig rig;
+  const std::array<PadBytes, 2> scripted = {Pad(0x55), Pad(0x66)};
+  std::string text = FormatPadRecordLine(10, scripted, 0) + "\n" + FormatPadRecordLine(12, scripted, -3) + "\n";
+  std::string error;
+  ASSERT_TRUE(ParsePadScript(text, &rig.options.script, &error));
+  rig.options.script_path = "script.txt";
+  auto kit = rig.Make();
+  EXPECT_TRUE(rig.sink.Contains("NOTE pad script script.txt frames=2 first=10 last=12"));
+
+  Command c = rig.Cmd(9);  // before the first listed frame: live
+  kit->OnCommand(&c, false);
+  EXPECT_EQ(c.pads, rig.Cmd(9).pads);
+  c = rig.Cmd(10);
+  kit->OnCommand(&c, false);
+  EXPECT_EQ(c.pads, scripted);
+  c = rig.Cmd(11);  // a hole in the script: live
+  kit->OnCommand(&c, false);
+  EXPECT_EQ(c.pads, rig.Cmd(11).pads);
+  EXPECT_EQ(c.pad_return, 1);
+  c = rig.Cmd(12);
+  kit->OnCommand(&c, false);
+  EXPECT_EQ(c.pads, scripted);
+  EXPECT_EQ(c.pad_return, -3);
+  EXPECT_FALSE(kit->ScriptEnded());  // the last listed frame itself has not passed yet
+  EXPECT_FALSE(rig.sink.Contains("NOTE pad script ended"));
+
+  c = rig.Cmd(13);  // after the end: live pads, and the note, once
+  kit->OnCommand(&c, false);
+  EXPECT_EQ(c.pads, rig.Cmd(13).pads);
+  EXPECT_TRUE(kit->ScriptEnded());
+  c = rig.Cmd(14);
+  kit->OnCommand(&c, false);
+  int notes = 0;
+  for (const std::string& l : rig.sink.lines)
+    notes += l == "NOTE pad script ended at frame 12";
+  EXPECT_EQ(notes, 1);
+}
+
+TEST(Rev3Rollback, PadScriptEndIsAlsoNotedInTheTrace)
+{
+  KitRig rig;
+  std::string error;
+  ASSERT_TRUE(ParsePadScript(FormatPadRecordLine(10, {Pad(1), Pad(2)}, 0) + "\n", &rig.options.script, &error));
+  rig.options.script_path = "s.txt";
+  rig.options.trace_path = "t.txt";
+  auto kit = rig.Make();
+  for (u32 f = 9; f <= 11; ++f)
+  {
+    Command c = rig.Cmd(f);
+    kit->OnCommand(&c, false);
+  }
+  bool noted = false;
+  for (const std::string& l : rig.trace.lines)
+    noted = noted || l == "NOTE pad script ended at frame 10";
+  EXPECT_TRUE(noted);
+  EXPECT_FALSE(rig.trace.flushed_at.empty());
+}
+
+TEST(Rev3Rollback, ScriptedPadsAreSubstitutedDuringResimulationToo)
+{
+  KitRig rig;
+  const std::array<PadBytes, 2> scripted = {Pad(0x55), Pad(0x66)};
+  std::string error;
+  ASSERT_TRUE(ParsePadScript(FormatPadRecordLine(10, scripted, 0) + "\n" + FormatPadRecordLine(20, scripted, 0) + "\n", &rig.options.script,
+                             &error));
+  rig.options.script_path = "s.txt";
+  rig.options.record_path = "r.txt";
+  auto kit = rig.Make();
+  Command c = rig.Cmd(10);
+  kit->OnCommand(&c, true);
+  EXPECT_EQ(c.pads, scripted);
+  EXPECT_EQ(rig.record.lines.size(), 1u);  // only the header: nothing recorded in a resimulation
+  // a resimulated call after the script's end does not end it either (only the first run of a frame counts)
+  c = rig.Cmd(30);
+  kit->OnCommand(&c, true);
+  EXPECT_FALSE(kit->ScriptEnded());
+}
+
+TEST(Rev3Rollback, TraceWritesAChecksumLineEveryNthFrame)
+{
+  KitRig rig;
+  rig.options.trace_path = "t.txt";
+  rig.options.trace_every = 30;
+  auto kit = rig.Make();
+  EXPECT_TRUE(rig.sink.Contains("NOTE trace -> t.txt every=30 ranges=0 bytes=0"));
+  for (u32 f = 295; f <= 331; ++f)
+  {
+    Command c = rig.Cmd(f);
+    kit->OnCommand(&c, false);
+  }
+  ASSERT_EQ(rig.trace.lines.size(), 2u);  // frames 300 and 330
+  EXPECT_STREQ(rig.trace.lines[0].c_str(), "T frame=300 fighters=2 chk=0xCDD50D8D mem=0x00000000");  // the golden value of rbchecksum
+  u32 chk = 0;
+  FighterChecksum(rig.mem, 330, &chk);
+  EXPECT_STREQ(rig.trace.lines[1].c_str(), FormatTraceLine(330, 2, chk, 0).c_str());
+  EXPECT_EQ(rig.trace.flushed_at.size(), 2u);  // flushed after every line
+  EXPECT_EQ(kit->TraceLines(), 2u);
+
+  // resimulated calls are not traced
+  Command c = rig.Cmd(360);
+  kit->OnCommand(&c, true);
+  EXPECT_EQ(rig.trace.lines.size(), 2u);
+}
+
+TEST(Rev3Rollback, TraceReportsNoFightersAsZero)
+{
+  KitRig rig;
+  rig.options.trace_path = "t.txt";
+  rig.options.trace_every = 10;
+  auto kit = rig.Make();
+  rig.mem.SetU32(0x8038FE50, 0);  // only one fighter left: reported as none, checksum 0
+  Command c = rig.Cmd(20);
+  kit->OnCommand(&c, false);
+  rig.mem.SetU32(0x8038FE50 + 4, 0);
+  c = rig.Cmd(30);
+  kit->OnCommand(&c, false);
+  ASSERT_EQ(rig.trace.lines.size(), 2u);
+  EXPECT_STREQ(rig.trace.lines[0].c_str(), "T frame=20 fighters=0 chk=0x00000000 mem=0x00000000");
+  EXPECT_STREQ(rig.trace.lines[1].c_str(), "T frame=30 fighters=0 chk=0x00000000 mem=0x00000000");
+}
+
+TEST(Rev3Rollback, TraceMemIsTheCrcOfTheRangesAndFollowsTheMemory)
+{
+  KitRig rig;
+  rig.options.trace_path = "t.txt";
+  rig.options.trace_every = 1;
+  ASSERT_TRUE(ParseWhitelist(R"({"ranges":[{"start":"0x80900000","end":"0x80900009"},{"start":2156921088,"end":2156921091}]})",
+                             &rig.options.ranges, nullptr));
+  rig.options.ranges_path = "r.json";
+  rig.mem.Write(0x80900000, "123456789", 9);
+  rig.mem.Write(0x80900100, "ABC", 3);
+  auto kit = rig.Make();
+  EXPECT_TRUE(rig.sink.Contains("NOTE trace -> t.txt every=1 ranges=2 bytes=12"));
+  Command c = rig.Cmd(1);
+  kit->OnCommand(&c, false);
+  const u8 joined[] = {'1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C'};
+  u32 chk = 0;
+  FighterChecksum(rig.mem, 1, &chk);
+  EXPECT_STREQ(rig.trace.lines[0].c_str(), FormatTraceLine(1, 2, chk, Common::ComputeCRC32(joined, sizeof(joined))).c_str());
+  rig.mem.Write(0x80900100, "ABD", 3);  // a changed byte shows in mem, not in the fighter checksum
+  c = rig.Cmd(2);
+  kit->OnCommand(&c, false);
+  const u8 joined2[] = {'1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'D'};
+  EXPECT_STREQ(rig.trace.lines[1].c_str(), FormatTraceLine(2, 2, [&] { u32 x = 0; FighterChecksum(rig.mem, 2, &x); return x; }(),
+                                                           Common::ComputeCRC32(joined2, sizeof(joined2))).c_str());
+}
+
+TEST(Rev3Rollback, TraceRangesJsonAcceptsHexStringsAndNumbers)
+{
+  std::vector<Range> ranges;
+  std::string error;
+  ASSERT_TRUE(ParseWhitelist(R"({"ranges":[{"start":"0x80000000","end":"0x80000100"},{"start":2415919104,"end":2415919360}]})", &ranges, &error));
+  ASSERT_EQ(ranges.size(), 2u);
+  EXPECT_EQ(ranges[1].start, 0x90000000u);
+  EXPECT_EQ(ranges[1].end, 0x90000100u);
+}
+
+TEST(Rev3Rollback, KitWorksAlongsideSyncTestAndSeesEachFrameOnce)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  SyncTest test(Options(2), game.Ranges(), game.Mem(), sink, FakeClock());
+
+  // a script for the frames 1000..1299 whose pads are not the game's own
+  std::string text;
+  for (u32 f = 1000; f < 1300; ++f)
+    text += FormatPadRecordLine(f, {Pad(static_cast<u8>(f * 7)), Pad(static_cast<u8>(f * 11))}, 0) + "\n";
+  FakeSink log;
+  FakeLines record;
+  FakeLines trace;
+  DeterminismOptions options;
+  std::string error;
+  ASSERT_TRUE(ParsePadScript(text, &options.script, &error));
+  options.script_path = "s.txt";
+  options.record_path = "r.txt";
+  options.trace_path = "t.txt";
+  options.trace_every = 30;
+  DeterminismKit kit(options, game.Mem(), log, &record, &trace);
+  game.AttachKit(&kit);
+
+  std::vector<u32> frames_with_pads_wrong;
+  for (int i = 0; i < 1500; ++i)  // about 500 frames: every rollback costs K extra hook calls
+  {
+    const u32 frame = game.Counter();
+    const Reply r = game.Frame(test);
+    if (r.flags == 0 && frame >= 1000 && frame < 1300 && r.pads != std::array<PadBytes, 2>{Pad(static_cast<u8>(frame * 7)), Pad(static_cast<u8>(frame * 11))})
+      frames_with_pads_wrong.push_back(frame);
+  }
+  while (test.Resimulating())
+    game.Frame(test);
+
+  EXPECT_TRUE(frames_with_pads_wrong.empty());   // SyncTest echoed the scripted pads, not the live ones
+  EXPECT_GT(test.Stats().rollbacks, 100u);        // it was armed and rolling back all along
+  EXPECT_EQ(test.Stats().mismatching_frames, 0u); // and the scripted run is as clean as a normal one
+  EXPECT_FALSE(sink.Contains("MISMATCH"));
+
+  // Every frame once in the record, in order, no matter how often SyncTest replayed it: header + one line per first run.
+  ASSERT_GT(record.lines.size(), 100u);
+  EXPECT_STREQ(record.lines[0].c_str(), PAD_RECORD_HEADER);
+  for (size_t i = 1; i < record.lines.size(); ++i)
+    EXPECT_EQ(std::stoul(record.lines[i].substr(0, record.lines[i].find(' '))), 1000u + (i - 1));
+  // The script ended after frame 1299; the trace has lines at frames 1020, 1050, ... only
+  EXPECT_TRUE(kit.ScriptEnded());
+  EXPECT_TRUE(log.Contains("NOTE pad script ended at frame 1299"));
+  u32 trace_lines = 0;
+  for (const std::string& l : trace.lines)
+  {
+    if (l.rfind("T frame=", 0) != 0)
+      continue;
+    ++trace_lines;
+    EXPECT_EQ(std::stoul(l.substr(8)) % 30, 0u);
+  }
+  EXPECT_EQ(trace_lines, kit.TraceLines());
+  EXPECT_GT(trace_lines, 10u);
+}
+
+TEST(Rev3Rollback, ReplayingARecordGivesTheRecordRunsTrace)
+{
+  // The point of the kit: replay a record and get the record run's trace. Run A plays live pads and records them; run B has other
+  // live pads but plays A's record as its script, and must write the same trace lines (chk and mem) and the same record.
+  const auto run = [](u32 salt, const std::string& script, FakeLines* record, FakeLines* trace) {
+    FakeMemory mem;
+    CsWorld(&mem);
+    FakeSink log;
+    DeterminismOptions options;
+    std::string error;
+    if (!script.empty())
+    {
+      EXPECT_TRUE(ParsePadScript(script, &options.script, &error));
+      options.script_path = "s.txt";
+    }
+    options.record_path = "r.txt";
+    options.trace_path = "t.txt";
+    options.trace_every = 10;
+    EXPECT_TRUE(ParseWhitelist(R"({"ranges":[{"start":"0x80900000","end":"0x80900100"},{"start":"0x80910000","end":"0x80910040"}]})",
+                               &options.ranges, &error));
+    DeterminismKit kit(options, mem, log, record, trace);
+    for (u32 frame = 0; frame < 300; ++frame)
+    {
+      Command c;
+      c.frame = frame;
+      c.pads = {Pad(static_cast<u8>(frame * 3 + salt)), Pad(static_cast<u8>(frame * 5 + salt))};
+      c.pad_return = 1;
+      kit.OnCommand(&c, false);
+      // the "game": the pads the kit handed back feed the fighters' health and a counter in the traced memory
+      mem.SetU32(CS_A1 + 0x28, mem.U32(CS_A1 + 0x28) * 31 + c.pads[0][0] + c.pads[0][3]);
+      mem.SetU32(CS_A2 + 0x28, mem.U32(CS_A2 + 0x28) * 17 + c.pads[1][5]);
+      mem.SetU32(0x80900000 + 4 * (frame % 64), mem.U32(0x80900000 + 4 * (frame % 64)) + c.pads[0][1]);
+    }
+    EXPECT_FALSE(kit.ScriptEnded());
+  };
+  FakeLines record_a, trace_a, record_b, trace_b, record_c, trace_c;
+  run(1, "", &record_a, &trace_a);
+  run(99, TextOf(record_a.lines), &record_b, &trace_b);
+  run(2, "", &record_c, &trace_c);  // other pads, no script: a different game
+  ASSERT_EQ(trace_a.lines.size(), 30u);
+  EXPECT_EQ(trace_a.lines, trace_b.lines);
+  EXPECT_EQ(record_a.lines, record_b.lines);  // re-recording a replay gives back the pads
+  EXPECT_TRUE(trace_a.lines != trace_c.lines);
 }

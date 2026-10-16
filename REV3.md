@@ -202,3 +202,34 @@ A clean run: a fight of a few thousand frames ends with `mismatching_frames=0`, 
 lines, and a restore time of a few hundred microseconds. The state machine is separate from Dolphin (`Rev3::SyncTest` talks to a
 `GuestMemory` / `Sink` interface); `Source/UnitTests/Core/Rev3RollbackTest.cpp` drives it with a fake game (target `tests`,
 filter `Rev3*`).
+
+## Determinism kit (M1)
+
+Milestone M1 of the netplay plan ("boot determinism"): play a session once, record the pads, replay the pads in a second run from the same
+user folder, and compare a trace of the two. The runner is rev3-mod `tools/rollback/phase4.py` (`determinism record | replay | compare`); the
+fork only writes and reads the files below. It lives in the 0xA0 command handler (`Rev3::DeterminismKit`, `Rev3Rollback.cpp` section 4b) and
+works with SyncTest off (plain play) and alongside it (`REV3_SYNCTEST=K`: the kit sees every hook call first, SyncTest then works with the
+scripted pads, and the reply keeps SyncTest's own flags and frame). Read once when the first command arrives; each line below is
+logged once in the Rev3 log (`<User>\Logs\rev3_synctest.log` or `REV3_SYNCTEST_LOG`).
+
+| variable | meaning |
+|---|---|
+| `REV3_PAD_RECORD=file` | pad record. First line `# rev3 pad record v1` (only when the file is new or empty; the file is appended to), then one line per hook call that is not a resimulation: `<frame> <port0 pad, 24 hex> <port1 pad, 24 hex> <padread return, signed int>`. `frame` = the command's frame (the hook's counter); a pad is the command's 12-byte PADStatus, lowercase hex. Flushed every 60 lines and at shutdown. Log: `NOTE pad record -> <path>` |
+| `REV3_PAD_SCRIPT=file` | same format (a record is a script). Parsed at start: `NOTE pad script <path> frames=<n> first=<f> last=<l>` (`n` = distinct frames; a frame listed twice keeps its later line; unusable lines are counted in `NOTE pad script: n malformed lines ignored`). For every listed frame the hook gets the listed two pads (and the listed padread return) instead of the live ones, flags 0, or SyncTest's own flags when it is running. Frames not listed (before the first, holes, after the last) use the live pads. Comment lines (`#`), blank lines, CRLF and a missing final newline are fine. The first hook call (not a resimulation) with a frame after the last listed one writes `NOTE pad script ended at frame <last>` to the Rev3 log and to the trace (if any), once. A script that cannot be read or has no pad line is an `ERROR` in the log (and on screen) and the script stays off |
+| `REV3_TRACE=file` | trace, appended, flushed after every line. Every `REV3_TRACE_EVERY`-th hook call (not a resimulation) with `frame % every == 0`: `T frame=<N> fighters=<0\|2> chk=0x<8 hex> mem=0x<8 hex>` (hex digits uppercase). `fighters` is 2 when both fighters are found through the TEAMS chain, `chk` is then the fighter checksum below; otherwise (none, or only one of them) `fighters=0 chk=0x00000000`. `mem` = CRC32 (zlib polynomial, init 0) over the bytes of all trace ranges in file order, 0 without a ranges file. The trace line is taken at hook entry, before SyncTest captures or restores anything (the state at the start of `input_handler` N). `NOTE ...` lines may be interleaved. Log: `NOTE trace -> <path> every=<n> ranges=<count> bytes=<total>` |
+| `REV3_TRACE_EVERY=n` | 1..1000000, default 30 (anything else is reported and 30 is used) |
+| `REV3_TRACE_RANGES=file` | `{"ranges":[{"start":"0x80...","end":"0x80..."}]}`, hex strings or numbers, end exclusive, inside MEM1 / MEM2 (the whitelist parser; an unusable file is an `ERROR` and `mem` stays 0). A range that cannot be read is skipped (`ERROR ... trace range(s) could not be read`, once) |
+
+A resimulated hook call (SyncTest replaying a rolled-back frame) is never recorded or traced, so the record has each frame once however
+often SyncTest replayed it. The scripted pads are substituted in resimulations too (SyncTest ignores them there and replays its recorded
+inputs).
+
+**Fighter checksum** (`FighterChecksum`): exactly rev3-mod `rev3mod/rbchecksum.py` `checksum(frame, fighters_bytes)`: CRC-32 (zlib, init 0)
+over u32 BE `frame`, then for player 1 and 2 (a player not found is skipped, not zero-filled) the u32 BE player id (1 = team 0 -> `*0x8038FE50`,
+2 = team 1) and the 61 `FIELDS` of the fighter struct as their raw 4 big-endian memory bytes each, in `FIELDS` order (floats are raw bits;
+fighter addresses are not hashed). The fork's `FIELDS` table is rbchecksum's (FIELDS_VERSION 1, `fields_digest()` 0xD4076EF2); the unit tests
+check the offsets, the digest, the golden value (the tests' invented fighter memory, frame 300 -> `0xCDD50D8D`) and the one-fighter /
+no-fighter streams against numbers computed with the Python module. Change the table in both places and bump FIELDS_VERSION.
+
+Tests: `Rev3Rollback.*` in `Source/UnitTests/Core/Rev3RollbackTest.cpp` (checksum, memory CRC, record / script / trace formats and parsing,
+the kit driven alongside SyncTest, and a record -> script round trip giving the same trace).
