@@ -2717,6 +2717,7 @@ public:
     ++audio_calls;
     out->push_back("dsp csr=0x0004 fake");
   }
+  void ExtraLines(std::vector<std::string>* out, bool racy) override { out->push_back(racy ? "hw di fake racy" : "hw di fake"); }
   DumpCpu cpu;
   bool cpu_ok = true;
   DumpHw hw;
@@ -3109,33 +3110,33 @@ TEST(Rev3Rollback, RestoreHwLineHasTheHardwareAndTheSoftwareFlags)
             "RESTOREHW 1 -> 0 pe_status=? pe_token=? cp_rw_dist=? cp_rd=? cp_wr=? vi_count=0x00001234 drawdone=0x01 sched_disable=0x00000001");
 }
 
-TEST(Rev3Rollback, StallIsReportedOncePerStallAndOnlyWhileArmed)
+TEST(Rev3Rollback, StallIsReportedOncePerStallInAnyModeButNotWhileTheSessionWaits)
 {
   FakeMemory mem;
   FakeSink sink;
   FakeDumpSource src;
   FakeMs ms;
   FreezeDump dump(mem, sink, src, 2000, ms.Fn());
-  EXPECT_FALSE(dump.StallDue());  // no command yet
+  EXPECT_FALSE(dump.StallDue());  // no command yet: the game is not running the hook
   dump.Tick(1);
-  *ms.now += 5000;
-  EXPECT_FALSE(dump.StallDue());  // not armed (a menu or a load is not a stall)
-  dump.SetArmed(true);
-  EXPECT_TRUE(dump.StallDue());
+  *ms.now += 1999;
+  EXPECT_FALSE(dump.StallDue());  // shorter than the limit
+  *ms.now += 1;
+  EXPECT_TRUE(dump.StallDue());  // not armed, no SyncTest: a stall all the same
   EXPECT_FALSE(dump.StallDue());  // once per stall
   *ms.now += 5000;
   EXPECT_FALSE(dump.StallDue());
   dump.Tick(2);  // the game is alive again: the next silence is a new stall
   EXPECT_EQ(dump.LastFrame(), 2u);
-  *ms.now += 1999;
-  EXPECT_FALSE(dump.StallDue());  // shorter than the limit
-  *ms.now += 1;
-  EXPECT_TRUE(dump.StallDue());
+  *ms.now += 2000;
   EXPECT_EQ(dump.LastAgeMs(), 2000u);
-  dump.Tick(3);
-  dump.SetArmed(false);
-  *ms.now += 9000;
+  // The netplay session is waiting for the peer: no command arrives on purpose.
+  dump.SetBlocked(true);
+  EXPECT_TRUE(dump.Blocked());
+  *ms.now += 60000;
   EXPECT_FALSE(dump.StallDue());
+  dump.SetBlocked(false);
+  EXPECT_TRUE(dump.StallDue());  // the wait ended and the game still did not come back
 }
 
 TEST(Rev3Rollback, SyncTestDumpsAtArmAndLogsTheHardwareAroundTheFirstRestores)
@@ -3195,10 +3196,9 @@ TEST(Rev3Rollback, SyncTestDumpsAtArmAndLogsTheHardwareAroundTheFirstRestores)
   EXPECT_EQ(before, 10);
   EXPECT_EQ(after, 10);
 
-  // The dump follows the commands: the last frame, and armed, so silence is a stall.
-  EXPECT_GT(dump.LastFrame(), 0u);
-  *ms.now += 3000;
-  EXPECT_TRUE(dump.StallDue());
+  // HandleCommand (not SyncTest) ticks the dump; here the test does.
+  dump.Tick(7);
+  EXPECT_EQ(dump.LastFrame(), 7u);
 }
 
 TEST(Rev3Rollback, SyncTestWithoutADumpLogsNoDumpLines)
@@ -3211,4 +3211,24 @@ TEST(Rev3Rollback, SyncTestWithoutADumpLogsNoDumpLines)
   ASSERT_GT(test.Stats().rollbacks, 20u);
   EXPECT_FALSE(sink.Contains("DUMP "));
   EXPECT_FALSE(sink.Contains("RESTOREHW"));
+}
+
+TEST(Rev3Rollback, FreezeDumpShowsTheWordsAroundTheDvdAndStreamQueuesAndTheExtraHardwareLines)
+{
+  FakeMemory mem;
+  mem.SetU32(0x8049D7B0 - 0x20, 0x11111111);
+  mem.SetU32(0x8049D7B0 + 0x3C, 0x22222222);
+  mem.SetU32(0x8049D238, 0x33333333);
+  FakeSink sink;
+  FakeDumpSource src;
+  FreezeDump dump(mem, sink, src);
+  const std::vector<std::string> lines = dump.Lines(false, true);
+  EXPECT_TRUE(HasLine(lines, "words dvd base=0x8049D790 +0x00: 0x11111111 0x00000000"));
+  EXPECT_TRUE(HasLine(lines, "words dvd base=0x8049D790 +0x40:"));
+  EXPECT_TRUE(HasLine(lines, "0x22222222"));
+  EXPECT_TRUE(HasLine(lines, "words nw4r_strm base=0x8049D218 +0x00:"));
+  EXPECT_TRUE(HasLine(lines, "0x33333333"));
+  EXPECT_TRUE(HasLine(lines, "hw di fake racy"));
+  EXPECT_TRUE(HasLine(dump.Lines(false, false), "hw di fake"));
+  EXPECT_FALSE(HasLine(dump.Lines(false, false), "fake racy"));
 }

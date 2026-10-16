@@ -1443,18 +1443,7 @@ bool SyncTest::Arm(const Command& command, const std::array<u32, 2>& fighters)
   return true;
 }
 
-// The freeze dump's watchdog needs to know when the last command arrived and whether SyncTest is armed.
 Reply SyncTest::OnCommand(const Command& command)
-{
-  if (m_dump != nullptr)
-    m_dump->Tick(command.frame);
-  const Reply reply = OnCommandImpl(command);
-  if (m_dump != nullptr)
-    m_dump->SetArmed(m_armed);
-  return reply;
-}
-
-Reply SyncTest::OnCommandImpl(const Command& command)
 {
   std::array<u32, 2> fighters{};
   const bool found = FindFighters(&fighters);
@@ -1948,6 +1937,8 @@ constexpr u32 TH_STACK_BASE = 0x304;  // highest address
 constexpr u32 TH_STACK_END = 0x308;   // lowest address; the canary word lives here
 constexpr u32 STACK_CANARY = 0xDEADBABE;
 
+constexpr u32 DUMP_WORDS_BEFORE = 0x20;  // bytes dumped before a queue address
+constexpr u32 DUMP_WORDS_COUNT = 24;     // words dumped around a queue address (multiple of 8)
 constexpr size_t DUMP_MAX_THREADS = 32;
 constexpr size_t DUMP_MAX_WAITERS = 8;
 constexpr size_t DUMP_PPC_FRAMES = 16;
@@ -2195,6 +2186,19 @@ void AppendQueues(std::vector<std::string>* out, const GuestMemory& memory)
                      Hex32(Rd32(memory, DUMP_GAME_LAST_VI_COUNT)).c_str());
     AppendQueue(out, memory, q.name, q.address, extra);
   }
+  // The words around the DVD and nw4r stream queues: the neighbouring SDK state (DVD command block pointers / state, stream player flags),
+  // for decoding by hand. DUMP_WORDS_BEFORE bytes before the queue, DUMP_WORDS_COUNT words in all.
+  for (const u32 queue : {0x8049D7B0u, 0x8049D238u})
+  {
+    const u32 base = queue - DUMP_WORDS_BEFORE;
+    for (u32 row = 0; row < DUMP_WORDS_COUNT; row += 8)
+    {
+      std::string words;
+      for (u32 i = row; i < row + 8; ++i)
+        words += " " + Hex32(Rd32(memory, base + 4 * i));
+      out->push_back(Format("words %s base=0x%08X +0x%02X:%s", queue == 0x8049D7B0u ? "dvd" : "nw4r_strm", base, 4 * row, words.c_str()));
+    }
+  }
   // The IPC queue sits behind a pointer (*0x8049D984 + 0x2C); skipped when the pointer is not a valid object.
   const std::optional<u32> ipc = Rd32(memory, DUMP_IPC_POINTER);
   if (ipc && DumpPtrOk(*ipc))
@@ -2258,7 +2262,7 @@ FreezeDump::FreezeDump(const GuestMemory& memory, Sink& sink, DumpSource& source
     m_now_ms = []() { return SteadyMicros() / 1000; };
 }
 
-std::vector<std::string> FreezeDump::Lines(bool full)
+std::vector<std::string> FreezeDump::Lines(bool full, bool racy)
 {
   std::vector<std::string> out;
   DumpCpu cpu;
@@ -2269,6 +2273,7 @@ std::vector<std::string> FreezeDump::Lines(bool full)
   AppendOs(&out, m_memory, cpu, cpu_ok);
   AppendQueues(&out, m_memory);
   AppendHw(&out, hw, hw_ok);
+  m_source.ExtraLines(&out, racy);
   if (full)
     m_source.AudioLines(&out);
   return out;
@@ -2281,7 +2286,7 @@ void FreezeDump::Dump(const char* reason, bool racy, bool full, const std::strin
   m_sink.Line(prefix + Format("begin racy=%d frame=%u last_cmd_age_ms=%llu", racy ? 1 : 0, m_frame.load(),
                               static_cast<unsigned long long>(LastAgeMs())) +
               (note.empty() ? std::string() : " " + note));
-  for (const std::string& line : Lines(full))
+  for (const std::string& line : Lines(full, racy))
     m_sink.Line(prefix + line);
   m_sink.Line(prefix + "end");
 }
@@ -2318,7 +2323,7 @@ u64 FreezeDump::LastAgeMs() const
 
 bool FreezeDump::StallDue()
 {
-  if (!m_armed.load() || !m_seen.load() || m_reported.load() || LastAgeMs() < m_stall_ms)
+  if (!m_seen.load() || m_blocked.load() || m_reported.load() || LastAgeMs() < m_stall_ms)
     return false;
   return !m_reported.exchange(true);  // claimed once; the next Tick starts a new stall
 }
@@ -2685,7 +2690,10 @@ std::string DescribeDsp(Core::System& system)
 class DolphinDumpSource final : public DumpSource
 {
 public:
-  DolphinDumpSource(Core::System& system, AudioHardware* audio) : m_system(system), m_audio(audio) {}
+  explicit DolphinDumpSource(Core::System& system) : m_system(system) {}
+
+  // The audio hardware object (created later, with SyncTest); without it the dump has the DSP line but not the CoreTiming events.
+  void SetAudio(AudioHardware* audio) { m_audio = audio; }
 
   // Called before the final dump: HW::Shutdown has stopped the DSP before it destroys the EXI devices, so its registers are off limits.
   void MarkShutdown() { m_shutdown = true; }
@@ -2748,6 +2756,36 @@ public:
     return true;
   }
 
+  // The DVD interface registers (plain reads) and, when the CPU is not running, the IOS /dev/di busy flag (it walks the IOS device map,
+  // which a running CPU thread may change). Rev3's BGM streaming reads the disc through /dev/di; a rollback during such a read is what
+  // the disc read gate postpones.
+  void ExtraLines(std::vector<std::string>* out, bool racy) override
+  {
+    MMIO::Mapping* mmio = m_system.GetMemory().GetMMIOMapping();
+    std::string ios = "n/a";
+    if (m_system.IsWii())
+    {
+      ios = "skipped(racy)";
+      if (!racy)
+      {
+        IOS::HLE::EmulationKernel* kernel = m_system.GetIOS();
+        const std::shared_ptr<IOS::HLE::Device> device = kernel != nullptr ? kernel->GetDeviceByName("/dev/di") : nullptr;
+        const auto* di = static_cast<const IOS::HLE::DIDevice*>(device.get());  // always the DIDevice; no RTTI in this build
+        ios = di != nullptr ? (di->IsBusy() ? "1" : "0") : "none";
+      }
+    }
+    if (mmio == nullptr)
+    {
+      out->push_back(Format("hw di unavailable ios_di_busy=%s", ios.c_str()));
+      return;
+    }
+    out->push_back(Format("hw di disr=0x%08X cmd0=0x%08X dimar=0x%08X dilength=0x%08X dicr=0x%08X wii_dicr=0x%08X ios_di_busy=%s",
+                          mmio->Read<u32>(m_system, 0x0C006000), mmio->Read<u32>(m_system, 0x0C006008),
+                          mmio->Read<u32>(m_system, 0x0C006014), mmio->Read<u32>(m_system, 0x0C006018),
+                          mmio->Read<u32>(m_system, 0x0C00601C), m_system.IsWii() ? mmio->Read<u32>(m_system, 0x0D00601C) : 0u,
+                          ios.c_str()));
+  }
+
   void AudioLines(std::vector<std::string>* out) override
   {
     if (m_shutdown)
@@ -2769,7 +2807,7 @@ public:
 
 private:
   Core::System& m_system;
-  AudioHardware* m_audio;
+  AudioHardware* m_audio = nullptr;
   bool m_shutdown = false;
 };
 
@@ -3065,11 +3103,13 @@ void InitializeKit(Module& module)
 
 // REV3_SYNCTEST_DUMP (default 1; 0 = off), REV3_SYNCTEST_DUMP_STALL_MS (100..600000, default 2000: silence on the 0xA0 hook that counts as
 // a stall), REV3_SYNCTEST_DUMP_PAUSE (default 1; 0 = the watchdog only writes the racy dump and never tries to pause the CPU).
-void InitializeDump(Module& module, Core::System& system)
+// The dump lives in every mode (plain play, SyncTest armed or not, netplay), independent of SyncTest; `sink` is the log it writes to
+// (the Rev3 log, or the net log in a netplay run).
+void InitializeDump(Module& module, Core::System& system, Sink& sink)
 {
   if (GetEnv("REV3_SYNCTEST_DUMP") == "0")
   {
-    module.sink->Line("NOTE freeze dump off (REV3_SYNCTEST_DUMP=0)");
+    sink.Line("NOTE freeze dump off (REV3_SYNCTEST_DUMP=0)");
     return;
   }
   u32 stall_ms = 2000;
@@ -3083,12 +3123,22 @@ void InitializeDump(Module& module, Core::System& system)
       ERROR_LOG_FMT(SLIPPI, "Rev3 SyncTest: ignoring REV3_SYNCTEST_DUMP_STALL_MS={} (100..600000)", stall_text);
   }
   const bool pause = GetEnv("REV3_SYNCTEST_DUMP_PAUSE") != "0";
-  module.dump_source = std::make_unique<DolphinDumpSource>(system, module.audio.get());
-  module.dump = std::make_unique<FreezeDump>(*module.memory, *module.sink, *module.dump_source, stall_ms);
-  module.synctest->SetFreezeDump(module.dump.get());
+  module.dump_source = std::make_unique<DolphinDumpSource>(system);
+  module.dump = std::make_unique<FreezeDump>(*module.memory, sink, *module.dump_source, stall_ms);
   module.watchdog = std::make_unique<StallWatchdog>(system, *module.dump, pause);
-  module.sink->Line(Format("NOTE freeze dump on: at arm, when no hook command arrives for %u ms while armed (pause_cpu=%d), at shutdown", stall_ms,
-                           pause ? 1 : 0));
+  sink.Line(Format("NOTE freeze dump on: at arm, when no hook command arrives for %u ms (any mode; not while the net session waits for the "
+                   "peer) (pause_cpu=%d), at shutdown",
+                   stall_ms, pause ? 1 : 0));
+}
+
+// Gives SyncTest the dump (RESTOREHW lines, the dump at arm) and the audio hardware object the dump reads events from.
+void AttachDump(Module& module)
+{
+  if (module.dump == nullptr)
+    return;
+  if (module.synctest != nullptr)
+    module.synctest->SetFreezeDump(module.dump.get());
+  module.dump_source->SetAudio(module.audio.get());
 }
 
 void Initialize(Module& module, Core::System& system)
@@ -3098,6 +3148,7 @@ void Initialize(Module& module, Core::System& system)
   // The determinism kit (pad record / script, trace) is independent of SyncTest and works with it off.
   module.memory = std::make_unique<DolphinMemory>(system);
   InitializeKit(module);
+  InitializeDump(module, system, EnsureSink(module));  // the freeze dump works with SyncTest off too
 
   const std::string k_text = GetEnv("REV3_SYNCTEST");
   if (k_text.empty())
@@ -3251,7 +3302,7 @@ void Initialize(Module& module, Core::System& system)
   }
   Core::System* const sys = &system;
   module.synctest->SetDspState([sys]() { return DescribeDsp(*sys); });
-  InitializeDump(module, system);
+  AttachDump(module);
   module.sink->Osd(Format("Rev3 SyncTest on: K=%d, every %d frame(s), log %s", options.k, options.every, log_path.c_str()));
 }
 }  // namespace
@@ -3271,6 +3322,10 @@ void HandleCommand(Core::System& system, const u8* command, size_t size, std::ve
     read_queue->assign(REPLY_SIZE, 0);
     return;
   }
+
+  // The freeze dump's watchdog: this command proves the game is alive (any mode).
+  if (module.dump != nullptr)
+    module.dump->Tick(parsed.frame);
 
   // The determinism kit sees every hook call first: it may replace the pads (REV3_PAD_SCRIPT), then SyncTest (if on) works with
   // those pads, and the reply carries them.
@@ -3301,7 +3356,7 @@ void Shutdown()
     watchdog_stuck = !module.watchdog->Stop(std::chrono::milliseconds(1500));
     module.watchdog.reset();
   }
-  if (module.dump != nullptr && module.dump_source != nullptr && module.dump->Seen())
+  if (module.dump != nullptr && module.dump_source != nullptr)
   {
     module.dump_source->MarkShutdown();
     module.dump->Dump("shutdown", module.dump_source->CpuRunning(), false);

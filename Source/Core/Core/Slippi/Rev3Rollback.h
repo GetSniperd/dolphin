@@ -337,6 +337,9 @@ public:
   // Extra lines (without the `DUMP <reason> ` prefix): the DSP / AI state and the audio CoreTiming events. Only asked for in a
   // consistent dump (arm, a paused CPU), never in a racy one. Default: none.
   virtual void AudioLines(std::vector<std::string>* /*out*/) {}
+  // Extra hardware lines (the DVD interface and IOS /dev/di state), asked for in every dump. `racy`: the CPU thread is still running, so
+  // anything that walks Dolphin's own containers (the IOS device map) must be skipped. Default: none.
+  virtual void ExtraLines(std::vector<std::string>* /*out*/, bool /*racy*/) {}
 };
 
 struct StackFrame
@@ -355,17 +358,20 @@ public:
   // `now_ms` returns a monotonic clock in milliseconds (default: steady_clock); `stall_ms` = silence that counts as a stall.
   FreezeDump(const GuestMemory& memory, Sink& sink, DumpSource& source, u32 stall_ms = 2000, std::function<u64()> now_ms = {});
 
-  // The dump as lines without the prefix. `full` adds the audio lines (consistent dumps only).
-  std::vector<std::string> Lines(bool full);
+  // The dump as lines without the prefix. `full` adds the audio lines (consistent dumps only); `racy` = the CPU thread is running.
+  std::vector<std::string> Lines(bool full, bool racy = false);
   // Writes Lines() to the sink, each as `DUMP <reason> <line>`, between `begin racy=<0|1> <note>` and `end` lines. One dump at a time.
   void Dump(const char* reason, bool racy, bool full, const std::string& note = {});
   // `RESTOREHW <from> -> <to>[ after] pe_status=.. pe_token=.. cp_rw_dist=.. cp_rd=.. cp_wr=.. vi_count=.. drawdone=.. sched_disable=..`
   std::string RestoreHwLine(u32 from, u32 to, bool after);
 
-  // CPU thread, every 0xA0 command: the latest frame and the time; ends a stall. SetArmed: SyncTest is armed (or not) after the command.
+  // CPU thread, every 0xA0 command (any mode: plain play, SyncTest armed or not, netplay): the latest frame and the time; ends a stall.
   void Tick(u32 frame);
-  void SetArmed(bool armed) { m_armed.store(armed); }
-  // Watchdog thread: true once per stall (armed, and no command for stall_ms since the last Tick); Tick starts the next stall.
+  // The netplay session is deliberately waiting for the peer (Rev3::Net wait loops): no command arrives, which is not a freeze.
+  void SetBlocked(bool blocked) { m_blocked.store(blocked); }
+  bool Blocked() const { return m_blocked.load(); }
+  // Watchdog thread: true once per stall (no command for stall_ms since the last Tick and the session is not blocked in its wait);
+  // Tick starts the next stall.
   bool StallDue();
   u32 LastFrame() const { return m_frame.load(); }
   u64 LastAgeMs() const;
@@ -381,7 +387,7 @@ private:
   std::mutex m_lock;  // serialises Dump (CPU thread at arm / shutdown, watchdog thread)
   std::atomic<u64> m_last_ms{0};
   std::atomic<u32> m_frame{0};
-  std::atomic<bool> m_armed{false};
+  std::atomic<bool> m_blocked{false};
   std::atomic<bool> m_reported{false};
   std::atomic<bool> m_seen{false};  // a command arrived at least once
 };
@@ -527,7 +533,6 @@ private:
     } audio;
   };
 
-  Reply OnCommandImpl(const Command& command);
   bool FindFighters(std::array<u32, 2>* addrs) const;
   bool Capture(Slot& slot, const Command& command, const std::array<u32, 2>& fighters);
   void Reset(const char* why);
