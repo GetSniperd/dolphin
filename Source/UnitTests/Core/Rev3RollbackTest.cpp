@@ -3613,7 +3613,9 @@ TEST(Rev3Rollback, FreezeDumpWalksTheThreadsAndUsesLiveRegistersForTheRunningOne
   // Running thread: pc / lr / sp from the live registers, not from its stale context (0xAAAA0000).
   EXPECT_TRUE(HasLine(lines, "thread 0x80600000 state=2 prio=16 suspend=0 queue=0x00000000 pc=0x80001000 lr=0x80002000 sp=0x80611F00 "
                              "canary=ok stack=0x80610000..0x80612000 running=1 live=1"));
-  EXPECT_FALSE(HasLine(lines, "0xAAAA0000"));
+  // (the saved context is printed on its own `ctx` line, see FreezeDumpPrintsEachThreadsSavedContext)
+  for (const std::string& l : lines)
+    EXPECT_FALSE(l.find("thread 0x80600000 state=") != std::string::npos && l.find("0xAAAA0000") != std::string::npos);
   // A waiting thread: the saved context, queue and canary.
   EXPECT_TRUE(HasLine(lines, "thread 0x80601000 state=4 prio=20 suspend=0 queue=0x8049D950 pc=0x80123450 lr=0x80123460 sp=0x80611800 "
                              "canary=ok stack=0x80614000..0x80616000"));
@@ -3623,6 +3625,170 @@ TEST(Rev3Rollback, FreezeDumpWalksTheThreadsAndUsesLiveRegistersForTheRunningOne
   EXPECT_TRUE(HasLine(lines, "thread 0x80601000 frame 0 sp=0x80611800 lr=0x80111110"));
   EXPECT_TRUE(HasLine(lines, "thread 0x80601000 frame 2 sp=0x80611900 lr=0x80333330"));
   EXPECT_FALSE(HasLine(lines, "thread 0x80601000 frame 3 "));
+}
+
+TEST(Rev3Rollback, FreezeDumpPrintsEachThreadsSavedContext)
+{
+  FakeMemory mem;
+  MakeFakeOs(mem);
+  // OSContext offsets (decomp OSDumpContext / OSExceptionVector): CR +0x80, CTR +0x88, SRR1 +0x19C, state u16 +0x1A2.
+  mem.SetU32(T1 + 0x19C, 0x0000B032);
+  mem.SetU32(T1 + 0x88, 0x80004444);
+  mem.SetU32(T1 + 0x80, 0x28000042);
+  const std::array<u8, 2> state{0x00, 0x02};
+  mem.Write(T1 + 0x1A2, state.data(), 2);
+  FakeSink sink;
+  FakeDumpSource src;
+  src.cpu = MakeFakeCpu();
+  FreezeDump dump(mem, sink, src);
+  const std::vector<std::string> lines = dump.Lines(false);
+  // The running thread: the SAVED context (0xAAAA0000 / 0xAAAA0004 / sp 0x80611FF0, inside its stack), not the live registers. No stack frames
+  // are built there, so the walk gives the one frame at the sp.
+  EXPECT_TRUE(HasLine(lines, "thread 0x80600000 ctx srr0=0xAAAA0000 srr1=0x0000B032 lr=0xAAAA0004 ctr=0x80004444 cr=0x28000042 r1=0x80611FF0 "
+                             "ctx_state=0x0002 in_stack=1 frames=[0x00000000]"));
+  // A waiting thread: its sp 0x80611800 is not inside its own stack (0x80614000..0x80616000): in_stack=0; three frames of back-chain.
+  EXPECT_TRUE(HasLine(lines, "thread 0x80601000 ctx srr0=0x80123450 srr1=0x00000000 lr=0x80123460 ctr=0x00000000 cr=0x00000000 r1=0x80611800 "
+                             "ctx_state=0x0000 in_stack=0 frames=[0x80111110,0x80222220,0x80333330]"));
+  // No exception here: one line says so, no thread is marked.
+  EXPECT_TRUE(HasLine(lines, "exc none halted=0"));
+  EXPECT_FALSE(HasLine(lines, " exc=1"));
+  // An unreadable thread (MEM2 does not exist in the fake memory): the line is there, with '?'.
+  FakeMemory mem2;
+  MakeFakeOs(mem2);
+  mem2.SetU32(0x800000DC, 0x90000000);
+  FreezeDump dump2(mem2, sink, src);
+  EXPECT_TRUE(HasLine(dump2.Lines(false), "thread 0x90000000 ctx srr0=? srr1=? lr=? ctr=? cr=? r1=? ctx_state=? in_stack=? frames=?"));
+}
+
+TEST(Rev3Rollback, FreezeDumpReportsTheUnhandledExceptionTheOsHaltedOn)
+{
+  FakeMemory mem;
+  MakeFakeOs(mem);
+  // The fault context is T1's OSThread (what the vector saved): srr0 in some game function, a DSI (2) on a bad pointer.
+  mem.SetU32(T1 + 0x198, 0x80123454);
+  mem.SetU32(T1 + 0x19C, 0x0000B032);
+  mem.SetU32(T1 + 0x84, 0x80567890);
+  mem.SetU32(T1 + 0x04, 0x80611FF0);
+  for (u32 i = 0; i < 32; ++i)
+    mem.SetU32(T1 + 4 * i, i == 1 ? 0x80611FF0 : 0x2000 + i);
+  mem.SetU32(0x80123454, 0x80640000);  // lwz r3,0(r4) as a stand-in word
+  const std::array<u8, 2> state{0x00, 0x02};
+  mem.Write(T1 + 0x1A2, state.data(), 2);
+  mem.SetU32(0x8049DA80, 0x803153C8);  // last interrupt SRR0
+  const std::array<u8, 2> last{0x00, 0x11};
+  mem.Write(0x8049DA84, last.data(), 2);
+  FakeSink sink;
+  FakeDumpSource src;
+  src.cpu = MakeFakeCpu();
+  src.cpu.pc = 0x802A18BC;  // PPCHalt
+  src.cpu.lr = 0x80315CE4;
+  src.cpu.gpr[25] = 2;
+  src.cpu.gpr[26] = T1;
+  src.cpu.gpr[27] = 0x40000000;
+  src.cpu.gpr[28] = 0x00000008;
+  src.cpu.dsisr = 0x40000000;
+  src.cpu.dar = 0x00000008;
+  FreezeDump dump(mem, sink, src);
+  const std::vector<std::string> lines = dump.Lines(false);
+  EXPECT_TRUE(HasLine(lines, "exc error=2 srr0=0x80123454 srr1=0x0000B032 dsisr=0x40000000 dar=0x00000008 lr=0x80567890 r1=0x80611FF0 "
+                             "ctx=0x80600000 ctx_src=r26 args=r25_r28 name=dsi insn=0x80640000 ctx_state=0x0002 last_int=17 "
+                             "last_int_srr0=0x803153C8 spr_dsisr=0x40000000 spr_dar=0x00000008"));
+  EXPECT_TRUE(HasLine(lines, "exc ctxgpr r0..r7: 0x00002000 0x80611FF0 0x00002002 0x00002003"));
+  EXPECT_TRUE(HasLine(lines, "exc ctxgpr r24..r31: 0x00002018"));
+  // The raw stack at the fault's r1 (here the memory is zero but for what the test wrote) and the code addresses found in it.
+  mem.SetU32(0x80611FF0 + 0x08, 0x8021A5F0);   // looks like a return address
+  mem.SetU32(0x80611FF0 + 0x0C, 0x80338BE0);   // one past the end of .text: not an address
+  mem.SetU32(0x80611FF0 + 0x20, 0x80005002);   // not word aligned
+  mem.SetU32(0x80611FF0 + 0x24, 0x8021CE34);
+  mem.SetU32(T1 + 0x304, 0x80612100);  // the scan stops at the thread's stack base: widen it to take in +0x24
+  const std::vector<std::string> again = dump.Lines(false);
+  EXPECT_TRUE(HasLine(again, "exc stack sp=0x80611FF0 +0x00: 0x00000000 0x00000000 0x8021A5F0 0x80338BE0"));
+  EXPECT_TRUE(HasLine(again, "exc stack sp=0x80611FF0 +0x20: 0x80005002 0x8021CE34"));
+  EXPECT_TRUE(HasLine(again, "exc stackscan sp=0x80611FF0 n=2 [+0x8:0x8021A5F0,+0x24:0x8021CE34]"));
+  // The callee-saved registers are listed (they hold the arguments while halted).
+  EXPECT_TRUE(HasLine(lines, "ppc r14=0x0000100E"));
+  EXPECT_TRUE(HasLine(lines, "r25=0x00000002 r26=0x80600000 r27=0x40000000 r28=0x00000008"));
+  // The running thread keeps its live line (PPCHalt), and its saved context line is the fault, marked exc=1.
+  EXPECT_TRUE(HasLine(lines, "thread 0x80600000 state=2 prio=16 suspend=0 queue=0x00000000 pc=0x802A18BC lr=0x80315CE4"));
+  EXPECT_TRUE(HasLine(lines, "thread 0x80600000 ctx srr0=0x80123454 srr1=0x0000B032 lr=0x80567890 "));
+  EXPECT_TRUE(HasLine(lines, " exc=1"));
+  EXPECT_FALSE(HasLine(lines, "exc none"));
+  // The exc line comes right after the os line and before the thread list.
+  size_t os = 0, exc = 0, threads = 0;
+  for (size_t i = 0; i < lines.size(); ++i)
+  {
+    if (lines[i].rfind("os ", 0) == 0)
+      os = i;
+    else if (lines[i].rfind("exc error=", 0) == 0)
+      exc = i;
+    else if (lines[i].rfind("threads ", 0) == 0)
+      threads = i;
+  }
+  EXPECT_LT(os, exc);
+  EXPECT_LT(exc, threads);
+}
+
+TEST(Rev3Rollback, FreezeDumpExceptionFallsBackWhenTheArgumentsAreNotUsable)
+{
+  FakeSink sink;
+  {
+    // In PPCHalt but r25 is not an error number and r26 not a pointer: error '?', the context is OSGetCurrentContext, DSISR / DAR from r27 / r28.
+    FakeMemory mem;
+    MakeFakeOs(mem);
+    mem.SetU32(T1 + 0x198, 0x80123454);
+    FakeDumpSource src;
+    src.cpu = MakeFakeCpu();
+    src.cpu.pc = 0x802A18B8;
+    src.cpu.gpr[25] = 0x80123456;
+    src.cpu.gpr[26] = 0x12345678;
+    FreezeDump dump(mem, sink, src);
+    const std::vector<std::string> lines = dump.Lines(false);
+    EXPECT_TRUE(HasLine(lines, "exc error=? srr0=0x80123454 "));
+    EXPECT_TRUE(HasLine(lines, "ctx=0x80600000 ctx_src=cur_context args=r25_r28 name=? "));
+  }
+  {
+    // A racy dump while the OS is still printing: the pc is in OSReport, __OSUnhandledException is on the back-chain. No arguments in the
+    // registers: error '?', DSISR / DAR from the SPRs, the context from OSGetCurrentContext.
+    FakeMemory mem;
+    MakeFakeOs(mem);
+    mem.SetU32(T1 + 0x198, 0x80123454);
+    MakeStack(mem, {{0x80611F00, 0x80315CE0}, {0x80611F30, 0x00400002}});
+    FakeDumpSource src;
+    src.cpu = MakeFakeCpu();
+    src.cpu.pc = 0x803155D0;
+    src.cpu.lr = 0x80315CE0 - 0x100;
+    src.cpu.dsisr = 0x0A000000;
+    src.cpu.dar = 0x0BADF00D;
+    FreezeDump dump(mem, sink, src);
+    const std::vector<std::string> lines = dump.Lines(false);
+    EXPECT_TRUE(HasLine(lines, "exc error=? srr0=0x80123454 srr1=0x00000000 dsisr=0x0A000000 dar=0x0BADF00D "));
+    EXPECT_TRUE(HasLine(lines, "ctx_src=cur_context args=spr name=?"));
+  }
+  {
+    // Halted with no readable context at all: the line says so, no register rows.
+    FakeMemory mem;
+    MakeFakeOs(mem);
+    mem.SetU32(0x800000D4, 0);
+    FakeDumpSource src;
+    src.cpu = MakeFakeCpu();
+    src.cpu.pc = 0x802A18BC;
+    src.cpu.gpr[25] = 6;
+    src.cpu.gpr[26] = 0;
+    FreezeDump dump(mem, sink, src);
+    const std::vector<std::string> lines = dump.Lines(false);
+    EXPECT_TRUE(HasLine(lines, "exc error=6 srr0=? srr1=? "));
+    EXPECT_TRUE(HasLine(lines, "name=program insn=? ctx_state=?"));
+    EXPECT_FALSE(HasLine(lines, "exc ctxgpr"));
+  }
+  {
+    // The CPU registers cannot be read: no exception can be told, and nothing crashes.
+    FakeMemory mem;
+    MakeFakeOs(mem);
+    FakeDumpSource src;
+    src.cpu_ok = false;
+    FreezeDump dump(mem, sink, src);
+    EXPECT_TRUE(HasLine(dump.Lines(false), "exc none halted=0"));
+  }
 }
 
 TEST(Rev3Rollback, FreezeDumpThreadListSurvivesLoopsBadPointersAndLength)
@@ -3946,6 +4112,8 @@ TEST(Rev3Rollback, FreezeDumpShowsTheWordsAroundTheDvdAndStreamQueuesAndTheExtra
   EXPECT_TRUE(HasLine(lines, "words dvd base=0x8049D790 +0x40:"));
   EXPECT_TRUE(HasLine(lines, "0x22222222"));
   EXPECT_TRUE(HasLine(lines, "words nw4r_strm base=0x8049D218 +0x00:"));
+  EXPECT_TRUE(HasLine(lines, "words dvdlog base=0x80460854 +0x00:"));
+  EXPECT_TRUE(HasLine(lines, "words dvdlog base=0x80460854 +0x60:"));
   EXPECT_TRUE(HasLine(lines, "0x33333333"));
   EXPECT_TRUE(HasLine(lines, "hw di fake racy"));
   EXPECT_TRUE(HasLine(dump.Lines(false, false), "hw di fake"));

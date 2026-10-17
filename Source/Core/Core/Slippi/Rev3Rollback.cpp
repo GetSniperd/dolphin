@@ -4182,6 +4182,16 @@ constexpr u32 OS_RUN_QUEUE_BITS = 0x8049DAC0;   // bit per priority with a ready
 constexpr u32 TH_CTX_GPR1 = 0x04;
 constexpr u32 TH_CTX_LR = 0x84;
 constexpr u32 TH_CTX_SRR0 = 0x198;
+// OSContext (the first 0x2C8 bytes of an OSThread), offsets from the decomp: the SDK exception vector OSExceptionVector 0x80313420 and
+// OSDefaultExceptionHandler 0x803134BC store r0..r31 at +0x00 (stw r0,0(r4); stw r1,4(r4); stmw r6,0x18(r4)), CR +0x80, LR +0x84, CTR +0x88,
+// XER +0x8C, SRR0 +0x198, SRR1 +0x19C and OR 2 into the u16 at +0x1A2; OSDumpContext 0x8031529C prints exactly these (gpr[i] = word i, LR = word 0x21,
+// CR = 0x20, SRR0 = 0x66, SRR1 = 0x67, "+0x1A2 & 1" = FPRs saved) and starts the SDK's own back-chain walk at word 1 (gpr1).
+constexpr u32 TH_CTX_GPR0 = 0x00;
+constexpr u32 TH_CTX_CR = 0x80;
+constexpr u32 TH_CTX_CTR = 0x88;
+constexpr u32 TH_CTX_XER = 0x8C;
+constexpr u32 TH_CTX_SRR1 = 0x19C;
+constexpr u32 TH_CTX_STATE = 0x1A2;  // u16: bit 0 FPRs saved, bit 1 exception (set by the vector, cleared by OSLoadContext)
 constexpr u32 TH_STATE = 0x2C8;       // u16: 1 ready, 2 running, 4 waiting, 8 moribund
 constexpr u32 TH_SUSPEND = 0x2CC;     // s32
 constexpr u32 TH_PRIORITY = 0x2D0;    // s32
@@ -4194,10 +4204,38 @@ constexpr u32 STACK_CANARY = 0xDEADBABE;
 
 constexpr u32 DUMP_WORDS_BEFORE = 0x20;  // bytes dumped before a queue address
 constexpr u32 DUMP_WORDS_COUNT = 24;     // words dumped around a queue address (multiple of 8)
+constexpr u32 DUMP_DVDLOG_BASE = 0x80460854;  // DVD library command log (5 records of 5 words; decomp dvd.c StampCommand / the 0x8046085C.. stores)
+constexpr u32 DUMP_DVDLOG_WORDS = 32;         // words dumped from it (multiple of 8)
 constexpr size_t DUMP_MAX_THREADS = 32;
 constexpr size_t DUMP_MAX_WAITERS = 8;
 constexpr size_t DUMP_PPC_FRAMES = 16;
 constexpr size_t DUMP_THREAD_FRAMES = 6;
+constexpr size_t DUMP_CTX_FRAMES = 8;  // frames walked from a saved context's r1
+
+// The unhandled exception path (Rev3 decomp + main.elf). The vector (OSExceptionVector, copied to 0x80000100.. + n * 0x100) saves the context
+// into *(0x800000C0) (physical; the same object as OSGetCurrentContext 0x800000D4, normally the running thread's OSThread), sets r3 = exception
+// number, r4 = *(0x800000D4), r5 = DSISR, r6 = DAR, does `stwu r1,-8(r1)` ON THE FAULTING THREAD'S OWN STACK (no stack switch) and branches to
+// __OSUnhandledException 0x80315A0C (a 0x30 byte frame). Its prologue keeps the arguments in r25 = error, r26 = context, r27 = DSISR, r28 = DAR
+// (mr r25,r3 / mr r26,r4 / mr r27,r5 / mr r28,r6), then OSReport("Unhandled Exception %d"), OSDumpContext(ctx), OSReport("DSISR = .. DAR = ..") and ends with
+// `bl PPCHalt` (0x802A18B8, 0x14 bytes, a leaf spin loop) at 0x80315CE0: so while halted the live r25..r28 ARE the arguments. The frame above
+// __OSUnhandledException is the vector's 8 byte frame: its LR slot is never written (any junk there is normal).
+constexpr u32 PPC_HALT_START = 0x802A18B8;
+constexpr u32 PPC_HALT_SIZE = 0x14;
+constexpr u32 OS_UNHANDLED_START = 0x80315A0C;
+constexpr u32 OS_UNHANDLED_SIZE = 0x2F0;
+constexpr size_t OS_UNHANDLED_REG_ERROR = 25;
+constexpr size_t OS_UNHANDLED_REG_CONTEXT = 26;
+constexpr size_t OS_UNHANDLED_REG_DSISR = 27;
+constexpr size_t OS_UNHANDLED_REG_DAR = 28;
+constexpr u32 OS_MAX_EXCEPTION = 0x20;                // the SDK's __OSErrorTable has 17 entries; anything above this in r25 is not an error number
+constexpr u32 OS_LAST_INTERRUPT = 0x8049DA84;         // s16 __OSLastInterrupt (r13 - 0x5E9C), printed by the "Last interrupt (%d)" line
+constexpr u32 OS_LAST_INTERRUPT_SRR0 = 0x8049DA80;    // its SRR0 (r13 - 0x5EA0)
+// Return address heuristic for the stack scan: Rev3's executable segments (main.elf program headers: 0x80004000 + 0x26A0 and 0x80016320 + 0x3228C0).
+constexpr u32 TEXT_START = 0x80004000;
+constexpr u32 TEXT_END = 0x80338BE0;
+constexpr u32 EXC_STACK_ROWS = 2;          // rows of 8 words printed from the faulting r1
+constexpr u32 EXC_SCAN_BYTES = 0x400;      // stack bytes above the faulting r1 scanned for code addresses (also stops at the thread's stack base)
+constexpr size_t EXC_SCAN_MAX = 24;        // code addresses listed
 
 // Sleep queues ({head, tail}, 8 bytes each) the freeze can be waiting in.
 struct DumpQueueDef
@@ -4285,6 +4323,11 @@ void AppendCpu(std::vector<std::string>* out, const GuestMemory& memory, const D
   for (size_t r = 3; r <= 12; ++r)
     regs += Format(" r%zu=0x%08X", r, cpu.gpr[r]);
   out->push_back(regs + Format(" exceptions=0x%08X", cpu.exceptions));
+  // The callee-saved registers: while halted in __OSUnhandledException r25..r28 are its arguments (error, context, DSISR, DAR), see the exc line.
+  std::string saved = "ppc";
+  for (size_t r = 14; r <= 31; ++r)
+    saved += Format(" r%zu=0x%08X", r, cpu.gpr[r]);
+  out->push_back(saved);
   std::vector<StackFrame> frames;
   WalkBackChain(memory, cpu.gpr[1], DUMP_PPC_FRAMES, &frames);
   if (frames.empty())
@@ -4292,8 +4335,48 @@ void AppendCpu(std::vector<std::string>* out, const GuestMemory& memory, const D
   AppendFrames(out, "", frames);
 }
 
+bool InRange(u32 address, u32 start, u32 size)
+{
+  return address >= start && address - start < size;
+}
+
+// The back-chain of a saved r1 as `[lr0,lr1,..]` (each frame's `*(sp+4)`, same convention as the `frame` lines), at most DUMP_CTX_FRAMES.
+std::string FrameList(const GuestMemory& memory, u32 sp)
+{
+  std::vector<StackFrame> frames;
+  WalkBackChain(memory, sp, DUMP_CTX_FRAMES, &frames);
+  std::string list;
+  for (const StackFrame& frame : frames)
+    list += Format("%s0x%08X", list.empty() ? "" : ",", frame.lr);
+  return "[" + list + "]";
+}
+
+// One thread's SAVED OSContext (what the vector / the scheduler stored in the OSThread): `thread 0x.. ctx srr0= srr1= lr= ctr= cr= r1= ctx_state=
+// in_stack= frames=[..]`. For the running thread it is the context of the last exception or switch, NOT the live registers: for the thread that
+// faulted it is the fault itself (srr0 = the faulting instruction, lr / r1 = its caller, see AppendException). `exc=1` marks the context the OS
+// reported as the unhandled exception's. in_stack = r1 lies inside [stack end, stack base].
+void AppendThreadContext(std::vector<std::string>* out, const GuestMemory& memory, u32 t, u32 exc_ctx)
+{
+  const std::optional<u32> srr0 = Rd32(memory, t + TH_CTX_SRR0);
+  const std::optional<u32> srr1 = Rd32(memory, t + TH_CTX_SRR1);
+  const std::optional<u32> lr = Rd32(memory, t + TH_CTX_LR);
+  const std::optional<u32> ctr = Rd32(memory, t + TH_CTX_CTR);
+  const std::optional<u32> cr = Rd32(memory, t + TH_CTX_CR);
+  const std::optional<u32> sp = Rd32(memory, t + TH_CTX_GPR1);
+  const std::optional<u32> ctx_state = Rd16(memory, t + TH_CTX_STATE);
+  const std::optional<u32> stack_base = Rd32(memory, t + TH_STACK_BASE);
+  const std::optional<u32> stack_end = Rd32(memory, t + TH_STACK_END);
+  std::string in_stack = "?";
+  if (sp && stack_base && stack_end)
+    in_stack = (*sp >= *stack_end && *sp <= *stack_base) ? "1" : "0";
+  out->push_back(Format("thread 0x%08X ctx srr0=%s srr1=%s lr=%s ctr=%s cr=%s r1=%s ctx_state=%s in_stack=%s frames=%s%s", t, Hex32(srr0).c_str(),
+                        Hex32(srr1).c_str(), Hex32(lr).c_str(), Hex32(ctr).c_str(), Hex32(cr).c_str(), Hex32(sp).c_str(),
+                        Hex16(ctx_state).c_str(), in_stack.c_str(), sp ? FrameList(memory, *sp).c_str() : "?",
+                        exc_ctx == t ? " exc=1" : ""));
+}
+
 // One OSThread. `live` = the running thread: pc / lr / sp come from the live registers instead of its (stale) saved context.
-void AppendThread(std::vector<std::string>* out, const GuestMemory& memory, u32 t, const DumpCpu* live)
+void AppendThread(std::vector<std::string>* out, const GuestMemory& memory, u32 t, const DumpCpu* live, u32 exc_ctx)
 {
   const std::optional<u32> state = Rd16(memory, t + TH_STATE);
   const std::optional<u32> prio = Rd32(memory, t + TH_PRIORITY);
@@ -4326,6 +4409,131 @@ void AppendThread(std::vector<std::string>* out, const GuestMemory& memory, u32 
     WalkBackChain(memory, *sp, DUMP_THREAD_FRAMES, &frames);
     AppendFrames(out, Format("thread 0x%08X ", t), frames);
   }
+  AppendThreadContext(out, memory, t, exc_ctx);
+}
+
+// The raw stack at the faulting context's r1, for a fault whose back-chain is broken (a leaf function, or a stack that was overwritten):
+//   exc stack sp=<r1>: EXC_STACK_ROWS rows of 8 words from r1, and
+//   exc stackscan sp=<r1> n=<k> [+<offset>:<word>,..]: the words up to EXC_SCAN_BYTES above r1 (or to the thread's stack base) that look like code
+//   addresses (TEXT_START..TEXT_END, word aligned), i.e. a guess at the return addresses of the callers.
+void AppendFaultStack(std::vector<std::string>* out, const GuestMemory& memory, u32 context)
+{
+  const std::optional<u32> sp = Rd32(memory, context + TH_CTX_GPR1);
+  if (!sp || (*sp & 3) != 0)
+    return;
+  for (u32 row = 0; row < EXC_STACK_ROWS; ++row)
+  {
+    std::string words;
+    for (u32 i = row * 8; i < row * 8 + 8; ++i)
+      words += " " + Hex32(Rd32(memory, *sp + 4 * i));
+    out->push_back(Format("exc stack sp=0x%08X +0x%02X:%s", *sp, row * 32, words.c_str()));
+  }
+  u64 limit = static_cast<u64>(*sp) + EXC_SCAN_BYTES;
+  if (const std::optional<u32> base = Rd32(memory, context + TH_STACK_BASE); base && *base > *sp && *base < limit)
+    limit = *base;
+  std::string list;
+  size_t found = 0;
+  for (u64 at = *sp; at < limit && found < EXC_SCAN_MAX; at += 4)
+  {
+    const std::optional<u32> word = Rd32(memory, static_cast<u32>(at));
+    if (!word)
+      break;
+    if (*word >= TEXT_START && *word < TEXT_END && (*word & 3) == 0)
+    {
+      list += Format("%s+0x%X:0x%08X", list.empty() ? "" : ",", static_cast<u32>(at - *sp), *word);
+      ++found;
+    }
+  }
+  out->push_back(Format("exc stackscan sp=0x%08X n=%zu [%s]", *sp, found, list.c_str()));
+}
+
+const char* ExceptionName(u32 error)
+{
+  // The vector order of the SDK (OSExceptionInit): 0x80000100 + 0x100 * n, with 15 = the Wii's memory protection error (the AI / ARAM / DI DMA report).
+  static const char* const names[16] = {"system_reset", "machine_check", "dsi",   "isi",       "external",          "alignment",
+                                        "program",      "fp_unavailable", "decrementer", "syscall", "trace",          "perf_monitor",
+                                        "breakpoint",   "system_management", "thermal", "memory_protection"};
+  return error < 16 ? names[error] : "unknown";
+}
+
+// The exception the OS halted on. Active when the CPU is in PPCHalt, in __OSUnhandledException, or has it on its back-chain (a racy dump taken
+// while the OS is still printing). In PPCHalt the arguments are live in r25..r28 (see the constants); elsewhere the error number is unknown
+// and DSISR / DAR come from the SPRs (the same values the vector read, unless a later DSI replaced them). The context is the OSContext the OS
+// was given (r26), or OSGetCurrentContext. Returns that context (0 = none) so the thread line can be marked. Lines:
+//   exc none halted=0
+//   exc error=<n> srr0= srr1= dsisr= dar= lr= r1= ctx= ctx_src=r26|cur_context args=r25_r28|spr name= insn=<word at srr0> ctx_state= last_int= last_int_srr0=
+//        spr_dsisr= spr_dar=
+//   exc ctxgpr r0..r7: ... (4 rows: r0..r31 of that context)
+u32 AppendException(std::vector<std::string>* out, const GuestMemory& memory, const DumpCpu& cpu, bool cpu_ok)
+{
+  const std::optional<u32> current = Rd32(memory, OS_CURRENT_CONTEXT);
+  const bool in_halt = cpu_ok && InRange(cpu.pc, PPC_HALT_START, PPC_HALT_SIZE);
+  bool active = in_halt;
+  if (cpu_ok && !active)
+  {
+    active = InRange(cpu.pc, OS_UNHANDLED_START, OS_UNHANDLED_SIZE) || InRange(cpu.lr, OS_UNHANDLED_START, OS_UNHANDLED_SIZE);
+    std::vector<StackFrame> frames;
+    WalkBackChain(memory, cpu.gpr[1], DUMP_PPC_FRAMES, &frames);
+    for (const StackFrame& frame : frames)
+      active = active || InRange(frame.lr, OS_UNHANDLED_START, OS_UNHANDLED_SIZE);
+  }
+  if (!active)
+  {
+    out->push_back("exc none halted=0");
+    return 0;
+  }
+  u32 context = current.value_or(0);
+  const char* context_src = "cur_context";
+  std::optional<u32> error;
+  u32 dsisr = cpu.dsisr;
+  u32 dar = cpu.dar;
+  const char* args = "spr";
+  if (in_halt)
+  {
+    if (DumpPtrOk(cpu.gpr[OS_UNHANDLED_REG_CONTEXT]))
+    {
+      context = cpu.gpr[OS_UNHANDLED_REG_CONTEXT];
+      context_src = "r26";
+    }
+    if (cpu.gpr[OS_UNHANDLED_REG_ERROR] < OS_MAX_EXCEPTION)
+      error = cpu.gpr[OS_UNHANDLED_REG_ERROR];
+    dsisr = cpu.gpr[OS_UNHANDLED_REG_DSISR];
+    dar = cpu.gpr[OS_UNHANDLED_REG_DAR];
+    args = "r25_r28";
+  }
+  const bool readable = DumpPtrOk(context);
+  std::optional<u32> srr0;
+  std::optional<u32> insn;
+  if (readable)
+  {
+    srr0 = Rd32(memory, context + TH_CTX_SRR0);
+    if (srr0)
+      insn = Rd32(memory, *srr0);
+  }
+  const std::optional<u32> last_int = Rd16(memory, OS_LAST_INTERRUPT);  // s16: shown as the signed value
+  std::string last_int_text = "?";
+  if (last_int)
+    last_int_text = Format("%d", (*last_int & 0x8000) != 0 ? static_cast<int>(*last_int) - 0x10000 : static_cast<int>(*last_int));
+  out->push_back(Format("exc error=%s srr0=%s srr1=%s dsisr=0x%08X dar=0x%08X lr=%s r1=%s ctx=0x%08X ctx_src=%s args=%s name=%s insn=%s "
+                        "ctx_state=%s last_int=%s last_int_srr0=%s spr_dsisr=0x%08X spr_dar=0x%08X",
+                        error ? Format("%u", *error).c_str() : "?", Hex32(srr0).c_str(), readable ? Hex32(Rd32(memory, context + TH_CTX_SRR1)).c_str() : "?", dsisr, dar,
+                        readable ? Hex32(Rd32(memory, context + TH_CTX_LR)).c_str() : "?",
+                        readable ? Hex32(Rd32(memory, context + TH_CTX_GPR1)).c_str() : "?", context, context_src, args,
+                        error ? ExceptionName(*error) : "?", Hex32(insn).c_str(),
+                        readable ? Hex16(Rd16(memory, context + TH_CTX_STATE)).c_str() : "?", last_int_text.c_str(),
+                        Hex32(Rd32(memory, OS_LAST_INTERRUPT_SRR0)).c_str(), cpu.dsisr, cpu.dar));
+  if (readable)
+  {
+    for (u32 row = 0; row < 32; row += 8)
+    {
+      std::string words;
+      for (u32 i = row; i < row + 8; ++i)
+        words += " " + Hex32(Rd32(memory, context + TH_CTX_GPR0 + 4 * i));
+      out->push_back(Format("exc ctxgpr r%u..r%u:%s", row, row + 7, words.c_str()));
+    }
+    AppendFaultStack(out, memory, context);
+  }
+  return readable ? context : 0;
 }
 
 void AppendOs(std::vector<std::string>* out, const GuestMemory& memory, const DumpCpu& cpu, bool cpu_ok)
@@ -4372,9 +4580,10 @@ void AppendOs(std::vector<std::string>* out, const GuestMemory& memory, const Du
     }
     t = *next;
   }
+  const u32 exc_ctx = AppendException(out, memory, cpu, cpu_ok);
   out->push_back(Format("threads n=%zu end=%s", threads.size(), end.c_str()));
   for (const u32 thread : threads)
-    AppendThread(out, memory, thread, cpu_ok && current && *current == thread ? &cpu : nullptr);
+    AppendThread(out, memory, thread, cpu_ok && current && *current == thread ? &cpu : nullptr, exc_ctx);
 }
 
 // One sleep queue {head, tail} at `address`: the first waiters (linked through OSThread.link) and the head thread's saved pc / lr.
@@ -4453,6 +4662,15 @@ void AppendQueues(std::vector<std::string>* out, const GuestMemory& memory)
         words += " " + Hex32(Rd32(memory, base + 4 * i));
       out->push_back(Format("words %s base=0x%08X +0x%02X:%s", queue == 0x8049D7B0u ? "dvd" : "nw4r_strm", base, 4 * row, words.c_str()));
     }
+  }
+  // The DVD library's own command log (dvd.c StampCommand 0x802D0624: a ring of 5 records x 5 words at 0x80460854, next record
+  // index in *0x8049D7E0, which the `words dvd` row at +0x40 shows): which DVD command the library stamped last, 32 words in 4 rows.
+  for (u32 row = 0; row < DUMP_DVDLOG_WORDS; row += 8)
+  {
+    std::string words;
+    for (u32 i = row; i < row + 8; ++i)
+      words += " " + Hex32(Rd32(memory, DUMP_DVDLOG_BASE + 4 * i));
+    out->push_back(Format("words dvdlog base=0x%08X +0x%02X:%s", DUMP_DVDLOG_BASE, 4 * row, words.c_str()));
   }
   // The IPC queue sits behind a pointer (*0x8049D984 + 0x2C); skipped when the pointer is not a valid object.
   const std::optional<u32> ipc = Rd32(memory, DUMP_IPC_POINTER);
@@ -5328,6 +5546,8 @@ public:
     out->msr = ppc.msr.Hex;
     out->srr0 = SRR0(ppc);
     out->srr1 = SRR1(ppc);
+    out->dsisr = ppc.spr[SPR_DSISR];
+    out->dar = ppc.spr[SPR_DAR];
     out->cr = ppc.cr.Get();
     out->exceptions = ppc.Exceptions;
     for (size_t i = 0; i < out->gpr.size(); ++i)

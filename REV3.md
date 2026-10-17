@@ -622,21 +622,40 @@ Dump format. Every line is `DUMP <reason> <line>` with `<reason>` = `arm`, `stal
 | line | content |
 |---|---|
 | `begin racy=<0\|1> frame=<last hook frame> last_cmd_age_ms=<ms since the last command> [note]` | start; `end` closes it |
-| `ppc pc= npc= lr= ctr= msr= srr0= srr1= cr= r1= r2= r13=` and `ppc r3=..r12= exceptions=` | registers and the pending exception bits (`PowerPCState::Exceptions`) |
+| `ppc pc= npc= lr= ctr= msr= srr0= srr1= cr= r1= r2= r13=`, `ppc r3=..r12= exceptions=` and `ppc r14=..r31=` | registers and the pending exception bits (`PowerPCState::Exceptions`: 0x1 decrementer, 0x4 external interrupt are just interrupts waiting while EE is off, not a fault). `r14..r31` are the callee-saved registers: halted in `__OSUnhandledException`, r25..r28 are its arguments |
 | `frame <i> sp=<sp> lr=<*(sp+4)>` | up to 16 frames of the back-chain from r1 (`*(sp)` is the next sp, `*(sp+4)` the saved LR word; stops at an unreadable, zero or unaligned sp or when the next sp does not increase). Frame 0's lr is the slot of the current function and stale unless it is in a call; from frame 1 on `lr` is a return address into the function that owns the frame |
 | `os cur_thread= cur_context= fpu_owner= sched_disable= run_queue_bits= resched= active_head=` | `*0x800000E4`, `*0x800000D4`, `*0x800000D8`, `*0x8049DAB8` (scheduler-disable count: nonzero while blocked is the freeze signature), `*0x8049DAC0`, `*0x8049DABC`, `*0x800000DC` |
 | `threads n=<count> end=null\|cycle(..)\|bad_ptr(..)\|max\|unreadable_link` | the active thread list from `*0x800000DC` via `+0x2FC` (at most 32) |
 | `thread 0x.. state= prio= suspend= queue= pc= lr= sp= canary=ok\|bad\|? stack=<end>..<base> [running=1 live=1]` | OSThread `+0x2C8` (u16: 1 ready, 2 running, 4 waiting, 8 moribund), `+0x2D0`, `+0x2CC`, `+0x2DC`; saved context pc `+0x198`, lr `+0x84`, gpr1 `+0x04`; canary = `*(+0x308) == 0xDEADBABE` at the stack end; the running thread (`*0x800000E4`) uses the live registers |
 | `thread 0x.. frame <i> sp= lr=` | 6 frames of the back-chain from the thread's sp |
+| `thread 0x.. ctx srr0= srr1= lr= ctr= cr= r1= ctx_state= in_stack=1\|0\|? frames=[lr0,lr1,..] [exc=1]` | the thread's SAVED OSContext (what the exception vector or the scheduler stored in the OSThread; offsets cited in the code comment: gpr[i] `+4*i`, CR `+0x80`, LR `+0x84`, CTR `+0x88`, SRR0 `+0x198`, SRR1 `+0x19C`, state u16 `+0x1A2`, bit 0 = FPRs saved, bit 1 = exception), for EVERY thread including the running one (whose `thread` line above uses the live registers). For the thread that took the unhandled exception this context IS the fault: srr0 = the faulting instruction, lr / r1 its caller. `in_stack` = r1 inside `[stack end, stack base]`; `frames` = `*(sp+4)` of up to 8 frames walked from the saved r1 (same convention as the `frame` lines); `exc=1` marks the context the OS reported (see `exc`) |
+| `exc none halted=0` or `exc error=<n\|?> srr0= srr1= dsisr= dar= lr= r1= ctx= ctx_src=r26\|cur_context args=r25_r28\|spr name= insn= ctx_state= last_int= last_int_srr0= spr_dsisr= spr_dar=` | the exception the OS halted on, right after the `os` line. Active when the CPU is in `PPCHalt` (0x802A18B8), in `__OSUnhandledException` (0x80315A0C) or has it on the back-chain. In `PPCHalt` the arguments are live: `error`/`ctx`/`dsisr`/`dar` = r25/r26/r27/r28 (`args=r25_r28`); otherwise `error=?` and DSISR / DAR come from the SPRs (`args=spr`; stale unless the last DSI is the fault) and `ctx` is `*0x800000D4`. `srr0 srr1 lr r1` are read from that context, `insn` = the word at its srr0, `name` = dsi / isi / alignment / program / memory_protection ..., `last_int` / `last_int_srr0` = the SDK's `__OSLastInterrupt` s16 (0x8049DA84) and its SRR0 (0x8049DA80; the "Last interrupt" line), `spr_*` = the SPR values always |
+| `exc ctxgpr r0..r7: ..` (4 rows) | r0..r31 of that context |
+| `exc stack sp=<r1> +0x00: ..` (2 rows) and `exc stackscan sp=<r1> n=<k> [+<off>:<word>,..]` | 16 raw words from the fault's r1, and the words in the 0x400 bytes above it (to the thread's stack base) that look like code addresses (0x80004000..0x80338BE0, word aligned): a guess at the callers when the back-chain is broken |
 | `queue <name> at= head= tail= waiters=<n>[<threads via +0x2E0>] head_state= head_pc= head_lr= [extra]` | sleep queues `gx_drawdone 0x8049D950` (+ `drawdone_flag` = byte `0x8049D958`), `vi_retrace 0x8049D4B8` (+ `retrace_count` `*0x8049D4DC`, `game_last_count` `*0x8049CF48`), `dvd 0x8049D7B0`, `nw4r_strm 0x8049D238`, `ax 0x8049D6A0`, `ipc` (`*0x8049D984 + 0x2C`; `queue ipc skipped: pointer ..` when the pointer is not in MEM1 / MEM2), `sc 0x804655A0` |
 | `game frame_loop_flags= main_state= no_gx=` | `*0x803C19C0`, `*0x803C11D4`, `*0x803C1A70` as raw u32 (a byte flag shows in the top byte) |
 | `hw pe pe_status= pe_token=` | MMIO 0x0C00100A (PE control / interrupt status) and 0x0C00100E (token) |
 | `hw cp status=idle\|busy\|breakpoint base= end= rd= wr= rw_dist= bp= gp_read= bp_enable= link= hi_wm= lo_wm=` | `GetCommandProcessor().GetFifo()`; `idle` = rw_dist 0, `breakpoint` = the breakpoint flag |
 | `hw pi cause= mask= fifo_base= fifo_end= fifo_wptr=` | processor interface interrupt cause / mask and the CPU write-gather FIFO pointers |
 | `words dvd base=.. +0x00: w w w w w w w w` (3 rows), `words nw4r_strm ...` | 24 raw words from 0x20 bytes before the DVD queue (`0x8049D7B0`) and before the nw4r stream queue (`0x8049D238`), i.e. the neighbouring SDK state, for decoding by hand |
+| `words dvdlog base=0x80460854 +0x00: ..` (4 rows) | the DVD library's command log: 5 records of 5 words (`StampCommand` 0x802D0624 writes the command and a tick; `*0x8049D7E0`, in the `words dvd` row at +0x40, is the next record), i.e. the last DVD commands the game's library issued |
 | `hw di disr= cmd0= dimar= dilength= dicr= wii_dicr= ios_di_busy=0\|1\|none\|skipped(racy)` | DVD interface registers (0x0C006000 status, 0x0C006008 command word 0, DIMAR, DILENGTH, DICR with TSTART in bit 0; 0x0D00601C on a Wii) and `DIDevice::IsBusy()` of IOS `/dev/di` (not read in a racy dump: it walks the IOS device map) |
 | `hw vi line= di0=` | vertical beam position (0x0C00202C) and display interrupt 0 (0x0C002030; bit 31 = flag, bit 28 = enable) |
 | `dsp csr= to_dsp_hi= ai_dma= src= blocks= left=` and `audio dsp=HLE\|LLE irq= events=<n> [type+cycles,..]` | the existing DSP / audio DMA line and the pending audio CoreTiming events; consistent dumps only (not racy, not at shutdown) |
+
+**Reading an unhandled exception halt** (`pc` in `PPCHalt` 0x802A18B8, `lr=0x80315CE4`). The SDK's exception vector (`OSExceptionVector` 0x80313420 +
+`OSDefaultExceptionHandler` 0x803134BC) saves the fault into the running thread's own OSContext, does `stwu r1,-8(r1)` on the faulting thread's stack
+(no stack switch; the LR slot of that 8 byte frame is never written, so junk like `0x00400002` above `__OSUnhandledException`'s frame is normal) and
+jumps to `__OSUnhandledException`, which prints "Unhandled Exception <n>" and `OSDumpContext(ctx)` (r0..r31, LR, CR, SRR0/1, GQRs, FPRs if the
+FP flag is set, a 16 frame back-chain from the saved r1), DSISR / DAR / TB, an explanation for DSI / ISI / alignment / program, and "Last
+interrupt", through `OSReport` -> MSL `__write_console` (0x8019E694, the UART; nobody reads it in Dolphin unless the game's symbol map is loaded
+and the OSREPORT_HLE log is on), then spins in `PPCHalt`. So the dump of a halted game shows: the live `pc/srr0` = the LAST INTERRUPT taken while
+the report was printing (inside `OSDumpContext`), the live r3..r12 = leftovers of the printf engine (r12 = `__write_console`; r4 = 0x10FC / 0x1104 in the two soak runs, probably the number of characters printed),
+and `exceptions=0x5` = decrementer + external interrupt pending with EE off. None of that is the fault. The fault is the `exc` line (error number,
+srr0, DAR) and the `thread .. ctx` line of the faulting thread. A frame is `stwu r1,-N`: frame sizes are in main.elf, so the faulting r1 can be
+matched to a call chain by adding them up (the stream thread of soak `20261016_212543` runs 8 and 9: root `0x909C9598`, `ThreadFunc` -0x10, `ExecuteTask` -0x20,
+`StrmDataLoadTask::Execute` -0x20, `LoadStreamData` -0x70, `DvdLockedFileStream::Read` -0x20, `DvdFileStream::Read` -0x10, `DVDReadPrio` -0x20 = `0x909C9488`,
+which is exactly the faulting r1). The dump stays address-only; `tools/rollback/soak.py --symbols` maps the addresses.
 
 How to use it: start Dolphin with `REV3_SYNCTEST=4` (K=4) as before, play until it freezes, wait 3 seconds (the stall dump needs 2 s plus
 the pause), then close Dolphin. The log then ends with the `DUMP stall` blocks and a `DUMP shutdown` block. Read the thread with `state=4`
@@ -644,7 +663,10 @@ and its `pc` / `lr` / `queue`, and the queue lines: a thread waiting in `gx_draw
 `vi_retrace` while `retrace_count` equals `game_last_count`, shows which event was lost. Variables: `REV3_SYNCTEST_DUMP=0` off,
 `REV3_SYNCTEST_DUMP_STALL_MS=n` (100..600000), `REV3_SYNCTEST_DUMP_PAUSE=0` (no CPU pause, racy dump only).
 
-Tests: `Rev3Rollback.FreezeDump*`, `BackChain*`, `RestoreHwLine*`, `Stall*`, `SyncTestDumpsAtArm*` (fake memory with a fake OS).
+Tests: `Rev3Rollback.FreezeDump*`, `BackChain*`, `RestoreHwLine*`, `Stall*`, `SyncTestDumpsAtArm*` (fake memory with a fake OS); the exception lines:
+`FreezeDumpPrintsEachThreadsSavedContext`, `FreezeDumpReportsTheUnhandledExceptionTheOsHaltedOn` (a synthetic OSThread holding a DSI context, CPU in
+`PPCHalt` with r25..r28 set; raw stack and stack scan), `FreezeDumpExceptionFallsBackWhenTheArgumentsAreNotUsable` (unusable r25 / r26, a racy dump
+inside `OSReport`, no readable context, no registers).
 
 ## Determinism kit (M1)
 

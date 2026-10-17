@@ -493,6 +493,8 @@ struct DumpCpu
   u32 srr1 = 0;
   u32 cr = 0;
   u32 exceptions = 0;  // PowerPCState::Exceptions (pending exception bits)
+  u32 dsisr = 0;       // SPR 18 / 19: what the last DSI / alignment exception left (the arguments __OSUnhandledException gets, unless a later one replaced them)
+  u32 dar = 0;
   std::array<u32, 32> gpr{};
 };
 
