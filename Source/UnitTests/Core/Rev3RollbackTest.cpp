@@ -5576,7 +5576,99 @@ TEST(Rev3Rollback, TheCountersAreReadFromTheV3DataBlock)
   ASSERT_TRUE(flags.ReadCounters(&iterations, &sounds));
   EXPECT_EQ(iterations, 1234u);
   EXPECT_EQ(sounds, 5u);
-  EXPECT_EQ(flags.SummaryFields(), " hide_protocol=3 hide_flags=1 hide_writes=0 hidden_iterations=1234 skipped_sounds=5");
+  EXPECT_EQ(flags.SummaryFields(),
+            " hide_protocol=3 hide_flags=1 hide_writes=0 hidden_iterations=1234 skipped_sounds=5 det_voice=0 voice_gate_hits=0 voice_gate_last=0");
+}
+
+TEST(Rev3Rollback, TheDetVoiceBitIsWrittenFromTheFirstProtocolThreeCommandAndKeptThroughEveryResimulation)
+{
+  FakeMemory mem;
+  FakeSink sink;
+  ResimHideFlags flags(mem, HIDE_DRAW, &sink, DET_VOICE);
+  EXPECT_EQ(flags.Always(), DET_VOICE);
+  flags.SetProtocol(PROTOCOL_VERSION_HIDE);  // the first command: the bit goes in before any resimulation, so the first voice of the match is decided alike
+  EXPECT_EQ(mem.U32(HIDE_FLAGS_ADDR), DET_VOICE);
+  EXPECT_EQ(flags.Writes(), 1u);
+  flags.Set(true);
+  EXPECT_EQ(mem.U32(HIDE_FLAGS_ADDR), DET_VOICE | HIDE_DRAW);
+  flags.Set(false);
+  EXPECT_EQ(mem.U32(HIDE_FLAGS_ADDR), DET_VOICE) << "ending a resimulation must not clear the voice bit";
+  flags.Set(false);
+  flags.SetProtocol(PROTOCOL_VERSION_HIDE);  // later commands write nothing
+  EXPECT_EQ(flags.Writes(), 3u);
+  EXPECT_EQ(sink.Count("NOTE det_voice on"), 1u);
+  EXPECT_EQ(sink.Count("NOTE resim hiding v3: flags=1 (draw)"), 1u);
+  EXPECT_FALSE(sink.Contains("NOTE resim hiding v3: flags=5"));
+}
+
+TEST(Rev3Rollback, TheDetVoiceBitIsNotWrittenWithProtocolTwoOrWhenOff)
+{
+  {
+    FakeMemory mem;
+    mem.SetU32(HIDE_FLAGS_ADDR, 0x77);
+    ResimHideFlags flags(mem, HIDE_DRAW, nullptr, DET_VOICE);
+    flags.SetProtocol(PROTOCOL_VERSION);
+    flags.Set(true);
+    flags.Set(false);
+    EXPECT_EQ(mem.U32(HIDE_FLAGS_ADDR), 0x77u);
+    EXPECT_EQ(flags.Writes(), 0u);
+  }
+  {
+    FakeMemory mem;
+    ResimHideFlags flags(mem, HIDE_DRAW, nullptr, 0);
+    flags.SetProtocol(PROTOCOL_VERSION_HIDE);
+    EXPECT_EQ(flags.Writes(), 0u);
+    EXPECT_EQ(mem.U32(HIDE_FLAGS_ADDR), 0u);
+    flags.Set(true);
+    flags.Set(false);
+    EXPECT_EQ(mem.U32(HIDE_FLAGS_ADDR), 0u);
+  }
+  {
+    FakeMemory mem;  // only the DET_VOICE bit is accepted as an always-on bit: a hiding bit is never left on outside a resimulation
+    ResimHideFlags flags(mem, HIDE_DRAW, nullptr, HIDE_ALL);
+    flags.SetProtocol(PROTOCOL_VERSION_HIDE);
+    EXPECT_EQ(flags.Always(), 0u);
+    EXPECT_EQ(mem.U32(HIDE_FLAGS_ADDR), 0u);
+  }
+}
+
+TEST(Rev3Rollback, VoiceGateHitsAreLoggedOncePerChangeOfTheCounterAndSummarised)
+{
+  FakeMemory mem;
+  FakeSink sink;
+  ResimHideFlags flags(mem, HIDE_DRAW, &sink, DET_VOICE);
+  flags.SetProtocol(PROTOCOL_VERSION_HIDE);
+  flags.SetProtocol(PROTOCOL_VERSION_HIDE);
+  EXPECT_EQ(sink.Count("VOICE gate"), 0u);
+  mem.SetU32(HIDE_VOICE_HITS_ADDR, 1);
+  mem.SetU32(HIDE_VOICE_LAST_ADDR, 8520);
+  flags.SetProtocol(PROTOCOL_VERSION_HIDE);
+  flags.SetProtocol(PROTOCOL_VERSION_HIDE);  // unchanged: no second line
+  EXPECT_EQ(sink.Count("VOICE gate"), 1u);
+  EXPECT_TRUE(sink.Contains("VOICE gate: a voice start found move_flags2 bit 0x10000 set with a live voice slot at frame 8520 (hits=1; det_voice on"));
+  mem.SetU32(HIDE_VOICE_HITS_ADDR, 3);  // two hits between two commands: one line, the latest frame
+  mem.SetU32(HIDE_VOICE_LAST_ADDR, 8530);
+  flags.SetProtocol(PROTOCOL_VERSION_HIDE);
+  EXPECT_EQ(sink.Count("VOICE gate"), 2u);
+  u32 hits = 0, last = 0;
+  ASSERT_TRUE(flags.ReadVoiceGate(&hits, &last));
+  EXPECT_EQ((hits << 16) | last, (3u << 16) | 8530u);
+  EXPECT_NE(flags.SummaryFields().find(" det_voice=1 voice_gate_hits=3 voice_gate_last=8530"), std::string::npos) << flags.SummaryFields();
+}
+
+TEST(Rev3Rollback, VoiceGateLinesAreCappedAndSayWhenDetVoiceIsOff)
+{
+  FakeMemory mem;
+  FakeSink sink;
+  ResimHideFlags flags(mem, HIDE_DRAW, &sink, 0);
+  flags.SetProtocol(PROTOCOL_VERSION_HIDE);
+  for (u32 i = 1; i <= 1000; ++i)
+  {
+    mem.SetU32(HIDE_VOICE_HITS_ADDR, i);
+    flags.SetProtocol(PROTOCOL_VERSION_HIDE);
+  }
+  EXPECT_EQ(sink.Count("VOICE gate"), 400u);
+  EXPECT_TRUE(sink.Contains("det_voice off: Rev3 drops the voice if the slot is live"));
 }
 
 TEST(Rev3Rollback, ResimHidingDrivesTheFlagWordFromTheRestoredReplyToTheLastResimulatedCall)

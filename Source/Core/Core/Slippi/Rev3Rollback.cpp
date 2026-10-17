@@ -209,16 +209,37 @@ bool ParseResimHide(const std::string& text, u32* flags)
   return true;
 }
 
-ResimHideFlags::ResimHideFlags(GuestMemory& memory, u32 flags, Sink* log) : m_memory(memory), m_log(log), m_flags(flags & HIDE_ALL)
+ResimHideFlags::ResimHideFlags(GuestMemory& memory, u32 flags, Sink* log, u32 always)
+    : m_memory(memory), m_log(log), m_flags(flags & HIDE_ALL), m_always(always & DET_VOICE)
 {
 }
 
+// The most VOICE lines one run writes: a hit needs the bit set while a voice is live, a few per round, plus the resimulated repeats.
+constexpr u32 MAX_VOICE_LINES = 400;
+
 void ResimHideFlags::SetProtocol(u8 protocol)
 {
-  if (protocol == m_protocol)
-    return;
-  m_protocol = protocol;
-  m_known = false;  // another hook: nobody knows what the word holds
+  if (protocol != m_protocol)
+  {
+    m_protocol = protocol;
+    m_known = false;  // another hook: nobody knows what the word holds
+    if (m_protocol == PROTOCOL_VERSION_HIDE && m_always != 0)
+      Set(m_hidden);  // the always-on bits go in now, before the first voice of the match (Set writes hidden ? flags : 0, plus them)
+  }
+  // Voice gate hits (the game found the bit set with a live voice slot): one line per change of the counter, as seen at the next command. The hit happens in the
+  // logic of frame N, after N's command, and `last` is the hook counter then = N + 1 = the frame whose START state holds the bit (a DESYNC first_diff frame).
+  u32 hits = 0;
+  u32 last = 0;
+  if (m_protocol == PROTOCOL_VERSION_HIDE && m_log != nullptr && ReadVoiceGate(&hits, &last) && hits != m_voice_hits_seen)
+  {
+    m_voice_hits_seen = hits;
+    if (m_voice_lines < MAX_VOICE_LINES)
+    {
+      ++m_voice_lines;
+      m_log->Line(Format("VOICE gate: a voice start found move_flags2 bit 0x10000 set with a live voice slot at frame %u (hits=%u; %s)", last, hits,
+                         (m_always & DET_VOICE) != 0 ? "det_voice on: treated as clear, same on both machines" : "det_voice off: Rev3 drops the voice if the slot is live"));
+    }
+  }
 }
 
 void ResimHideFlags::Set(bool hidden)
@@ -234,7 +255,7 @@ void ResimHideFlags::Set(bool hidden)
     }
     return;
   }
-  const u32 value = hidden ? m_flags : 0;
+  const u32 value = (hidden ? m_flags : 0) | m_always;
   if (m_known && m_word == value)
     return;
   u8 raw[4];
@@ -244,15 +265,21 @@ void ResimHideFlags::Set(bool hidden)
   m_known = true;
   m_word = value;
   ++m_writes;
-  if (value != 0 && !m_noted_on)
+  if (value != 0 && (value & HIDE_ALL) != 0 && !m_noted_on)
   {
     m_noted_on = true;
     if (m_log != nullptr)
     {
-      m_log->Line(Format("NOTE resim hiding v3: flags=%u (%s%s%s) written to 0x%08X while a resimulation runs", value,
-                         (value & HIDE_DRAW) != 0 ? "draw" : "", value == HIDE_ALL ? "+" : "", (value & HIDE_SOUND) != 0 ? "sound" : "",
+      m_log->Line(Format("NOTE resim hiding v3: flags=%u (%s%s%s) written to 0x%08X while a resimulation runs", value & HIDE_ALL,
+                         (value & HIDE_DRAW) != 0 ? "draw" : "", (value & HIDE_ALL) == HIDE_ALL ? "+" : "", (value & HIDE_SOUND) != 0 ? "sound" : "",
                          HIDE_FLAGS_ADDR));
     }
+  }
+  if ((value & DET_VOICE) != 0 && !m_noted_det)
+  {
+    m_noted_det = true;
+    if (m_log != nullptr)
+      m_log->Line(Format("NOTE det_voice on: FLAGS bit 2 written to 0x%08X for the whole session (the voice start no longer depends on the sound slot table)", HIDE_FLAGS_ADDR));
   }
 }
 
@@ -269,14 +296,30 @@ bool ResimHideFlags::ReadCounters(u32* hidden_iterations, u32* skipped_sounds) c
   return true;
 }
 
+bool ResimHideFlags::ReadVoiceGate(u32* hits, u32* last_frame) const
+{
+  if (m_protocol != PROTOCOL_VERSION_HIDE)
+    return false;
+  u8 a[4];
+  u8 b[4];
+  if (!m_memory.Read(HIDE_VOICE_HITS_ADDR, a, sizeof(a)) || !m_memory.Read(HIDE_VOICE_LAST_ADDR, b, sizeof(b)))
+    return false;
+  *hits = ReadBE32(a);
+  *last_frame = ReadBE32(b);
+  return true;
+}
+
 std::string ResimHideFlags::SummaryFields() const
 {
   u32 iterations = 0;
   u32 sounds = 0;
   if (!ReadCounters(&iterations, &sounds))
     return Format(" hide_protocol=%u hide_flags=%u hide_writes=%u", m_protocol, m_flags, m_writes);
-  return Format(" hide_protocol=%u hide_flags=%u hide_writes=%u hidden_iterations=%u skipped_sounds=%u", m_protocol, m_flags, m_writes, iterations,
-                sounds);
+  u32 hits = 0;
+  u32 last = 0;
+  ReadVoiceGate(&hits, &last);
+  return Format(" hide_protocol=%u hide_flags=%u hide_writes=%u hidden_iterations=%u skipped_sounds=%u det_voice=%u voice_gate_hits=%u voice_gate_last=%u", m_protocol,
+                m_flags, m_writes, iterations, sounds, (m_always & DET_VOICE) != 0 ? 1u : 0u, hits, last);
 }
 
 // ---- (2) whitelist ------------------------------------------------------------------------------------------------------
@@ -6218,6 +6261,17 @@ u32 ReadResimHide(Sink& log)
   return flags;
 }
 
+// REV3_DET_VOICE: 1 (default) = FLAGS bit 2 on for the whole session; 0 = Rev3's own voice gate (to reproduce the desync, or an A/B run). Returns DET_VOICE or 0.
+u32 ReadDetVoice(Sink& log)
+{
+  const std::string text = GetEnv("REV3_DET_VOICE");
+  if (text.empty() || text == "1")
+    return DET_VOICE;
+  if (text != "0")
+    log.Line("ERROR REV3_DET_VOICE=" + text + " is neither 0 nor 1; using 1");
+  return text == "0" ? 0u : DET_VOICE;
+}
+
 // Builds module.synctest from the REV3_SYNCTEST_* variables (K frames; in netplay K = MAXR + 1 so the ring has MAXR + 2 slots) and the
 // REV3_WHITELIST seed. False (logged): not usable; module.synctest stays null.
 bool BuildSyncTest(Module& module, Core::System& system, long k, bool net)
@@ -6434,7 +6488,7 @@ bool BuildSyncTest(Module& module, Core::System& system, long k, bool net)
   if (!net && GetEnv("REV3_SYNCTEST_HIDE") == "1")
   {
     const u32 flags = ReadResimHide(sink);
-    module.hide = std::make_unique<ResimHideFlags>(*module.memory, flags, &sink);
+    module.hide = std::make_unique<ResimHideFlags>(*module.memory, flags, &sink, ReadDetVoice(sink));
     module.synctest->SetResimHide(module.hide.get());
     sink.Line(Format("NOTE REV3_SYNCTEST_HIDE=1: resim hiding flags=%u are set during every resimulation (needs hook protocol 3)", flags));
   }
@@ -6600,7 +6654,7 @@ void InitializeNet(Module& module, Core::System& system)
     return Core::GetState(*sys) == Core::State::Stopping || sys->GetCPU().GetState() == CPU::State::PowerDown;
   };
   env.hello = CollectHelloInputs(stable_crc);
-  module.hide = std::make_unique<ResimHideFlags>(*module.memory, ReadResimHide(log), &log);
+  module.hide = std::make_unique<ResimHideFlags>(*module.memory, ReadResimHide(log), &log, ReadDetVoice(log));
   module.hider = std::make_unique<DolphinResimHider>(system, module.hide.get());
   env.hider = module.hider.get();
   module.pacer = std::make_unique<DolphinPacer>(system);

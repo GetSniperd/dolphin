@@ -437,6 +437,13 @@ constexpr u32 HIDE_SOUNDS_ADDR = 0x800029E8;       // rbhook.V3_DATA +8: sound s
 constexpr u32 HIDE_DRAW = 1;                       // FLAGS bit 0
 constexpr u32 HIDE_SOUND = 2;                      // FLAGS bit 1
 constexpr u32 HIDE_ALL = HIDE_DRAW | HIDE_SOUND;
+// FLAGS bit 2, hook protocol 3 with the voice gate patch (rev3-mod rbhook.FLAG_DET_VOICE): the game's voice start (zz_80099ae0_) ignores the sound slot
+// table when it decides whether to drop a new voice. Rev3 drops it when the fighter's move_flags2 bit 0x10000 is set AND the fighter's previous voice is still
+// in a slot, and the slot table follows the audio engine's timing, which a rollback does not reproduce: the soak of build e329af6 desynced five times on exactly
+// that bit. Unlike the hiding bits this one is NOT tied to a resimulation: it is on for the whole session (both machines must decide alike at every frame).
+constexpr u32 DET_VOICE = 4;
+constexpr u32 HIDE_VOICE_HITS_ADDR = 0x800029EC;   // rbhook.V3_DATA +0xC: times the gate found the bit set with a live voice slot (Rev3 would have dropped the voice)
+constexpr u32 HIDE_VOICE_LAST_ADDR = 0x800029F0;   // rbhook.V3_DATA +0x10: the hook's frame counter at the last such time (= the frame whose start state the bit is in)
 constexpr u32 HIDE_DEFAULT = HIDE_DRAW;            // REV3_RESIM_HIDE unset: draw only (sounds as v1) until `all` has been listened to (resim_skip.md 3.4)
 
 // REV3_RESIM_HIDE: "" -> HIDE_DEFAULT; "0" / "off" -> 0; "1" / "draw"; "2" / "sound"; "3" / "all" (case does not matter). False (and *flags =
@@ -446,10 +453,13 @@ bool ParseResimHide(const std::string& text, u32* flags);
 class ResimHideFlags
 {
 public:
-  // `flags`: what Set(true) writes (0 = hiding by flag is off). `log` (optional, not owned): the one-time NOTE lines.
-  ResimHideFlags(GuestMemory& memory, u32 flags, Sink* log = nullptr);
-  // The protocol of the command just received (every command; the first one decides). Only protocol 3 has a flag word.
+  // `flags`: what Set(true) writes (0 = hiding by flag is off). `log` (optional, not owned): the one-time NOTE lines. `always` (DET_VOICE or 0): bits written
+  // with every value of the word, resimulating or not, from the first protocol 3 command on.
+  ResimHideFlags(GuestMemory& memory, u32 flags, Sink* log = nullptr, u32 always = 0);
+  // The protocol of the command just received (every command; the first one decides). Only protocol 3 has a flag word. Also writes the `always` bits
+  // when the protocol becomes 3, and logs every new voice gate hit (the game found the bit set with a live voice slot) it sees in the counters.
   void SetProtocol(u8 protocol);
+  u32 Always() const { return m_always; }
   u8 Protocol() const { return m_protocol; }
   u32 Flags() const { return m_flags; }
   // True: write the flags; false: write 0. Does nothing with protocol 2, flags 0, or when that value is already in the word. CPU thread.
@@ -458,13 +468,19 @@ public:
   u32 Writes() const { return m_writes; }
   // The two guest counters; false when the protocol is not 3 or the memory is not readable.
   bool ReadCounters(u32* hidden_iterations, u32* skipped_sounds) const;
-  // " hide_protocol=3 hide_flags=1 hide_writes=4 hidden_iterations=12 skipped_sounds=0" (leading space), appended to SUMMARY lines.
+  // The voice gate's counter and the hook frame of its last hit; false when the protocol is not 3 or the memory is not readable.
+  bool ReadVoiceGate(u32* hits, u32* last_frame) const;
+  // " hide_protocol=3 hide_flags=1 hide_writes=4 hidden_iterations=12 skipped_sounds=0 det_voice=1 voice_gate_hits=3 voice_gate_last=8519" (leading space),
+  // appended to SUMMARY lines.
   std::string SummaryFields() const;
 
 private:
   GuestMemory& m_memory;
   Sink* m_log;
   u32 m_flags;
+  u32 m_always = 0;           // DET_VOICE or 0: ORed into every value written
+  u32 m_voice_hits_seen = 0;  // the counter value the last log line reported
+  u32 m_voice_lines = 0;      // VOICE lines written (capped)
   u8 m_protocol = 0;          // 0 = no command yet
   bool m_hidden = false;      // the latest Set()
   bool m_known = false;       // m_word is what the guest word holds
@@ -472,6 +488,7 @@ private:
   u32 m_writes = 0;
   bool m_noted_on = false;
   bool m_noted_v2 = false;
+  bool m_noted_det = false;
 };
 
 // ---- freeze dump (REV3_SYNCTEST_DUMP) ---------------------------------------------------------------------------------------
