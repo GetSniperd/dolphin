@@ -5523,7 +5523,9 @@ TEST(Rev3Rollback, ResimHideEnvValuesParse)
     bool ok;
   };
   const Case cases[] = {{"", HIDE_DRAW, true}, {"0", 0, true},   {"off", 0, true},  {"1", 1, true},   {"draw", 1, true}, {"DRAW", 1, true},
-                        {"2", 2, true},        {"sound", 2, true}, {"3", 3, true},  {"all", 3, true},  {"4", 1, false},   {"hide", 1, false}};
+                        {"2", 2, true},        {"sound", 2, true}, {"3", 3, true},  {"all", 3, true},  {"4", 1, false},   {"hide", 1, false},
+                        {"9", 9, true},        {"fast", 9, true},  {"FastAll", 11, true}, {"11", 11, true}, {"17", 17, true}, {"keep3d", 17, true},
+                        {"keep3dall", 19, true}, {"19", 19, true}, {"8", 1, false}, {"16", 1, false}, {"25", 1, false}, {"10", 1, false}};
   for (const Case& c : cases)
   {
     u32 flags = 99;
@@ -5558,7 +5560,7 @@ TEST(Rev3Rollback, TheFlagWordIsWrittenBigEndianWhileHiddenAndClearedAfterwards)
 
 TEST(Rev3Rollback, EachFlagValueWritesItsOwnBits)
 {
-  for (const u32 want : {0u, 1u, 2u, 3u})
+  for (const u32 want : {0u, 1u, 2u, 3u, 9u, 11u, 17u, 19u})
   {
     FakeMemory mem;
     ResimHideFlags flags(mem, want);
@@ -5599,7 +5601,49 @@ TEST(Rev3Rollback, TheCountersAreReadFromTheV3DataBlock)
   EXPECT_EQ(iterations, 1234u);
   EXPECT_EQ(sounds, 5u);
   EXPECT_EQ(flags.SummaryFields(),
-            " hide_protocol=3 hide_flags=1 hide_writes=0 hidden_iterations=1234 skipped_sounds=5 det_voice=0 voice_gate_hits=0 voice_gate_last=0");
+            " hide_protocol=3 hide_flags=1 hide_writes=0 hidden_iterations=1234 skipped_sounds=5 det_voice=0 voice_gate_hits=0 voice_gate_last=0 hidden_copies=0 "
+            "hidden_presents=0");
+  mem.SetU32(HIDE_COPIES_ADDR, 1200);
+  mem.SetU32(HIDE_PRESENTS_ADDR, 1199);
+  u32 copies = 0, presents = 0;
+  ASSERT_TRUE(flags.ReadDrawCounters(&copies, &presents));
+  EXPECT_EQ(copies, 1200u);
+  EXPECT_EQ(presents, 1199u);
+  EXPECT_NE(flags.SummaryFields().find(" hidden_copies=1200 hidden_presents=1199"), std::string::npos) << flags.SummaryFields();
+}
+
+TEST(Rev3Rollback, TheDrawModeBitsAreWrittenWithTheHideAndSaidOnce)
+{
+  FakeMemory mem;
+  FakeSink sink;
+  ResimHideFlags flags(mem, HIDE_DRAW | HIDE_FAST, &sink, DET_VOICE);
+  flags.SetProtocol(PROTOCOL_VERSION_HIDE);
+  flags.Set(true);
+  EXPECT_EQ(mem.U32(HIDE_FLAGS_ADDR), HIDE_DRAW | HIDE_FAST | DET_VOICE);
+  flags.Set(false);
+  EXPECT_EQ(mem.U32(HIDE_FLAGS_ADDR), DET_VOICE) << "the mode bits go with the hide, only the voice bit stays";
+  flags.Set(true);
+  EXPECT_TRUE(sink.Contains("NOTE resim hiding v3: draw mode fast (flags 9)"));
+  EXPECT_EQ(sink.Count("NOTE resim hiding v3: draw mode"), 1u);
+
+  FakeMemory mem2;
+  FakeSink sink2;
+  ResimHideFlags keep(mem2, HIDE_ALL | HIDE_KEEP_3D, &sink2);
+  keep.SetProtocol(PROTOCOL_VERSION_HIDE);
+  keep.Set(true);
+  EXPECT_EQ(mem2.U32(HIDE_FLAGS_ADDR), 19u);
+  EXPECT_TRUE(sink2.Contains("NOTE resim hiding v3: draw mode keep3d (flags 19)"));
+
+  FakeMemory mem3;
+  FakeSink sink3;
+  ResimHideFlags plain(mem3, HIDE_DRAW, &sink3);
+  plain.SetProtocol(PROTOCOL_VERSION_HIDE);
+  plain.Set(true);
+  EXPECT_EQ(mem3.U32(HIDE_FLAGS_ADDR), 1u);
+  EXPECT_EQ(sink3.Count("NOTE resim hiding v3: draw mode"), 0u) << "the default mode is not a note";
+  EXPECT_EQ(HIDE_MODE_MASK, 24u);
+  EXPECT_EQ(HIDE_COPIES_ADDR, 0x800029F8u);
+  EXPECT_EQ(HIDE_PRESENTS_ADDR, 0x800029FCu);
 }
 
 TEST(Rev3Rollback, TheDetVoiceBitIsWrittenFromTheFirstProtocolThreeCommandAndKeptThroughEveryResimulation)

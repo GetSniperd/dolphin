@@ -1173,18 +1173,25 @@ rev3-mod `docs/resim_skip.md` is the decision record (what is patched in the gam
   (`NOTE resim hiding: the hook speaks protocol 2 ...` once, if hiding was wanted).
 - **SyncTest.** `REV3_SYNCTEST_HIDE=1` makes SyncTest set the same flags (`REV3_RESIM_HIDE`) from its RESTORED reply to the reply of its last resimulated frame (cleared when the history
   is reset and in `Finish`), so a SyncTest run tests the patches: the hidden resimulation must reproduce the drawn original run (no `MISMATCH`).
-- **Counters.** The SUMMARY lines (SyncTest and netplay) end with ` hide_protocol=3 hide_flags=1 hide_writes=n hidden_iterations=n skipped_sounds=n`: the u32 counters at
-  `0x800029E4` (main-loop iterations that skipped drawing) and `0x800029E8` (sound starts skipped). `hidden_iterations` should be about the sum of (N - g) over the rollbacks;
-  `skipped_sounds` is 0 unless bit 1 is set.
+- **Counters.** The SUMMARY lines (SyncTest and netplay) end with ` hide_protocol=3 hide_flags=1 hide_writes=n hidden_iterations=n skipped_sounds=n ... hidden_copies=n hidden_presents=n`:
+  the u32 counters at `0x800029E4` (main-loop iterations that skipped drawing) and `0x800029E8` (sound starts skipped). `hidden_iterations` should be about the sum of (N - g) over the
+  rollbacks; `skipped_sounds` is 0 unless bit 1 is set. `hidden_copies` / `hidden_presents` (`0x800029F8` / `0x800029FC`, rbhook timing-faithful hide, Oct 17; they read 0 with an older
+  rbhook) count the EFB copies and `VISetNextFrameBuffer` calls skipped in hidden iterations: in the default draw mode both are about `hidden_iterations` (every hidden iteration took the
+  game's draw arm, so it also waited for the retrace), in `fast` mode both are 0.
+- **Draw modes (Oct 17).** FLAGS bits 3-4 pick how a hidden iteration spends emulated time (rev3-mod `docs/resim_skip.md` section 9). Default (`1` / `3`): the game's own end-of-frame and
+  present code run as in a drawn frame, only the 3D scene, `GXCopyDisp` and `VISetNextFrameBuffer` are skipped, so `GXDrawDone`, `VIFlush`, `VIWaitForRetrace` (and the 30 fps retrace
+  spin) and `G3dReset` stay and a resimulated frame takes the same emulated time as the first run. `9` / `fast`, `11` / `fastall`: the first v3 hide (the game's skip arm: no waits;
+  A/B for the soak). `17` / `keep3d`, `19` / `keep3dall`: the 3D scene is drawn too, only the copy and the present are skipped. The fork's own resimulation changes only host time:
+  `Core::SetIsThrottlerResimDisabled` makes `Throttle()` return and `EndResim()` moves the throttle reference cycle; no emulated event, VI field or cycle count is touched.
 
 | variable | default | meaning |
 |---|---|---|
-| `REV3_RESIM_HIDE=0\|1\|2\|3` (or `off\|draw\|sound\|all`) | 1 (draw) | the flags written while a resimulation runs: bit 0 no 3D draw / EFB copy / presenting, bit 1 the sound start funnel returns "started" without starting. 0 = the v1 hiding only. A bad value is an `ERROR` line and `draw`. Needs a hook built with `rbhook --protocol 3`. Local to a machine (not in HELLO; the protocol is) |
+| `REV3_RESIM_HIDE=0\|1\|2\|3\|9\|11\|17\|19` (or `off\|draw\|sound\|all\|fast\|fastall\|keep3d\|keep3dall`) | 1 (draw) | the flags written while a resimulation runs: bit 0 no EFB copy / presenting (and no 3D scene unless `keep3d`), bit 1 the sound start funnel returns "started" without starting, bits 3-4 the draw mode (8 = fast hide, 16 = keep the 3D scene; see "Draw modes"). 0 = the v1 hiding only. A bad value is an `ERROR` line and `draw`. Needs a hook built with `rbhook --protocol 3`. Local to a machine (not in HELLO; the protocol is) |
 | `REV3_SYNCTEST_HIDE=1` | 0 | SyncTest only: set the flags during its resimulations |
 
 What D runs: regenerate the INI with `--protocol 3` (rev3-mod `docs/resim_skip.md` section 7), then SyncTest K = 1..7 with `REV3_SYNCTEST_HIDE=1`, then loopback netplay with the netsim,
 then `REV3_RESIM_HIDE=all` for the listening test.
-Tests: `ProtocolsTwoAndThree*`, `ResimHideEnvValuesParse`, `TheFlagWordIs*`, `EachFlagValue*`, `ProtocolTwoNeverTouchesTheFlagWord*`, `TheCountersAreRead*`, `ResimHidingDrivesTheFlagWord*`,
+Tests: `ProtocolsTwoAndThree*`, `ResimHideEnvValuesParse`, `TheFlagWordIs*`, `EachFlagValue*`, `TheDrawModeBits*`, `ProtocolTwoNeverTouchesTheFlagWord*`, `TheCountersAreRead*`, `ResimHidingDrivesTheFlagWord*`,
 `SyncTestSetsTheFlagsOnlyWhileItResimulates`, `SyncTestWithHooksOfProtocolTwo*`, `TheHideCountersGoIntoTheNetSummaryNote`, `Rev3NetLink.HelloCarriesTheHookProtocol*`.
 Not done: the optional refinement of resim_skip.md 5.4 (clear bit 0 one call earlier so the corrected frame N - 1 is drawn).
 

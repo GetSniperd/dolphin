@@ -206,13 +206,21 @@ bool ParseResimHide(const std::string& text, u32* flags)
     *flags = HIDE_SOUND;
   else if (lower == "3" || lower == "all")
     *flags = HIDE_ALL;
+  else if (lower == "9" || lower == "fast")
+    *flags = HIDE_DRAW | HIDE_FAST;
+  else if (lower == "11" || lower == "fastall")
+    *flags = HIDE_ALL | HIDE_FAST;
+  else if (lower == "17" || lower == "keep3d")
+    *flags = HIDE_DRAW | HIDE_KEEP_3D;
+  else if (lower == "19" || lower == "keep3dall")
+    *flags = HIDE_ALL | HIDE_KEEP_3D;
   else
     return false;
   return true;
 }
 
 ResimHideFlags::ResimHideFlags(GuestMemory& memory, u32 flags, Sink* log, u32 always)
-    : m_memory(memory), m_log(log), m_flags(flags & HIDE_ALL), m_always(always & DET_VOICE)
+    : m_memory(memory), m_log(log), m_flags(flags & (HIDE_ALL | HIDE_MODE_MASK)), m_always(always & DET_VOICE)
 {
 }
 
@@ -277,6 +285,16 @@ void ResimHideFlags::Set(bool hidden)
                          HIDE_FLAGS_ADDR));
     }
   }
+  if ((value & HIDE_MODE_MASK) != 0 && !m_noted_mode)
+  {
+    m_noted_mode = true;
+    if (m_log != nullptr)
+    {
+      m_log->Line(Format("NOTE resim hiding v3: draw mode %s (flags %u): %s", (value & HIDE_FAST) != 0 ? "fast" : "keep3d", value & (HIDE_ALL | HIDE_MODE_MASK),
+                         (value & HIDE_FAST) != 0 ? "a hidden frame takes the game's skip arm (no GXDrawDone, no retrace wait)" :
+                                                    "a hidden frame runs the 3D scene too; only the EFB copy and the present are skipped"));
+    }
+  }
   if ((value & DET_VOICE) != 0 && !m_noted_det)
   {
     m_noted_det = true;
@@ -311,6 +329,19 @@ bool ResimHideFlags::ReadVoiceGate(u32* hits, u32* last_frame) const
   return true;
 }
 
+bool ResimHideFlags::ReadDrawCounters(u32* copies_skipped, u32* presents_skipped) const
+{
+  if (m_protocol != PROTOCOL_VERSION_HIDE)
+    return false;
+  u8 a[4];
+  u8 b[4];
+  if (!m_memory.Read(HIDE_COPIES_ADDR, a, sizeof(a)) || !m_memory.Read(HIDE_PRESENTS_ADDR, b, sizeof(b)))
+    return false;
+  *copies_skipped = ReadBE32(a);
+  *presents_skipped = ReadBE32(b);
+  return true;
+}
+
 std::string ResimHideFlags::SummaryFields() const
 {
   u32 iterations = 0;
@@ -320,8 +351,13 @@ std::string ResimHideFlags::SummaryFields() const
   u32 hits = 0;
   u32 last = 0;
   ReadVoiceGate(&hits, &last);
-  return Format(" hide_protocol=%u hide_flags=%u hide_writes=%u hidden_iterations=%u skipped_sounds=%u det_voice=%u voice_gate_hits=%u voice_gate_last=%u", m_protocol,
-                m_flags, m_writes, iterations, sounds, (m_always & DET_VOICE) != 0 ? 1u : 0u, hits, last);
+  // The draw counters exist from rbhook's timing-faithful hide on (the same words of the v3 data block were free before and read 0): copies = EFB copies skipped, presents =
+  // VISetNextFrameBuffer calls skipped. With the default mode both are about hidden_iterations (one per hidden iteration that took the game's draw arm); in fast mode they are 0.
+  u32 copies = 0;
+  u32 presents = 0;
+  ReadDrawCounters(&copies, &presents);
+  return Format(" hide_protocol=%u hide_flags=%u hide_writes=%u hidden_iterations=%u skipped_sounds=%u det_voice=%u voice_gate_hits=%u voice_gate_last=%u hidden_copies=%u hidden_presents=%u",
+                m_protocol, m_flags, m_writes, iterations, sounds, (m_always & DET_VOICE) != 0 ? 1u : 0u, hits, last, copies, presents);
 }
 
 // ---- (2) whitelist ------------------------------------------------------------------------------------------------------
@@ -6810,7 +6846,7 @@ u32 ReadResimHide(Sink& log)
   const std::string text = GetEnv("REV3_RESIM_HIDE");
   if (!ParseResimHide(text, &flags))
   {
-    log.Line("ERROR REV3_RESIM_HIDE=" + text + " is none of 0|off, 1|draw, 2|sound, 3|all; using draw");
+    log.Line("ERROR REV3_RESIM_HIDE=" + text + " is none of 0|off, 1|draw, 2|sound, 3|all, 9|fast, 11|fastall, 17|keep3d, 19|keep3dall; using draw");
     ERROR_LOG_FMT(SLIPPI, "Rev3: ignoring REV3_RESIM_HIDE={}", text);
   }
   return flags;

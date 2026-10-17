@@ -48,7 +48,9 @@
 //                            misses (see "restore verify" below, REV3.md "Restore verify"). Also REV3_RB_VERIFY_EVERY / _SLOTS / _HEAL / _STACK_BELOW /
 //                            _IGNORE (ParseVerifyEnv)
 //   REV3_RESIM_HIDE=0|1|2|3  (or off|draw|sound|all) hook protocol 3 only (M6): what the game hides while a resimulation runs, written as a u32 to
-//                            0x8000241C (default 1 = draw; see "hiding resimulated frames" below). Netplay always; SyncTest with REV3_SYNCTEST_HIDE=1
+//                            0x8000241C (default 1 = draw; see "hiding resimulated frames" below). Netplay always; SyncTest with REV3_SYNCTEST_HIDE=1.
+//                            Draw modes (rev3-mod resim_skip.md section 9): 9|fast, 11|fastall = the first v3 hide (no waits in a hidden frame), 17|keep3d,
+//                            19|keep3dall = hide the picture but run the 3D scene too; plain 1 / 3 are the timing-faithful hide (default)
 //   REV3_RB_WRITE_TRACK=0|1|2  host write tracking (default 0 = off): the pages the game writes are found by write-protecting guest RAM in every host
 //                            view and catching the first write (instead of hashing pages), so the snapshot set grows WITHOUT dropping the
 //                            snapshot history; 2 = also keep the hash scan and report every page it finds that no fault announced
@@ -460,6 +462,15 @@ constexpr u32 HIDE_SOUNDS_ADDR = 0x800029E8;       // rbhook.V3_DATA +8: sound s
 constexpr u32 HIDE_DRAW = 1;                       // FLAGS bit 0
 constexpr u32 HIDE_SOUND = 2;                      // FLAGS bit 1
 constexpr u32 HIDE_ALL = HIDE_DRAW | HIDE_SOUND;
+// FLAGS bits 3-4: the DRAW MODE of a hidden iteration (rev3-mod rbhook.FLAG_FAST_HIDE / FLAG_KEEP_3D, resim_skip.md section 9; read by the game only while bit 0 is set):
+// 0 (default) timing: the hidden iteration takes the game's own end-of-frame / present arm (GXDrawDone, VIFlush, VIWaitForRetrace, G3dReset stay), only the 3D scene, the EFB
+// copy and VISetNextFrameBuffer are skipped, so a resimulated frame costs the same emulated time as the first run; 8 fast: the first v3 behaviour (skip arm, no waits);
+// 16 keep 3D: like timing but the 3D scene is drawn too (the exact CPU and GPU work of a drawn frame).
+constexpr u32 HIDE_FAST = 8;
+constexpr u32 HIDE_KEEP_3D = 16;
+constexpr u32 HIDE_MODE_MASK = HIDE_FAST | HIDE_KEEP_3D;
+constexpr u32 HIDE_COPIES_ADDR = 0x800029F8;       // rbhook.V3_DATA +0x18: EFB copies (GXCopyDisp) skipped in hidden iterations
+constexpr u32 HIDE_PRESENTS_ADDR = 0x800029FC;     // rbhook.V3_DATA +0x1C: VISetNextFrameBuffer calls skipped in hidden iterations
 // FLAGS bit 2, hook protocol 3 with the voice gate patch (rev3-mod rbhook.FLAG_DET_VOICE): the game's voice start (zz_80099ae0_) ignores the sound slot
 // table when it decides whether to drop a new voice. Rev3 drops it when the fighter's move_flags2 bit 0x10000 is set AND the fighter's previous voice is still
 // in a slot, and the slot table follows the audio engine's timing, which a rollback does not reproduce: the soak of build e329af6 desynced five times on exactly
@@ -469,8 +480,8 @@ constexpr u32 HIDE_VOICE_HITS_ADDR = 0x800029EC;   // rbhook.V3_DATA +0xC: times
 constexpr u32 HIDE_VOICE_LAST_ADDR = 0x800029F0;   // rbhook.V3_DATA +0x10: the hook's frame counter at the last such time (= the frame whose start state the bit is in)
 constexpr u32 HIDE_DEFAULT = HIDE_DRAW;            // REV3_RESIM_HIDE unset: draw only (sounds as v1) until `all` has been listened to (resim_skip.md 3.4)
 
-// REV3_RESIM_HIDE: "" -> HIDE_DEFAULT; "0" / "off" -> 0; "1" / "draw"; "2" / "sound"; "3" / "all" (case does not matter). False (and *flags =
-// HIDE_DEFAULT) when the text is none of these.
+// REV3_RESIM_HIDE: "" -> HIDE_DEFAULT; "0" / "off" -> 0; "1" / "draw"; "2" / "sound"; "3" / "all"; and the draw modes: "9" / "fast" (draw, fast), "11" / "fastall",
+// "17" / "keep3d" (draw, keep the 3D scene), "19" / "keep3dall" (case does not matter). False (and *flags = HIDE_DEFAULT) when the text is none of these.
 bool ParseResimHide(const std::string& text, u32* flags);
 
 class ResimHideFlags
@@ -493,7 +504,10 @@ public:
   bool ReadCounters(u32* hidden_iterations, u32* skipped_sounds) const;
   // The voice gate's counter and the hook frame of its last hit; false when the protocol is not 3 or the memory is not readable.
   bool ReadVoiceGate(u32* hits, u32* last_frame) const;
-  // " hide_protocol=3 hide_flags=1 hide_writes=4 hidden_iterations=12 skipped_sounds=0 det_voice=1 voice_gate_hits=3 voice_gate_last=8519" (leading space),
+  // The draw counters: EFB copies and VISetNextFrameBuffer calls skipped in hidden iterations; false when the protocol is not 3 or the memory is not readable.
+  bool ReadDrawCounters(u32* copies_skipped, u32* presents_skipped) const;
+  // " hide_protocol=3 hide_flags=1 hide_writes=4 hidden_iterations=12 skipped_sounds=0 det_voice=1 voice_gate_hits=3 voice_gate_last=8519 hidden_copies=12 hidden_presents=12"
+  // (leading space),
   // appended to SUMMARY lines.
   std::string SummaryFields() const;
 
@@ -512,6 +526,7 @@ private:
   bool m_noted_on = false;
   bool m_noted_v2 = false;
   bool m_noted_det = false;
+  bool m_noted_mode = false;
 };
 
 // ---- freeze dump (REV3_SYNCTEST_DUMP) ---------------------------------------------------------------------------------------
