@@ -149,6 +149,13 @@ constexpr u32 DUMP_MAGIC = 0x52334431;         // "R3D1"
 constexpr size_t MAX_DUMP_FRAMES = 64;
 constexpr size_t MAX_HELLO_ITEMS = 256;
 constexpr size_t MAX_FIELD_DIFFS_LOGGED = 20;
+constexpr u32 ARM_PROPOSE_MAGIC = 0x52334131;  // "R3A1"
+constexpr u32 ARM_ACCEPT_MAGIC = 0x52334132;   // "R3A2"
+constexpr u32 ARM_REJECT_MAGIC = 0x52334133;   // "R3A3"
+constexpr size_t MAX_ARM_TEXT = 600;           // the gate text of an ARM message is cut to this (it is for the log only)
+constexpr size_t ARM_QUEUE_MAX = 32;           // ARM_* messages kept unanswered
+constexpr u32 ARM_LOG_FULL_LINES = 8;          // ARM refusal lines written in full; afterwards one in ARM_LOG_EVERY
+constexpr u32 ARM_LOG_EVERY = 20;
 constexpr u32 RANGE_MAGIC = 0x52335231;        // "R3R1"
 constexpr size_t MAX_RANGE_ENTRIES = 20000;
 constexpr size_t MAX_RANGE_DIFFS_LOGGED = 40;
@@ -494,6 +501,105 @@ bool ParseRangeCrc(const std::vector<u8>& bytes, RangeCrcMsg* out)
   return true;
 }
 
+const char* ArmReasonName(u8 reason)
+{
+  switch (static_cast<ArmReason>(reason))
+  {
+  case ArmReason::NotReady:
+    return "not ready";
+  case ArmReason::TooLate:
+    return "too late";
+  case ArmReason::NotLockstep:
+    return "not in lockstep";
+  case ArmReason::Crossed:
+    return "crossed (the host's proposal wins)";
+  case ArmReason::Busy:
+    return "busy (another arm is agreed)";
+  }
+  return "unknown";
+}
+
+std::vector<u8> SerializeArmPropose(const ArmPropose& m)
+{
+  Writer w;
+  w.U32(ARM_PROPOSE_MAGIC);
+  w.U32(m.id);
+  w.S32(m.frame);
+  w.S32(m.at_frame);
+  w.Str(m.gate.substr(0, MAX_ARM_TEXT));
+  return w.Take();
+}
+
+bool ParseArmPropose(const std::vector<u8>& bytes, ArmPropose* out)
+{
+  Reader r(bytes);
+  if (r.U32() != ARM_PROPOSE_MAGIC)
+    return false;
+  ArmPropose m;
+  m.id = r.U32();
+  m.frame = r.S32();
+  m.at_frame = r.S32();
+  m.gate = r.Str();
+  if (!r.ok() || !r.done())
+    return false;
+  *out = std::move(m);
+  return true;
+}
+
+std::vector<u8> SerializeArmAccept(const ArmAccept& m)
+{
+  Writer w;
+  w.U32(ARM_ACCEPT_MAGIC);
+  w.U32(m.id);
+  w.S32(m.frame);
+  w.S32(m.at_frame);
+  return w.Take();
+}
+
+bool ParseArmAccept(const std::vector<u8>& bytes, ArmAccept* out)
+{
+  Reader r(bytes);
+  if (r.U32() != ARM_ACCEPT_MAGIC)
+    return false;
+  ArmAccept m;
+  m.id = r.U32();
+  m.frame = r.S32();
+  m.at_frame = r.S32();
+  if (!r.ok() || !r.done())
+    return false;
+  *out = m;
+  return true;
+}
+
+std::vector<u8> SerializeArmReject(const ArmReject& m)
+{
+  Writer w;
+  w.U32(ARM_REJECT_MAGIC);
+  w.U32(m.id);
+  w.S32(m.frame);
+  w.S32(m.at_frame);
+  w.U8(m.reason);
+  w.Str(m.gate.substr(0, MAX_ARM_TEXT));
+  return w.Take();
+}
+
+bool ParseArmReject(const std::vector<u8>& bytes, ArmReject* out)
+{
+  Reader r(bytes);
+  if (r.U32() != ARM_REJECT_MAGIC)
+    return false;
+  ArmReject m;
+  m.id = r.U32();
+  m.frame = r.S32();
+  m.at_frame = r.S32();
+  m.reason = r.U8();
+  m.gate = r.Str();
+  if (!r.ok() || !r.done())
+    return false;
+  *out = std::move(m);
+  return true;
+}
+
 // ---- pacing: the time offset estimate and the policy (M5) -----------------------------------------------------------------------
 
 void TimeSync::OnLocalSend(s32 frame, u64 now_us)
@@ -818,12 +924,11 @@ u32 RollbackSession::BlockTimeoutMs() const
     return m_cfg.barrier_timeout_ms;
   case Block::Stall:
     return m_cfg.stall_disconnect_frames * 1000 / 60;  // 420 frames of 1/60 s = 7000 ms
-  case Block::StartCheck:
-    return m_cfg.start_check_timeout_ms;
   case Block::None:
   case Block::Lockstep:
   case Block::DrainA:
   case Block::DrainB:
+  case Block::ArmAnswer:
     break;
   }
   return m_cfg.wait_timeout_ms;
@@ -835,6 +940,8 @@ bool RollbackSession::BlockSatisfied()
   PumpMessages();
   if (m_mode == Mode::OFFLINE || m_net.State() == ConnState::Failed)
     return true;  // Step() sees it and answers offline
+  // A proposal the peer sends while this side waits is answered NOW, not when the wait ends: the peer may be waiting for the answer (ARM_ANSWER).
+  ProcessArmMessages();
   const s32 n = m_cur_frame;
   switch (m_block)
   {
@@ -854,8 +961,8 @@ bool RollbackSession::BlockSatisfied()
     return Confirmed() >= n - 1;
   case Block::DrainB:
     return Confirmed() >= n;
-  case Block::StartCheck:
-    return !m_peer_start.empty();
+  case Block::ArmAnswer:
+    return m_arm.phase != ArmPhase::Pending;
   }
   return true;
 }
@@ -878,12 +985,10 @@ void RollbackSession::BlockTimedOut()
     EndStall(true);
     LeaveSession(Fmt("stall: no remote pad for %u frames (%u ms)", m_cfg.stall_disconnect_frames, BlockTimeoutMs()), true);
     break;
-  case Block::StartCheck:
-    // The peer is not asking for the same arm (see "Known gap" in Rev3Session.h): stay in lockstep, correct but slower.
-    Line(Fmt("ARM frame=%d refused: no START_CHECK from the peer within %u ms; staying in lockstep", m_cur_frame,
-             m_cfg.start_check_timeout_ms));
-    m_arm_blocked = true;
-    ++m_stats.arm_refused;
+  case Block::ArmAnswer:
+    // The answer to a proposal travels on the reliable channel and is sent the moment the peer reads the proposal: after wait_timeout_ms the
+    // link is dead (the same wait would end the session in the pad wait next).
+    LeaveSession(Fmt("no answer to ARM_PROPOSE id=%u frame=%d within %u ms", m_arm.id, m_arm.frame, m_cfg.wait_timeout_ms), true);
     break;
   case Block::None:
   case Block::Lockstep:
@@ -933,6 +1038,9 @@ bool RollbackSession::StepInner(const Command& command, const Gate& gate, Reply*
     *reply = EchoReply(command);
     return true;
   }
+
+  if (m_mode != Mode::LOCKSTEP && m_mode != Mode::CONNECTING)
+    ProcessArmMessages();  // ARMED / DRAIN: whatever the peer proposes is answered "not in lockstep" (LOCKSTEP answers in its own step, with its gate)
 
   const s32 n = static_cast<s32>(command.frame);
 
@@ -1017,17 +1125,28 @@ void RollbackSession::StartLockstep()
 bool RollbackSession::StepLockstep(const Command& command, const Gate& gate, Reply* reply)
 {
   const s32 n = m_cur_frame;
-  if (!gate.open)
+  // What a proposal that arrives now (here or while this call waits) is answered with.
+  m_gate_ready = gate.open && gate.fighters_found && !gate.health_zero;
+  m_gate_text = DescribeGate(gate);
+  ProcessArmMessages();
+
+  switch (StepArm(gate))
   {
-    m_arm_blocked = false;  // a refused gate opening is over once the gate has closed
+  case ArmOutcome::Wait:
+    return false;
+  case ArmOutcome::Left:
+    return EndCall(n, EchoReply(command), reply);
+  case ArmOutcome::Armed:
+  {
+    // The arm frame was agreed, the hardware is local: when a disc read is in flight right now this first ARMED call plays the real pad (a HOLD),
+    // exactly as every later call does while the read lasts.
+    Gate armed_gate = gate;
+    if (!armed_gate.hardware_quiet)
+      armed_gate.hardware_hold = true;
+    return StepArmed(command, armed_gate, reply);
   }
-  else if (!m_arm_blocked)
-  {
-    const int arm = TryArm(gate);
-    if (arm == 0)
-      return false;
-    if (arm == 1)
-      return StepArmed(command, gate, reply);
+  case ArmOutcome::Lockstep:
+    break;
   }
   if (Confirmed() < n)
     return Blocked(Block::Lockstep);
@@ -1035,49 +1154,141 @@ bool RollbackSession::StepLockstep(const Command& command, const Gate& gate, Rep
   return EndCall(n, MakeReply(LocalAt(n), RemoteAt(n), 0, n), reply);
 }
 
-int RollbackSession::TryArm(const Gate& gate)
+// ---- the arm agreement ---------------------------------------------------------------------------------------------------------------
+// See THE GATE RULE (OPEN) in Rev3Session.h. The only blocking step is the proposer's at call F, and only when the answer is not there yet.
+
+s32 RollbackSession::CurrentFrame() const
+{
+  return m_cur_frame >= 0 ? m_cur_frame : m_expected_next;
+}
+
+std::string RollbackSession::DescribeGate(const Gate& g) const
+{
+  const char* why = g.why != nullptr ? g.why : "";
+  if (g.detail != nullptr && g.detail[0] != '\0')  // the module's own inputs in words (they already carry the found / quiet / health / layout fields)
+    return Fmt("open=%d hardware_hold=%d why=\"%s\" %s", g.open ? 1 : 0, g.hardware_hold ? 1 : 0, why, g.detail);
+  return Fmt("open=%d fighters_found=%d health_zero=%d hardware_quiet=%d hardware_hold=%d layout_pending=%d why=\"%s\"", g.open ? 1 : 0,
+             g.fighters_found ? 1 : 0, g.health_zero ? 1 : 0, g.hardware_quiet ? 1 : 0, g.hardware_hold ? 1 : 0, g.layout_pending ? 1 : 0, why);
+}
+
+void RollbackSession::ArmLine(const std::string& text)
+{
+  if (m_arm_log_lines < ARM_LOG_FULL_LINES)
+  {
+    ++m_arm_log_lines;
+    Line(text);
+    return;
+  }
+  if (++m_arm_log_left_out % ARM_LOG_EVERY == 0)
+    Line(text + Fmt(" (%u more ARM lines of this kind left out so far)", m_arm_log_left_out));
+}
+
+// The number of frames between the call that proposes and the frame to arm at: about one round trip (the answer should be here before the
+// proposer reaches F, so it never waits), plus the input delay twice (the two machines are up to D frames apart in lockstep), plus a few frames.
+s32 RollbackSession::ArmMargin() const
+{
+  const u64 rtt_us = m_net.RttUs();
+  const s32 rtt_frames = rtt_us == 0 ? 8 : static_cast<s32>(std::min<u64>((rtt_us + PACE_FRAME_US - 1) / PACE_FRAME_US, 600));
+  const s32 margin = rtt_frames + 2 * m_delay + 6 + m_arm_margin_extra;
+  return std::max(m_cfg.arm_margin_min, std::min(m_cfg.arm_margin_cap, margin));
+}
+
+void RollbackSession::SendPropose()
 {
   const s32 n = m_cur_frame;
-  if (m_arm_sent_frame != n)
+  ArmPropose m;
+  m.id = m_arm_next_id++;
+  const s32 margin = ArmMargin();
+  m.frame = n + margin;
+  m.at_frame = n;
+  m.gate = m_gate_text;
+  m_net.SendReliable(MsgType::ArmPropose, SerializeArmPropose(m));
+  m_arm.phase = ArmPhase::Pending;
+  m_arm.own = true;
+  m_arm.id = m.id;
+  m_arm.frame = m.frame;
+  ++m_stats.arm_proposed;
+  Line(Fmt("ARM propose id=%u frame=%d (call %d + margin %d; rtt %.0f ms, delay %d) own gate: %s", m.id, m.frame, n, margin,
+           static_cast<double>(m_net.RttUs()) / 1000.0, m_delay, m_gate_text.c_str()));
+}
+
+RollbackSession::ArmOutcome RollbackSession::StepArm(const Gate& gate)
+{
+  const s32 n = m_cur_frame;
+  const bool shared_ok = gate.fighters_found && !gate.health_zero;  // identical on both machines in lockstep (state, not hardware)
+  if (m_arm_wait_start_us != 0 && m_arm.phase != ArmPhase::Pending)
   {
-    StartCheck mine;
-    mine.frame = n;
-    mine.checksum = m_store.LiveChecksum(n, &mine.fields);
-    mine.stable_crc = m_store.StableCrc();
-    m_arm_mine = mine;
-    m_arm_sent_frame = n;
-    m_net.SendReliable(MsgType::StartCheck, SerializeStartCheck(mine));
+    const u64 now = m_net.Now();
+    const u64 us = now >= m_arm_wait_start_us ? now - m_arm_wait_start_us : 0;
+    m_stats.arm_wait_us_total += us;
+    m_stats.arm_wait_us_max = std::max(m_stats.arm_wait_us_max, us);
+    m_arm_wait_start_us = 0;
   }
-  const auto it = m_peer_start.find(n);
-  if (it == m_peer_start.end())
+  if (m_arm.phase != ArmPhase::None)
   {
-    if (m_peer_start.empty())
+    if (n < m_arm.frame)
+      return ArmOutcome::Lockstep;  // the pad stream goes on; nothing here waits
+    if (n > m_arm.frame)
     {
-      Blocked(Block::StartCheck);
-      return 0;
+      Line(Fmt("ERROR ARM id=%u frame=%d: call %d is past the agreed frame; dropping the agreement", m_arm.id, m_arm.frame, n));
+      m_arm = ArmState();
+      return ArmOutcome::Lockstep;
     }
-    // The peer asked for an arm at another frame.
-    const s32 other = m_peer_start.begin()->first;
-    Line(Fmt("ARM frame=%d refused: START_CHECK frame mismatch (own=%d peer=%d)", n, n, other));
-    m_sink.Osd(Fmt("Rev3 netplay: not arming (gate opened on frame %d here, %d at the peer); staying in lockstep", n, other));
-    m_peer_start.clear();
-    m_arm_blocked = true;
-    ++m_stats.arm_refused;
-    return 2;
+    // n == F
+    if (!shared_ok)
+    {
+      CancelArm(Fmt("at the agreed frame %s (the same on both machines; neither arms)",
+                    !gate.fighters_found ? "no fighters are found" : "a fighter is at health 0")
+                    .c_str());
+      return ArmOutcome::Lockstep;
+    }
+    if (m_arm.phase == ArmPhase::Pending)
+    {
+      if (m_arm_wait_start_us == 0)
+      {
+        ++m_stats.arm_waits;
+        m_arm_wait_start_us = std::max<u64>(m_net.Now(), 1);
+      }
+      Blocked(Block::ArmAnswer);
+      return ArmOutcome::Wait;
+    }
+    return DoArm(gate);
   }
-  const StartCheck theirs = it->second;
-  m_peer_start.erase(m_peer_start.begin(), m_peer_start.upper_bound(n));
-  const std::vector<std::string> mismatches = StartCheckMismatches(m_arm_mine, theirs);
-  if (!mismatches.empty())
+  if (gate.open && shared_ok && n >= m_arm_retry_at && m_peer_hello_ok)
+    SendPropose();
+  return ArmOutcome::Lockstep;
+}
+
+void RollbackSession::CancelArm(const char* why)
+{
+  ++m_stats.arm_cancelled;
+  Line(Fmt("ARM id=%u frame=%d cancelled: %s", m_arm.id, m_arm.frame, why));
+  m_arm = ArmState();
+  m_arm_retry_at = CurrentFrame() + m_cfg.arm_retry_frames;
+}
+
+// Call F of an agreed arm, fighters found and nobody at health 0: the same decision on both machines. Mirrors the old TryArm's tail.
+RollbackSession::ArmOutcome RollbackSession::DoArm(const Gate& gate)
+{
+  const s32 n = m_cur_frame;
+  if (!gate.open)
   {
-    Line(Fmt("ARM frame=%d refused: START_CHECK mismatch (%zu items)", n, mismatches.size()));
-    for (const std::string& m : mismatches)
-      Line("  START_CHECK " + m);
-    m_sink.Osd(Fmt("Rev3 netplay: not arming, the machines differ at frame %d (%s); staying in lockstep", n, mismatches.front().c_str()));
-    m_arm_blocked = true;
-    ++m_stats.arm_refused;
-    return 2;
+    // The tracker shut in between (the fighters were lost and found again inside the margin): this side's set is not installed. Install it now.
+    Line(Fmt("ARM frame=%d: this side's gate is no longer open (%s); installing the snapshot set now", n, m_gate_text.c_str()));
+    if (!m_store.Relayout())
+    {
+      Line(Fmt("ERROR ARM frame=%d: the snapshot set is not usable", n));
+      LeaveSession("snapshot set unusable at the agreed arm", true);
+      return ArmOutcome::Left;
+    }
   }
+  StartCheck mine;
+  mine.frame = n;
+  mine.checksum = m_store.LiveChecksum(n, &mine.fields);
+  mine.stable_crc = m_store.StableCrc();
+  m_arm_mine = mine;
+  m_start_pending = true;
+  m_net.SendReliable(MsgType::StartCheck, SerializeStartCheck(mine));
 
   m_mode = Mode::ARMED;
   m_armed_frame = n;
@@ -1097,10 +1308,190 @@ int RollbackSession::TryArm(const Gate& gate)
   for (Used& u : m_used)
     u = Used{};
   ++m_stats.gate_opens;
+  Line(Fmt("ARM armed id=%u frame=%d (%s proposal)", m_arm.id, n, m_arm.own ? "own" : "the peer's"));
   Line(Fmt("GATE open frame=%d why=%s", n, gate.why != nullptr ? gate.why : ""));
-  Line(Fmt("CHK start frame=%d value=0x%08X stable_crc=0x%08X (both machines agree)", n, m_arm_mine.checksum, m_arm_mine.stable_crc));
-  return 1;
+  m_arm = ArmState();
+  m_arm_margin_extra = 0;
+  m_arm_retry_gap = 0;
+  m_arm_retry_at = 0;
+  m_arm_log_lines = 0;
+  m_arm_log_left_out = 0;
+  CompareStart();  // the peer's START_CHECK may be here already; if not, it is compared when it arrives
+  return m_mode == Mode::OFFLINE ? ArmOutcome::Left : ArmOutcome::Armed;
 }
+
+// START_CHECK never blocks: ours went out at the arm, the peer's is compared whenever both exist. Equal states are the rule (lockstep); a difference
+// is a desync that happened BEFORE the arm, found a few frames after it.
+void RollbackSession::CompareStart()
+{
+  if (!m_start_pending || m_mode == Mode::OFFLINE)
+    return;
+  const auto it = m_peer_start.find(m_arm_mine.frame);
+  if (it == m_peer_start.end())
+    return;
+  const StartCheck theirs = it->second;
+  m_peer_start.erase(m_peer_start.begin(), m_peer_start.upper_bound(m_arm_mine.frame));
+  m_start_pending = false;
+  const std::vector<std::string> mismatches = StartCheckMismatches(m_arm_mine, theirs);
+  if (mismatches.empty())
+  {
+    Line(Fmt("CHK start frame=%d value=0x%08X stable_crc=0x%08X (both machines agree)", m_arm_mine.frame, m_arm_mine.checksum,
+             m_arm_mine.stable_crc));
+    return;
+  }
+  ++m_stats.checks_bad;
+  Line(Fmt("DESYNC start frame=%d: the two machines were not in the same state when they armed (%zu items)", m_arm_mine.frame, mismatches.size()));
+  for (const std::string& m : mismatches)
+    Line("  START_CHECK " + m);
+  m_sink.Osd(Fmt("Rev3 netplay: the machines differ at the arm (frame %d), leaving the session", m_arm_mine.frame));
+  LeaveSession("desync (START_CHECK mismatch)", true);
+}
+
+void RollbackSession::ProcessArmMessages()
+{
+  while (!m_arm_in.empty() && m_mode != Mode::OFFLINE && m_mode != Mode::CONNECTING)
+  {
+    const Message message = std::move(m_arm_in.front());
+    m_arm_in.pop_front();
+    switch (message.type)
+    {
+    case MsgType::ArmPropose:
+    {
+      ArmPropose m;
+      if (ParseArmPropose(message.bytes, &m))
+        OnArmPropose(m);
+      else
+        Line("ERROR bad ARM_PROPOSE message");
+      break;
+    }
+    case MsgType::ArmAccept:
+    {
+      ArmAccept m;
+      if (ParseArmAccept(message.bytes, &m))
+        OnArmAccept(m);
+      else
+        Line("ERROR bad ARM_ACCEPT message");
+      break;
+    }
+    case MsgType::ArmReject:
+    {
+      ArmReject m;
+      if (ParseArmReject(message.bytes, &m))
+        OnArmReject(m);
+      else
+        Line("ERROR bad ARM_REJECT message");
+      break;
+    }
+    case MsgType::Hello:
+    case MsgType::StartCheck:
+    case MsgType::DesyncDump:
+    case MsgType::Bye:
+    case MsgType::RangeCrc:
+      break;
+    }
+  }
+}
+
+void RollbackSession::SendArmReject(const ArmPropose& m, ArmReason reason)
+{
+  ArmReject r;
+  r.id = m.id;
+  r.frame = m.frame;
+  r.at_frame = CurrentFrame();
+  r.reason = static_cast<u8>(reason);
+  r.gate = m_mode == Mode::LOCKSTEP ? m_gate_text : Fmt("mode=%s", ModeName(m_mode));
+  m_net.SendReliable(MsgType::ArmReject, SerializeArmReject(r));
+  ++m_stats.arm_refused;
+  ArmLine(Fmt("ARM reject id=%u frame=%d reason=%s (own call %d; the peer proposed at its call %d); own gate: %s; peer gate: %s", m.id, m.frame,
+              ArmReasonName(r.reason), r.at_frame, m.at_frame, r.gate.c_str(), m.gate.c_str()));
+}
+
+// The peer proposes to arm at m.frame.
+void RollbackSession::OnArmPropose(const ArmPropose& m)
+{
+  if (m_mode != Mode::LOCKSTEP)
+  {
+    SendArmReject(m, ArmReason::NotLockstep);
+    return;
+  }
+  if (m_arm.phase == ArmPhase::Pending)
+  {
+    // Both proposed at once: the host's proposal wins. The host refuses the guest's; the guest drops its own and answers the host's.
+    if (m_cfg.role == Role::Host)
+    {
+      SendArmReject(m, ArmReason::Crossed);
+      return;
+    }
+    Line(Fmt("ARM crossed: dropping own proposal id=%u frame=%d for the host's id=%u frame=%d", m_arm.id, m_arm.frame, m.id, m.frame));
+    m_arm = ArmState();
+  }
+  if (m_arm.phase == ArmPhase::Agreed)
+  {
+    SendArmReject(m, ArmReason::Busy);
+    return;
+  }
+  const s32 cur = CurrentFrame();
+  if (m.frame <= cur)
+  {
+    SendArmReject(m, ArmReason::TooLate);
+    return;
+  }
+  if (!m_gate_ready)
+  {
+    SendArmReject(m, ArmReason::NotReady);
+    return;
+  }
+  ArmAccept a;
+  a.id = m.id;
+  a.frame = m.frame;
+  a.at_frame = cur;
+  m_net.SendReliable(MsgType::ArmAccept, SerializeArmAccept(a));
+  m_arm.phase = ArmPhase::Agreed;
+  m_arm.own = false;
+  m_arm.id = m.id;
+  m_arm.frame = m.frame;
+  ++m_stats.arm_accepted;
+  Line(Fmt("ARM accept id=%u frame=%d (own call %d; the peer proposed at its call %d); own gate: %s", m.id, m.frame, cur, m.at_frame,
+           m_gate_text.c_str()));
+}
+
+// The peer accepted our proposal.
+void RollbackSession::OnArmAccept(const ArmAccept& m)
+{
+  if (m_arm.phase != ArmPhase::Pending || !m_arm.own || m_arm.id != m.id)
+  {
+    ArmLine(Fmt("ARM ignoring ARM_ACCEPT id=%u frame=%d: no such proposal is waiting for an answer", m.id, m.frame));
+    return;
+  }
+  m_arm.phase = ArmPhase::Agreed;
+  Line(Fmt("ARM agreed id=%u frame=%d (the peer accepted at its call %d; own call %d)", m.id, m.frame, m.at_frame, CurrentFrame()));
+}
+
+// The peer refused our proposal.
+void RollbackSession::OnArmReject(const ArmReject& m)
+{
+  if (m_arm.phase != ArmPhase::Pending || !m_arm.own || m_arm.id != m.id)
+    return;  // the answer to a proposal we dropped (crossed) or that is over
+  ++m_stats.arm_rejected;
+  const s32 cur = CurrentFrame();
+  s32 gap;
+  if (m.reason == static_cast<u8>(ArmReason::TooLate))
+  {
+    // The answer was slower than the margin: a longer margin next time, and try again at once.
+    m_arm_margin_extra = std::min(m_cfg.arm_margin_cap, m_arm_margin_extra + m_cfg.arm_margin_step);
+    gap = 1;
+  }
+  else
+  {
+    m_arm_retry_gap = m_arm_retry_gap == 0 ? m_cfg.arm_retry_frames : std::min(m_cfg.arm_retry_cap_frames, m_arm_retry_gap * 2);
+    gap = m_arm_retry_gap;
+  }
+  m_arm_retry_at = cur + gap;
+  ArmLine(Fmt("ARM propose id=%u frame=%d rejected by the peer: %s (the peer was at call %d, own call %d); retry in %d frames; peer gate: %s; own gate: %s",
+              m.id, m.frame, ArmReasonName(m.reason), m.at_frame, cur, gap, m.gate.c_str(), m_gate_text.c_str()));
+  m_arm = ArmState();
+}
+
 
 // ---- ARMED -----------------------------------------------------------------------------------------------------------------------
 
@@ -1425,7 +1816,6 @@ void RollbackSession::EnterDrain(s32 frame, const std::string& why, bool relayou
     Line(Fmt("GATE relayout frame=%d why=%s", frame, why.c_str()));
     return;
   }
-  m_arm_blocked = false;
   ++m_stats.gate_closes;
   Line(Fmt("GATE close frame=%d why=%s", frame, why.c_str()));
 }
@@ -1942,6 +2332,19 @@ void RollbackSession::HandleMessage(const Message& message)
     m_peer_start[check.frame] = check;
     while (m_peer_start.size() > 8)
       m_peer_start.erase(m_peer_start.begin());
+    CompareStart();
+    return;
+  }
+  case MsgType::ArmPropose:
+  case MsgType::ArmAccept:
+  case MsgType::ArmReject:
+  {
+    // Answered where the gate is known (the lockstep step, or a wait of it): see ProcessArmMessages.
+    if (m_mode == Mode::OFFLINE)
+      return;
+    if (m_arm_in.size() >= ARM_QUEUE_MAX)
+      m_arm_in.pop_front();
+    m_arm_in.push_back(message);
     return;
   }
   case MsgType::DesyncDump:
@@ -2003,6 +2406,11 @@ void RollbackSession::LeaveSession(const std::string& why, bool tell_peer)
 {
   if (m_mode == Mode::OFFLINE)
     return;
+  m_leave_reason = why;
+  m_arm = ArmState();
+  m_arm_in.clear();
+  m_start_pending = false;
+  m_arm_wait_start_us = 0;
   Line(Fmt("LEAVE frame=%d from=%s reason=%s", m_cur_frame, ModeName(m_mode), why.c_str()));
   m_sink.Osd("Rev3 netplay: " + why + " (continuing offline)");
   if (tell_peer && m_net.State() != ConnState::Failed)
@@ -2053,11 +2461,11 @@ void RollbackSession::SummaryLine(const char* tag)
   const std::string store_note = m_store.SummaryNote();  // may write the `NOTE learned summary` line, so before the SUMMARY line below
   Line(Fmt("%s mode=%s frame=%d calls=%u resim_calls=%u rollbacks=%u max_depth=%u depth_hist=[%s] predicted=%u stalls=%u stall_ms_max=%.1f "
            "postponed=%u forced_hw=%u hw_holds=%u hold_calls=%u relayouts=%u chk_ok=%u chk_bad=%u gate_opens=%u gate_closes=%u gate_late=%u "
-           "arm_refused=%u log_suppressed=%u io_redirected=%u io_no_clean_slot=%u local_active=%u local_mirrored=%u err_hist=[%u,%u,%u,%u,%u]%s%s%s",
+           "arm_refused=%u arm_proposed=%u arm_accepted=%u arm_rejected=%u arm_cancelled=%u arm_waits=%u arm_wait_ms_max=%.1f log_suppressed=%u io_redirected=%u io_no_clean_slot=%u local_active=%u local_mirrored=%u err_hist=[%u,%u,%u,%u,%u]%s%s%s",
            tag, ModeName(m_mode), m_expected_next, m_stats.calls, m_stats.resim_calls, m_stats.rollbacks, m_stats.max_depth, hist.c_str(),
            m_stats.predicted_frames, m_stats.stalls, static_cast<double>(m_stats.stall_us_max) / 1000.0, m_stats.postponed,
            m_stats.forced_hw, m_stats.hw_holds, m_stats.hold_calls, m_stats.relayouts, m_stats.checks_ok, m_stats.checks_bad,
-           m_stats.gate_opens, m_stats.gate_closes, m_stats.gate_late, m_stats.arm_refused, m_stats.log_suppressed, m_stats.io_redirected,
+           m_stats.gate_opens, m_stats.gate_closes, m_stats.gate_late, m_stats.arm_refused, m_stats.arm_proposed, m_stats.arm_accepted, m_stats.arm_rejected, m_stats.arm_cancelled, m_stats.arm_waits, static_cast<double>(m_stats.arm_wait_us_max) / 1000.0, m_stats.log_suppressed, m_stats.io_redirected,
            m_stats.io_no_clean_slot, m_stats.local_active, m_stats.local_mirrored, m_stats.local_err[0], m_stats.local_err[1],
            m_stats.local_err[2], m_stats.local_err[3], m_stats.local_err[4], sim.c_str(),
            ranges.c_str(), m5.c_str()) +

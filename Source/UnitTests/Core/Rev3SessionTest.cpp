@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -481,12 +482,52 @@ struct Rig
       sc.fields.value[1][2] ^= 0x1;
     net.inbox.push_back({MsgType::StartCheck, SerializeStartCheck(sc)});
   }
-  // Lockstep `n` frames (counter = n), handshake and a matching START_CHECK queued: the next Frame(.., Open()) arms.
+  // The peer proposes to arm at `frame` (it sent the proposal at its call `at`).
+  void PeerPropose(s32 frame, u32 id = 1, s32 at = -1)
+  {
+    ArmPropose m;
+    m.id = id;
+    m.frame = frame;
+    m.at_frame = at >= 0 ? at : counter;
+    m.gate = "peer gate (test)";
+    net.inbox.push_back({MsgType::ArmPropose, SerializeArmPropose(m)});
+  }
+  void PeerAccept(u32 id, s32 frame)
+  {
+    ArmAccept m;
+    m.id = id;
+    m.frame = frame;
+    m.at_frame = counter;
+    net.inbox.push_back({MsgType::ArmAccept, SerializeArmAccept(m)});
+  }
+  void PeerReject(u32 id, s32 frame, ArmReason reason)
+  {
+    ArmReject m;
+    m.id = id;
+    m.frame = frame;
+    m.at_frame = counter;
+    m.reason = static_cast<u8>(reason);
+    m.gate = "peer gate (test)";
+    net.inbox.push_back({MsgType::ArmReject, SerializeArmReject(m)});
+  }
+  // Lockstep until counter = n - 1, then one call with the gate open at which the peer's proposal "arm at frame n" arrives and is accepted, and the
+  // peer's equal START_CHECK queued (counter = n): the next Frame(.., Open()) arms at frame n.
   void ReadyToArm(s32 n)
   {
     Handshake();
-    Lockstep(n);
+    Lockstep(n - 1);
+    PeerPropose(n);
+    net.Deliver(counter, RemotePadScript(counter));
+    Frame(LocalPad(counter), Open());
     PeerStartCheck();
+  }
+  // ReadyToArm(n - 1) and the arming call itself, with its remote pad delivered: ARMED at counter n, the newest confirmed remote pad is frame n - 1's.
+  // For the tests whose first ARMED call must already be a lost one: the arm agreement itself cancels an arm at a frame with a fighter at health 0.
+  void ArmedAt(s32 n)
+  {
+    ReadyToArm(n - 1);
+    net.Deliver(counter, RemotePadScript(counter));
+    Frame(LocalPad(counter), Open());
   }
 
   Config cfg;
@@ -1167,95 +1208,520 @@ TEST(Rev3Session, FieldsFromRawAndChecksumOfFields)
 
 // ---- arming ----------------------------------------------------------------------------------------------------------------------
 
-TEST(Rev3Session, ArmingNeedsThePeersMatchingStartCheck)
+// Parses the newest message of a type our side sent.
+ArmPropose LastPropose(const Rig& rig)
+{
+  ArmPropose m;
+  const Message* msg = rig.net.LastOut(MsgType::ArmPropose);
+  EXPECT_TRUE(msg != nullptr);
+  EXPECT_TRUE(msg != nullptr && ParseArmPropose(msg->bytes, &m));
+  return m;
+}
+ArmReject LastReject(const Rig& rig)
+{
+  ArmReject m;
+  const Message* msg = rig.net.LastOut(MsgType::ArmReject);
+  EXPECT_TRUE(msg != nullptr);
+  EXPECT_TRUE(msg != nullptr && ParseArmReject(msg->bytes, &m));
+  return m;
+}
+
+TEST(Rev3Session, ArmMessagesRoundTripAndRejectMalformedBytes)
+{
+  ArmPropose p;
+  p.id = 7;
+  p.frame = 1234;
+  p.at_frame = 1220;
+  p.gate = "open=1 why=\"x\" found_streak=3/3";
+  ArmPropose p2;
+  ASSERT_TRUE(ParseArmPropose(SerializeArmPropose(p), &p2));
+  EXPECT_EQ(p2.id, 7u);
+  EXPECT_EQ(p2.frame, 1234);
+  EXPECT_EQ(p2.at_frame, 1220);
+  EXPECT_EQ(p2.gate, p.gate);
+  ArmAccept a{9, 55, 50};
+  ArmAccept a2;
+  ASSERT_TRUE(ParseArmAccept(SerializeArmAccept(a), &a2));
+  EXPECT_EQ(a2.id, 9u);
+  EXPECT_EQ(a2.frame, 55);
+  EXPECT_EQ(a2.at_frame, 50);
+  ArmReject r;
+  r.id = 3;
+  r.frame = -4;
+  r.at_frame = 8;
+  r.reason = static_cast<u8>(ArmReason::NotReady);
+  r.gate = "hardware busy";
+  ArmReject r2;
+  ASSERT_TRUE(ParseArmReject(SerializeArmReject(r), &r2));
+  EXPECT_EQ(r2.id, 3u);
+  EXPECT_EQ(r2.frame, -4);
+  EXPECT_EQ(r2.reason, static_cast<u8>(ArmReason::NotReady));
+  EXPECT_EQ(r2.gate, "hardware busy");
+  EXPECT_STREQ(ArmReasonName(r2.reason), "not ready");
+  // Every truncation, an extra byte and another message's magic are refused.
+  const std::vector<u8> bytes = SerializeArmReject(r);
+  ArmReject unused;
+  for (size_t cut = 0; cut < bytes.size(); ++cut)
+    EXPECT_FALSE(ParseArmReject(std::vector<u8>(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(cut)), &unused)) << cut;
+  std::vector<u8> longer = bytes;
+  longer.push_back(0);
+  EXPECT_FALSE(ParseArmReject(longer, &unused));
+  ArmPropose up;
+  ArmAccept ua;
+  EXPECT_FALSE(ParseArmPropose(SerializeArmAccept(a), &up));
+  EXPECT_FALSE(ParseArmAccept(SerializeArmPropose(p), &ua));
+  EXPECT_FALSE(ParseArmReject(SerializeArmPropose(p), &unused));
+}
+
+TEST(Rev3Session, AReadyGateProposesAndKeepsPlayingLockstepWhileItWaitsForTheAnswer)
 {
   Rig rig(Role::Host, 0);
   rig.Handshake();
   rig.Lockstep(10);
-  // Gate open, our START_CHECK goes out, the peer's is not here yet: wait.
-  EXPECT_FALSE(rig.TryFrame(LocalPad(10), Open()));
+  // The gate is open at call 10: the proposal goes out and the call is answered at once with the exact lockstep pads.
+  rig.net.Deliver(10, RemotePadScript(10));
+  const Reply r = rig.Frame(LocalPad(10), Open());
+  EXPECT_EQ(r.flags, 0u);
+  EXPECT_TRUE(SanitizePad(r.pads[1]) == RemotePadScript(10));
+  EXPECT_TRUE(rig.session->mode() == Mode::LOCKSTEP);
+  ASSERT_EQ(rig.net.CountOut(MsgType::ArmPropose), 1u);
+  const ArmPropose p = LastPropose(rig);
+  EXPECT_EQ(p.id, 1u);
+  EXPECT_EQ(p.at_frame, 10);
+  EXPECT_EQ(p.frame, 10 + 14);  // no RTT estimate yet: 8 frames + 2 * D (0) + 6, above the 12 frame floor
+  EXPECT_NE(p.gate.find("open=1"), std::string::npos);
+  EXPECT_TRUE(rig.sink.Has("ARM propose id=1 frame=24"));
+  EXPECT_EQ(rig.net.CountOut(MsgType::StartCheck), 0u);  // nothing is sent about the state until the arm itself
+
+  // The pad stream goes on, one pad per call, for as long as the answer takes; no second proposal is sent.
+  const size_t sent_before = rig.net.sent.size();
+  for (s32 f = 11; f < 24; ++f)
+  {
+    rig.net.Deliver(f, RemotePadScript(f));
+    EXPECT_TRUE(rig.TryFrame(LocalPad(f), Open())) << "frame " << f << " must not block";
+  }
+  EXPECT_EQ(rig.net.sent.size(), sent_before + 13u);
+  EXPECT_EQ(rig.net.CountOut(MsgType::ArmPropose), 1u);
+  EXPECT_TRUE(rig.session->mode() == Mode::LOCKSTEP);
+
+  // ACCEPT arrives; call 24 arms (and sends the START_CHECK, which is compared whenever the peer's arrives).
+  rig.PeerAccept(1, 24);
+  rig.net.Deliver(24, RemotePadScript(24));
+  rig.Frame(LocalPad(24), Open());
+  EXPECT_TRUE(rig.session->mode() == Mode::ARMED);
+  EXPECT_TRUE(rig.sink.Has("ARM agreed id=1 frame=24"));
+  EXPECT_TRUE(rig.sink.Has("ARM armed id=1 frame=24 (own proposal)"));
+  EXPECT_TRUE(rig.sink.Has("GATE open frame=24 why=test"));
   EXPECT_EQ(rig.net.CountOut(MsgType::StartCheck), 1u);
+  EXPECT_EQ(rig.session->stats().gate_opens, 1u);
+  EXPECT_EQ(rig.session->stats().arm_proposed, 1u);
+  EXPECT_EQ(rig.session->stats().arm_waits, 0u);  // the answer was here before call F: no wait at all
+  EXPECT_EQ(rig.store.captures, 1u);
+  EXPECT_FALSE(rig.sink.Has("CHK start"));  // the peer's START_CHECK is not here yet
+  rig.PeerStartCheck();                     // for frame 25: not the arm frame, ignored
+  rig.net.Deliver(25, RemotePadScript(25));
+  rig.Frame(LocalPad(25), Open());
+  EXPECT_FALSE(rig.sink.Has("CHK start"));
+}
+
+TEST(Rev3Session, TheMarginFollowsTheRoundTripAndTheInputDelay)
+{
+  Rig rig(Role::Host, 3);
+  rig.net.rtt_us = 150000;  // 9 frames of 16.683 ms
+  rig.Handshake();
+  rig.Lockstep(10);
+  rig.net.Deliver(10, RemotePadScript(10));
+  rig.Frame(LocalPad(10), Open());
+  EXPECT_EQ(LastPropose(rig).frame, 10 + 9 + 2 * 3 + 6);
+}
+
+TEST(Rev3Session, TheProposerWaitsAtTheArmFrameOnlyForTheAnswerAndSendsItsPadFirst)
+{
+  Rig rig(Role::Host, 2);
+  rig.net.now_us = 1000;
+  rig.Handshake();
+  rig.Lockstep(10);
+  rig.net.Deliver(10, RemotePadScript(10));
+  rig.Frame(LocalPad(10), Open());
+  const s32 f = LastPropose(rig).frame;  // 10 + 8 + 4 + 6 = 28
+  EXPECT_EQ(f, 28);
+  for (s32 c = 11; c < f; ++c)
+  {
+    rig.net.Deliver(c, RemotePadScript(c));
+    rig.Frame(LocalPad(c), Open());
+  }
+  // Call F, the answer is not here: the call blocks, but its own pad (for F + D) is already out, so the peer can go on to call F + D.
+  rig.net.Deliver(f, RemotePadScript(f));
+  EXPECT_FALSE(rig.TryFrame(LocalPad(f), Open()));
+  EXPECT_EQ(rig.net.sent.back().frame, f + 2);
   EXPECT_EQ(rig.session->BlockTimeoutMs(), 10000u);
   EXPECT_FALSE(rig.session->BlockSatisfied());
-  StartCheck mine;
-  ASSERT_TRUE(ParseStartCheck(rig.net.LastOut(MsgType::StartCheck)->bytes, &mine));
-  EXPECT_EQ(mine.frame, 10);
-  EXPECT_EQ(mine.checksum, rig.game.Checksum(10));
-  rig.PeerStartCheck();
+  EXPECT_EQ(rig.session->stats().arm_waits, 1u);
+  rig.net.now_us += 40000;
+  rig.PeerAccept(1, f);
   EXPECT_TRUE(rig.session->BlockSatisfied());
-  rig.net.Deliver(10, RemotePadScript(10));
-  EXPECT_TRUE(rig.TryFrame(LocalPad(10), Open()));
-  EXPECT_EQ(rig.net.CountOut(MsgType::StartCheck), 1u);  // retries do not send again
+  EXPECT_TRUE(rig.TryFrame(LocalPad(f), Open()));
   EXPECT_TRUE(rig.session->mode() == Mode::ARMED);
-  EXPECT_TRUE(rig.sink.Has("GATE open frame=10 why=test"));
-  EXPECT_EQ(rig.store.captures, 1u);
-  EXPECT_EQ(rig.session->stats().gate_opens, 1u);
+  EXPECT_EQ(rig.net.sent.back().frame, f + 2);  // the retry did not send the pad twice
+  EXPECT_EQ(rig.session->stats().arm_waits, 1u);
+  EXPECT_GE(rig.session->stats().arm_wait_us_max, 40000u);
 }
 
-TEST(Rev3Session, StartCheckMismatchRefusesToArmAndNamesTheDifference)
+TEST(Rev3Session, ARejectionAtTheArmFrameEndsTheWaitAndLockstepGoesOn)
 {
   Rig rig(Role::Host, 0);
   rig.Handshake();
   rig.Lockstep(10);
-  rig.PeerStartCheck(/*equal=*/false);
   rig.net.Deliver(10, RemotePadScript(10));
-  EXPECT_TRUE(rig.TryFrame(LocalPad(10), Open()));
-  EXPECT_TRUE(rig.session->mode() == Mode::LOCKSTEP);  // still in lockstep, the frame was answered exactly
-  EXPECT_EQ(rig.session->stats().arm_refused, 1u);
-  EXPECT_TRUE(rig.sink.Has("refused: START_CHECK mismatch"));
-  EXPECT_TRUE(rig.sink.Has("START_CHECK checksum:"));
-  EXPECT_TRUE(rig.sink.Has("START_CHECK field p2"));
-  EXPECT_FALSE(rig.sink.osd.empty());
-  EXPECT_EQ(rig.store.captures, 0u);
-
-  // The gate stays open: no new attempt (no second START_CHECK) until it has closed once.
-  rig.net.Deliver(11, RemotePadScript(11));
-  EXPECT_TRUE(rig.TryFrame(LocalPad(11), Open()));
-  EXPECT_EQ(rig.net.CountOut(MsgType::StartCheck), 1u);
+  rig.Frame(LocalPad(10), Open());
+  const s32 f = LastPropose(rig).frame;
+  for (s32 c = 11; c < f; ++c)
+  {
+    rig.net.Deliver(c, RemotePadScript(c));
+    rig.Frame(LocalPad(c), Open());
+  }
+  rig.net.Deliver(f, RemotePadScript(f));
+  EXPECT_FALSE(rig.TryFrame(LocalPad(f), Open()));
+  rig.PeerReject(1, f, ArmReason::NotReady);
+  EXPECT_TRUE(rig.session->BlockSatisfied());
+  const Reply r = rig.Frame(LocalPad(f), Open());
   EXPECT_TRUE(rig.session->mode() == Mode::LOCKSTEP);
-  rig.net.Deliver(12, RemotePadScript(12));
-  rig.Frame(LocalPad(12), Closed());
-  rig.PeerStartCheck();  // for frame 13
-  rig.net.Deliver(13, RemotePadScript(13));
-  rig.Frame(LocalPad(13), Open());
-  EXPECT_TRUE(rig.session->mode() == Mode::ARMED);
-  EXPECT_EQ(rig.net.CountOut(MsgType::StartCheck), 2u);
+  EXPECT_EQ(r.flags, 0u);
+  EXPECT_EQ(rig.session->stats().arm_rejected, 1u);
+  EXPECT_EQ(rig.net.CountOut(MsgType::StartCheck), 0u);
+  EXPECT_TRUE(rig.sink.Has("rejected by the peer: not ready"));
+  EXPECT_TRUE(rig.sink.Has("peer gate: peer gate (test)"));
+  EXPECT_TRUE(rig.sink.Has("own gate: open=1"));
 }
 
-TEST(Rev3Session, StartCheckForAnotherFrameRefusesToArm)
-{
-  Rig rig(Role::Host, 0);
-  rig.Handshake();
-  rig.Lockstep(10);
-  rig.counter = 10;
-  StartCheck sc;
-  sc.frame = 12;  // the peer's gate opened two frames later than ours
-  sc.checksum = rig.game.Checksum(12);
-  sc.stable_crc = rig.game.stable;
-  sc.fields = rig.game.Fields();
-  rig.net.inbox.push_back({MsgType::StartCheck, SerializeStartCheck(sc)});
-  rig.net.Deliver(10, RemotePadScript(10));
-  EXPECT_TRUE(rig.TryFrame(LocalPad(10), Open()));
-  EXPECT_TRUE(rig.session->mode() == Mode::LOCKSTEP);
-  EXPECT_TRUE(rig.sink.Has("START_CHECK frame mismatch (own=10 peer=12)"));
-}
-
-TEST(Rev3Session, StartCheckTimeoutOnlyRefusesToArm)
+TEST(Rev3Session, NoAnswerWithinTheWaitLimitLeavesTheSession)
 {
   Rig rig(Role::Host, 0);
   rig.Handshake();
   rig.Lockstep(10);
   rig.net.Deliver(10, RemotePadScript(10));
+  rig.Frame(LocalPad(10), Open());
+  const s32 f = LastPropose(rig).frame;
+  for (s32 c = 11; c < f; ++c)
+  {
+    rig.net.Deliver(c, RemotePadScript(c));
+    rig.Frame(LocalPad(c), Open());
+  }
+  rig.net.Deliver(f, RemotePadScript(f));
   rig.wait = [&](const std::function<bool()>&, u32 timeout) {
     EXPECT_EQ(timeout, 10000u);
     return false;
   };
-  const Reply r = rig.session->OnCommand(rig.Cmd(10, LocalPad(10)), Open());
-  EXPECT_TRUE(rig.session->mode() == Mode::LOCKSTEP);  // not left
+  const Reply r = rig.session->OnCommand(rig.Cmd(f, LocalPad(f)), Open());
+  EXPECT_TRUE(rig.session->mode() == Mode::OFFLINE);
   EXPECT_EQ(r.flags, 0u);
-  EXPECT_TRUE(SanitizePad(r.pads[1]) == RemotePadScript(10));
-  EXPECT_TRUE(rig.sink.Has("no START_CHECK from the peer"));
+  EXPECT_TRUE(rig.sink.Has("LEAVE"));
+  EXPECT_TRUE(rig.sink.Has("no answer to ARM_PROPOSE id=1 frame=" + std::to_string(f)));
+  EXPECT_EQ(rig.session->leave_reason().find("no answer to ARM_PROPOSE"), 0u);
+}
+
+TEST(Rev3Session, APeerProposalIsAcceptedWhenTheGateIsReadyAndBothArmAtItsFrame)
+{
+  Rig rig(Role::Guest, 0);
+  rig.Handshake();
+  rig.Lockstep(10);
+  rig.PeerPropose(25, 5, 9);
+  rig.net.Deliver(10, RemotePadScript(10));
+  rig.Frame(LocalPad(10), Open());
+  ASSERT_EQ(rig.net.CountOut(MsgType::ArmAccept), 1u);
+  ArmAccept a;
+  ASSERT_TRUE(ParseArmAccept(rig.net.LastOut(MsgType::ArmAccept)->bytes, &a));
+  EXPECT_EQ(a.id, 5u);
+  EXPECT_EQ(a.frame, 25);
+  EXPECT_EQ(a.at_frame, 10);
+  EXPECT_EQ(rig.net.CountOut(MsgType::ArmPropose), 0u);  // an agreed arm is not proposed again
+  EXPECT_EQ(rig.session->stats().arm_accepted, 1u);
+  EXPECT_TRUE(rig.sink.Has("ARM accept id=5 frame=25"));
+  // Committed: it arms at 25 whatever its own gate does in between (hardware busy, the set not ready).
+  for (s32 f = 11; f < 25; ++f)
+  {
+    rig.net.Deliver(f, RemotePadScript(f));
+    Gate g = Closed();
+    rig.Frame(LocalPad(f), g);
+    EXPECT_TRUE(rig.session->mode() == Mode::LOCKSTEP);
+  }
+  rig.net.Deliver(25, RemotePadScript(25));
+  rig.Frame(LocalPad(25), Closed());  // the gate is shut here; the shared state (fighters, health) is fine: arm
+  EXPECT_TRUE(rig.session->mode() == Mode::ARMED);
+  EXPECT_TRUE(rig.sink.Has("ARM armed id=5 frame=25 (the peer's proposal)"));
+  EXPECT_TRUE(rig.sink.Has("installing the snapshot set now"));
+  EXPECT_EQ(rig.store.relayouts, 1u);
+  EXPECT_EQ(rig.net.CountOut(MsgType::StartCheck), 1u);
+}
+
+TEST(Rev3Session, APeerProposalIsRejectedWithBothGatesWhenTheGateIsNotReady)
+{
+  Rig rig(Role::Host, 0);
+  rig.Handshake();
+  rig.Lockstep(10);
+  rig.PeerPropose(25, 5, 9);
+  rig.net.Deliver(10, RemotePadScript(10));
+  Gate g = Closed();
+  g.why = "hardware busy";
+  g.detail = "found_streak=60/60 quiet_streak=2/30";
+  const Reply r = rig.Frame(LocalPad(10), g);
+  EXPECT_EQ(r.flags, 0u);  // the call itself is plain lockstep
+  ASSERT_EQ(rig.net.CountOut(MsgType::ArmReject), 1u);
+  const ArmReject rej = LastReject(rig);
+  EXPECT_EQ(rej.id, 5u);
+  EXPECT_EQ(rej.frame, 25);
+  EXPECT_EQ(rej.reason, static_cast<u8>(ArmReason::NotReady));
+  EXPECT_EQ(rej.at_frame, 10);
+  EXPECT_NE(rej.gate.find("why=\"hardware busy\""), std::string::npos);
+  EXPECT_NE(rej.gate.find("quiet_streak=2/30"), std::string::npos);  // the inputs the log is for
+  EXPECT_TRUE(rig.sink.Has("ARM reject id=5 frame=25 reason=not ready"));
+  EXPECT_TRUE(rig.sink.Has("peer gate: peer gate (test)"));
   EXPECT_EQ(rig.session->stats().arm_refused, 1u);
+  EXPECT_TRUE(rig.session->mode() == Mode::LOCKSTEP);
+  // Its own gate becomes ready two frames later: it proposes itself (and the peer was not wrongly counted as agreed).
+  rig.net.Deliver(11, RemotePadScript(11));
+  rig.Frame(LocalPad(11), Closed());
+  EXPECT_EQ(rig.net.CountOut(MsgType::ArmPropose), 0u);
+  rig.net.Deliver(12, RemotePadScript(12));
+  rig.Frame(LocalPad(12), Open());
+  ASSERT_EQ(rig.net.CountOut(MsgType::ArmPropose), 1u);
+  EXPECT_EQ(LastPropose(rig).frame, 12 + 14);
+}
+
+TEST(Rev3Session, AProposalThatIsAlreadyPastIsRejectedTooLate)
+{
+  Rig rig(Role::Host, 0);
+  rig.Handshake();
+  rig.Lockstep(10);
+  rig.PeerPropose(10, 2, 3);  // F = our current call: not ahead of us any more
+  rig.net.Deliver(10, RemotePadScript(10));
+  rig.Frame(LocalPad(10), Closed());
+  EXPECT_EQ(rig.net.CountOut(MsgType::ArmAccept), 0u);
+  EXPECT_EQ(LastReject(rig).reason, static_cast<u8>(ArmReason::TooLate));
+  // ... while one for the next frame is still accepted.
+  rig.PeerPropose(12, 3, 9);
+  rig.net.Deliver(11, RemotePadScript(11));
+  rig.Frame(LocalPad(11), Open());
+  ASSERT_EQ(rig.net.CountOut(MsgType::ArmAccept), 1u);
+  ArmAccept a;
+  ASSERT_TRUE(ParseArmAccept(rig.net.LastOut(MsgType::ArmAccept)->bytes, &a));
+  EXPECT_EQ(a.id, 3u);
+}
+
+TEST(Rev3Session, AProposalThatArrivesWhileTheCallWaitsIsAnsweredInTheWaitNotAfterIt)
+{
+  Rig rig(Role::Host, 0);
+  rig.Handshake();
+  rig.Lockstep(10);
+  // Call 10 waits for the remote pad of frame 10. The peer, itself at the arm frame, is waiting for our answer: it must get one now.
+  EXPECT_FALSE(rig.TryFrame(LocalPad(10), Open()));
+  const size_t proposals = rig.net.CountOut(MsgType::ArmPropose);
+  rig.PeerPropose(20, 4, 8);
+  EXPECT_FALSE(rig.session->BlockSatisfied());                     // still no pad
+  EXPECT_EQ(rig.net.CountOut(MsgType::ArmAccept) + rig.net.CountOut(MsgType::ArmReject), 1u);  // but the answer is out
+  EXPECT_EQ(proposals, rig.net.CountOut(MsgType::ArmPropose));
+}
+
+TEST(Rev3Session, CrossedProposalsTheHostsWinsAndTheGuestAnswersIt)
+{
+  Rig host(Role::Host, 0);
+  Rig guest(Role::Guest, 0);
+  for (Rig* r : {&host, &guest})
+  {
+    r->Handshake();
+    r->Lockstep(10);
+    r->net.Deliver(10, RemotePadScript(10));
+    r->Frame(LocalPad(10), Open());
+    ASSERT_EQ(r->net.CountOut(MsgType::ArmPropose), 1u);
+  }
+  const ArmPropose from_host = LastPropose(host);
+  const ArmPropose from_guest = LastPropose(guest);
+  // Each receives the other's proposal at its next call.
+  host.net.inbox.push_back(*guest.net.LastOut(MsgType::ArmPropose));
+  guest.net.inbox.push_back(*host.net.LastOut(MsgType::ArmPropose));
+  host.net.Deliver(11, RemotePadScript(11));
+  guest.net.Deliver(11, RemotePadScript(11));
+  host.Frame(LocalPad(11), Open());
+  guest.Frame(LocalPad(11), Open());
+  // The host refuses the guest's (crossed); the guest drops its own and accepts the host's.
+  EXPECT_EQ(host.net.CountOut(MsgType::ArmAccept), 0u);
+  EXPECT_EQ(LastReject(host).reason, static_cast<u8>(ArmReason::Crossed));
+  EXPECT_EQ(guest.net.CountOut(MsgType::ArmReject), 0u);
+  ASSERT_EQ(guest.net.CountOut(MsgType::ArmAccept), 1u);
+  ArmAccept a;
+  ASSERT_TRUE(ParseArmAccept(guest.net.LastOut(MsgType::ArmAccept)->bytes, &a));
+  EXPECT_EQ(a.id, from_host.id);
+  EXPECT_EQ(a.frame, from_host.frame);
+  EXPECT_TRUE(guest.sink.Has("ARM crossed: dropping own proposal"));
+  // The host gets the accept, the guest the host's rejection of its dropped proposal (ignored): both arm at the host's frame.
+  host.net.inbox.push_back(*guest.net.LastOut(MsgType::ArmAccept));
+  guest.net.inbox.push_back(*host.net.LastOut(MsgType::ArmReject));
+  s32 hc = 12;
+  s32 gc = 12;
+  for (; hc <= from_host.frame; ++hc)
+  {
+    host.net.Deliver(hc, RemotePadScript(hc));
+    host.Frame(LocalPad(hc), Open());
+  }
+  for (; gc <= from_host.frame; ++gc)
+  {
+    guest.net.Deliver(gc, RemotePadScript(gc));
+    guest.Frame(LocalPad(gc), Open());
+  }
+  EXPECT_TRUE(host.session->mode() == Mode::ARMED);
+  EXPECT_TRUE(guest.session->mode() == Mode::ARMED);
+  EXPECT_TRUE(host.sink.Has("GATE open frame=" + std::to_string(from_host.frame)));
+  EXPECT_TRUE(guest.sink.Has("GATE open frame=" + std::to_string(from_host.frame)));
+  EXPECT_NE(from_guest.id + from_guest.frame, 0u);
+}
+
+TEST(Rev3Session, ARejectedSideBacksOffAndTooLateGrowsTheMargin)
+{
+  Rig rig(Role::Host, 0);
+  rig.Handshake();
+  rig.Lockstep(10);
+  rig.net.Deliver(10, RemotePadScript(10));
+  rig.Frame(LocalPad(10), Open());
+  EXPECT_EQ(LastPropose(rig).frame, 24);
+  rig.PeerReject(1, 24, ArmReason::NotReady);
+  s32 c = 11;
+  // First rejection: the next proposal comes 30 frames after the call that saw the rejection (call 11).
+  for (; c < 41; ++c)
+  {
+    rig.net.Deliver(c, RemotePadScript(c));
+    rig.Frame(LocalPad(c), Open());
+    EXPECT_EQ(rig.net.CountOut(MsgType::ArmPropose), 1u) << "call " << c;
+  }
+  rig.net.Deliver(c, RemotePadScript(c));
+  rig.Frame(LocalPad(c), Open());
+  ASSERT_EQ(rig.net.CountOut(MsgType::ArmPropose), 2u);
+  EXPECT_EQ(LastPropose(rig).id, 2u);
+  EXPECT_EQ(LastPropose(rig).frame, 41 + 14);
+  // TooLate: try again at once with a 16 frame longer margin.
+  rig.PeerReject(2, 55, ArmReason::TooLate);
+  ++c;
+  rig.net.Deliver(c, RemotePadScript(c));
+  rig.Frame(LocalPad(c), Open());  // sees the rejection
+  ++c;
+  rig.net.Deliver(c, RemotePadScript(c));
+  rig.Frame(LocalPad(c), Open());
+  ASSERT_EQ(rig.net.CountOut(MsgType::ArmPropose), 3u);
+  EXPECT_EQ(LastPropose(rig).frame, c + 14 + 16);
+}
+
+TEST(Rev3Session, AnAgreedFrameWithoutFightersOrWithAFighterAtHealthZeroIsCancelledAlikeOnBothSides)
+{
+  for (int kind = 0; kind < 2; ++kind)
+  {
+    Rig rig(Role::Guest, 0);
+    rig.Handshake();
+    rig.Lockstep(10);
+    rig.PeerPropose(14, 1, 9);
+    rig.net.Deliver(10, RemotePadScript(10));
+    rig.Frame(LocalPad(10), Open());
+    ASSERT_EQ(rig.net.CountOut(MsgType::ArmAccept), 1u);
+    for (s32 f = 11; f < 14; ++f)
+    {
+      rig.net.Deliver(f, RemotePadScript(f));
+      rig.Frame(LocalPad(f), Open());
+    }
+    rig.net.Deliver(14, RemotePadScript(14));
+    rig.Frame(LocalPad(14), kind == 0 ? NoFighters() : Lost());
+    EXPECT_TRUE(rig.session->mode() == Mode::LOCKSTEP) << kind;
+    EXPECT_EQ(rig.session->stats().arm_cancelled, 1u);
+    EXPECT_TRUE(rig.sink.Has("ARM id=1 frame=14 cancelled"));
+    EXPECT_EQ(rig.net.CountOut(MsgType::StartCheck), 0u);
+    EXPECT_EQ(rig.session->stats().gate_opens, 0u);
+  }
+}
+
+TEST(Rev3Session, ArmingWithTheHardwareBusyPlaysTheFirstArmedCallWithTheRealPad)
+{
+  Rig rig(Role::Guest, 0);
+  rig.Handshake();
+  rig.Lockstep(10);
+  rig.PeerPropose(12, 1, 9);
+  rig.net.Deliver(10, RemotePadScript(10));
+  rig.Frame(LocalPad(10), Open());
+  rig.net.Deliver(11, RemotePadScript(11));
+  rig.Frame(LocalPad(11), Open());
+  // Call 12 arms with a disc read in flight and its remote pad not here: a HOLD, so the call waits instead of predicting.
+  EXPECT_FALSE(rig.TryFrame(LocalPad(12), Busy()));
+  EXPECT_TRUE(rig.session->mode() == Mode::ARMED);
+  EXPECT_EQ(rig.session->stats().hw_holds, 1u);
+  EXPECT_EQ(rig.session->stats().predicted_frames, 0u);
+  rig.net.Deliver(12, RemotePadScript(12));
+  EXPECT_TRUE(rig.session->BlockSatisfied());
+  const Reply r = rig.Frame(LocalPad(12), Busy());
+  EXPECT_TRUE(SanitizePad(r.pads[0]) == RemotePadScript(12));  // the guest plays game port 1; the host's pad is port 0
+}
+
+TEST(Rev3Session, TheStartCheckNeverBlocksAndAMismatchIsADesync)
+{
+  // Equal state, the peer's START_CHECK already here when we arm.
+  {
+    Rig rig(Role::Host, 0);
+    rig.ReadyToArm(10);
+    rig.net.Deliver(10, RemotePadScript(10));
+    rig.Frame(LocalPad(10), Open());
+    EXPECT_TRUE(rig.session->mode() == Mode::ARMED);
+    EXPECT_TRUE(rig.sink.Has("CHK start frame=10"));
+    EXPECT_EQ(rig.net.CountOut(MsgType::StartCheck), 1u);
+  }
+  // The peer's START_CHECK arrives after the arm: compared then.
+  {
+    Rig rig(Role::Host, 0);
+    rig.Handshake();
+    rig.Lockstep(9);
+    rig.PeerPropose(10);
+    rig.net.Deliver(9, RemotePadScript(9));
+    rig.Frame(LocalPad(9), Open());
+    rig.net.Deliver(10, RemotePadScript(10));
+    rig.Frame(LocalPad(10), Open());
+    EXPECT_TRUE(rig.session->mode() == Mode::ARMED);
+    EXPECT_FALSE(rig.sink.Has("CHK start"));
+    const s32 mine_frame = 10;
+    StartCheck sc;
+    ASSERT_TRUE(ParseStartCheck(rig.net.LastOut(MsgType::StartCheck)->bytes, &sc));
+    EXPECT_EQ(sc.frame, mine_frame);
+    rig.net.inbox.push_back({MsgType::StartCheck, rig.net.LastOut(MsgType::StartCheck)->bytes});
+    rig.net.Deliver(11, RemotePadScript(11));
+    rig.Frame(LocalPad(11), Open());
+    EXPECT_TRUE(rig.sink.Has("CHK start frame=10"));
+    EXPECT_TRUE(rig.session->mode() == Mode::ARMED);
+  }
+  // A different state at the arm frame: DESYNC naming the items, and the session leaves.
+  {
+    Rig rig(Role::Host, 0);
+    rig.Handshake();
+    rig.Lockstep(9);
+    rig.PeerPropose(10);
+    rig.net.Deliver(9, RemotePadScript(9));
+    rig.Frame(LocalPad(9), Open());
+    rig.counter = 10;
+    rig.PeerStartCheck(/*equal=*/false);
+    rig.net.Deliver(10, RemotePadScript(10));
+    rig.Frame(LocalPad(10), Open());
+    EXPECT_TRUE(rig.session->mode() == Mode::OFFLINE);
+    EXPECT_TRUE(rig.sink.Has("DESYNC start frame=10"));
+    EXPECT_TRUE(rig.sink.Has("START_CHECK checksum:"));
+    EXPECT_TRUE(rig.sink.Has("START_CHECK field p2"));
+    EXPECT_EQ(rig.session->stats().checks_bad, 1u);
+    EXPECT_FALSE(rig.sink.osd.empty());
+  }
+}
+
+TEST(Rev3Session, ProposalsAreAnsweredNotInLockstepWhenArmedAndNeverHang)
+{
+  Rig rig(Role::Host, 0);
+  rig.ReadyToArm(10);
+  rig.Frame(LocalPad(10), Open());
+  ASSERT_TRUE(rig.session->mode() == Mode::ARMED);
+  rig.PeerPropose(40, 9, 12);
+  rig.net.Deliver(10, RemotePadScript(10));
+  rig.Frame(LocalPad(11), Open());
+  EXPECT_EQ(LastReject(rig).reason, static_cast<u8>(ArmReason::NotLockstep));
+  EXPECT_TRUE(rig.session->mode() == Mode::ARMED);
 }
 
 // ---- prediction, misprediction, rollback, resimulation ---------------------------------------------------------------------------
@@ -1562,7 +2028,7 @@ TEST(Rev3Session, QuietHardwareRollsBackAtOnce)
 // scheduled for frame 16 = 10 + MAXR + 1. Every remote pad equals its prediction. Ends in LOCKSTEP with the counter at 17.
 void PlayALostFrameToTheDrain(Rig& rig)
 {
-  rig.ReadyToArm(10);
+  rig.ArmedAt(10);
   const Pad8 predicted = RemotePadScript(9);
   rig.Frame(LocalPad(10), Lost());
   for (s32 f = 11; f <= 14; ++f)
@@ -1578,7 +2044,7 @@ void PlayALostFrameToTheDrain(Rig& rig)
 TEST(Rev3Session, ALostFinalFrameClosesTheGateMaxrPlusOneFramesLaterDrainsRollsBackAndContinuesInLockstep)
 {
   Rig rig(Role::Host, 0, 5);
-  rig.ReadyToArm(10);
+  rig.ArmedAt(10);
   const Pad8 predicted = RemotePadScript(9);
   // Frame 10 is final when it is played (all remote pads below it are confirmed): the close is scheduled at once, for the same frame the peer
   // will pick, 10 + MAXR + 1 = 16.
@@ -1642,7 +2108,7 @@ TEST(Rev3Session, ALostFinalFrameClosesTheGateMaxrPlusOneFramesLaterDrainsRollsB
 TEST(Rev3Session, ADrainWithNothingWrongJustWaitsAndSwitchesToLockstep)
 {
   Rig rig(Role::Host, 0, 5);
-  rig.ReadyToArm(10);
+  rig.ArmedAt(10);
   const Pad8 predicted = RemotePadScript(9);
   rig.Frame(LocalPad(10), Lost());
   for (s32 f = 11; f <= 14; ++f)
@@ -1668,7 +2134,11 @@ TEST(Rev3Session, TheGateCanOpenAgainAfterADrain)
   Rig rig(Role::Host, 0, 5);
   PlayALostFrameToTheDrain(rig);
   EXPECT_TRUE(rig.session->mode() == Mode::LOCKSTEP);
-  rig.Lockstep(3);       // frames 17..19
+  rig.Lockstep(2);  // frames 17, 18
+  rig.PeerPropose(20, 2, 18);  // the second arming is another agreement
+  rig.net.Deliver(19, RemotePadScript(19));
+  rig.Frame(LocalPad(19), Open());
+  EXPECT_EQ(rig.net.CountOut(MsgType::ArmAccept), 2u);  // (the first one was the arm at frame 9 of ArmedAt)
   rig.PeerStartCheck();  // frame 20
   rig.net.Deliver(20, RemotePadScript(20));
   rig.Frame(LocalPad(20), Open());
@@ -1679,7 +2149,7 @@ TEST(Rev3Session, TheGateCanOpenAgainAfterADrain)
 TEST(Rev3Session, TheCloseOfALostFrameIsScheduledOnlyOnce)
 {
   Rig rig(Role::Host, 0, 5);
-  rig.ReadyToArm(10);
+  rig.ArmedAt(10);
   rig.Frame(LocalPad(10), Lost());
   rig.Frame(LocalPad(11), Lost());  // a second lost frame before the close: no second schedule
   rig.Frame(LocalPad(12), Lost());
@@ -2498,6 +2968,9 @@ TEST(Rev3Session, NoCheckWithoutAnRttOrEnoughSamplesAndNothingInLockstep)
   EXPECT_TRUE(pacer.delays.empty());
   EXPECT_EQ(rig.sink.Count("PACE "), 0u);
 
+  rig.PeerPropose(rig.counter + 1);  // arm at the next frame
+  rig.net.Deliver(rig.counter, RemotePadScript(rig.counter));
+  rig.Frame(LocalPad(rig.counter), Open());
   rig.PeerStartCheck();
   rig.net.rtt_us = 0;  // armed, but no RTT estimate: no decision (the offset subtracts RTT/2)
   ArmedFrames(rig, 80);
@@ -3153,6 +3626,8 @@ struct SimParams
                                        // time is lost for good, a machine that rolls back often drifts later (~2 % in D's first loopback)
   u64 max_fallback_us = 100000;        // MAIN_MAX_FALLBACK: a lag beyond this is forgiven (catch_up only)
   bool pace = false;                   // pacing on (Config::pace.enabled) with a simulated actuator; false: the sessions only measure
+  s32 ready_extra[2] = {0, 0};         // machine i's gate turns READY this many frames after open_at: its local inputs (hardware quiet streak, learned
+                                       // set, write tracking) differ from the peer's by some frames (D's soak run_2 / run_6, Oct 16). A huge value = never ready.
   u64 gate_skew_us[2] = {0, 0};        // catch_up only: when machine i first turns ARMED its throttle schedule restarts at "now + this", i.e. it is that
                                        // far BEHIND a machine that restarts on time. Two greedy machines (each runs as early as the peer's pads allow)
                                        // come out of the lockstep with some skew like this; the one in front then sits at the stall limit, which is what
@@ -3175,6 +3650,7 @@ struct SimMachineResult
   u32 bad_delay_calls = 0;    // pacing delays asked in LOCKSTEP / DRAIN / a resimulation (a bug if not 0)
   u64 largest_delay_us = 0;
   u64 end_us = 0;
+  u64 max_block_us = 0;         // the longest time one call waited (a deadlock shows here as the 10 s timeout)
   std::map<s32, u64> send_log;  // when each local frame went out (the true timing, to judge the offset estimate)
 };
 
@@ -3292,6 +3768,7 @@ struct SimMachine
   bool done = false;
   bool blocking = false;
   u64 block_start = 0;
+  u64 max_block_us = 0;
   u32 phantom_lost = 0;
   SimPacer pacer;
   u64 target_us = 0;     // catch_up: when the throttle wants the next call
@@ -3350,7 +3827,7 @@ bool RunSim(const SimParams& p, SimResult* out)
       c.pads[1] = ToPadBytes(RandomPad(junk));
       Gate gate;
       gate.health_zero = LostAt(p, m.game, m.counter);
-      gate.open = GateAt(p, m.counter) && !gate.health_zero;
+      gate.open = GateAt(p, m.counter) && !gate.health_zero && m.counter >= p.open_at + p.ready_extra[m.idx];
       gate.hardware_quiet = !(p.busy_hardware && (m.busy_left > 0 || m.rng.Below(10) == 0));
       gate.hardware_hold = m.busy_left > 0 && m.busy_streak >= 3;  // GateTracker: busy for 3 calls in a row
       gate.layout_pending = m.layout_pending && m.session->mode() == Mode::ARMED;
@@ -3374,6 +3851,8 @@ bool RunSim(const SimParams& p, SimResult* out)
         m.next_at = net.now + 1000;  // the real wait polls every millisecond
         continue;
       }
+      if (m.blocking)
+        m.max_block_us = std::max(m.max_block_us, net.now - m.block_start);
       m.blocking = false;
       if (armed_call && gate.health_zero && m.counter >= 0 && static_cast<size_t>(m.counter) < out->reference_states.size())
       {
@@ -3460,6 +3939,7 @@ bool RunSim(const SimParams& p, SimResult* out)
     r.counter = m.counter;
     r.left_session = m.sink.Has("LEAVE");
     r.send_log = net.ep[i].send_log;
+    r.max_block_us = m.max_block_us;
     r.slept_us = m.pacer.total_us;
     r.delay_calls = m.pacer.calls;
     r.bad_delay_calls = m.pacer.bad_calls;
@@ -3499,6 +3979,9 @@ SimParams ParamsFromSeed(u64 seed)
   p.period_us[1] = 15500 + r.Below(2500);
   p.start_us[0] = r.Below(80000);
   p.start_us[1] = r.Below(80000);
+  // (Drawn last so every older parameter of a seed is unchanged.) The two gates become ready at different frames in most runs.
+  p.ready_extra[0] = r.Below(3) == 0 ? 0 : static_cast<s32>(r.Below(30));
+  p.ready_extra[1] = r.Below(3) == 0 ? 0 : static_cast<s32>(r.Below(30));
   return p;
 }
 
@@ -3643,6 +4126,132 @@ TEST(Rev3Session, GateClosingAndReopeningInTheMiddleStaysInAgreement)
   EXPECT_EQ(res.m[1].stats.gate_opens, 2u);
 }
 
+// The frames of the "GATE open frame=N" lines of a log, in order.
+std::vector<s32> OpenFrames(const std::string& log)
+{
+  std::vector<s32> out;
+  size_t pos = 0;
+  while ((pos = log.find("GATE open frame=", pos)) != std::string::npos)
+  {
+    pos += std::strlen("GATE open frame=");
+    out.push_back(std::atoi(log.c_str() + pos));
+  }
+  return out;
+}
+
+// D's soak, Oct 16 (run_2 and run_6 of 20261016_212543): at the start of round 2 one machine's gate was ready and the other's was not yet (the
+// hardware quiet streak, the learned set and write tracking are local, so they differ by a few frames). The ready one blocked for a START_CHECK
+// the other never sent, the other blocked for the first one's pads: 10 s, then both left. With the arm agreed over the wire a gate that is ready
+// proposes and goes on playing; the other accepts when it gets ready or proposes itself.
+TEST(Rev3Session, OneGateReadyFramesBeforeTheOtherNeverDeadlocksAndBothArmAtTheSameFrame)
+{
+  u32 armed_runs = 0;
+  for (int lead_machine = 0; lead_machine < 2; ++lead_machine)
+    for (s32 n : {1, 2, 3, 5, 8, 13, 21, 34, 55, 89})
+    {
+      SimParams p;
+      p.seed = static_cast<u64>(100 + n);
+      p.delay = 2;
+      p.maxr = 5;
+      p.net.delay_us = 70000;
+      p.net.jitter_us = 30000;
+      p.net.loss_pct = 5;
+      p.frames = 400;
+      p.open_at = 30;
+      p.close_at = 380;
+      p.ready_extra[lead_machine] = 0;
+      p.ready_extra[1 - lead_machine] = n;  // the other gate is ready n frames later
+      SimResult res;
+      ASSERT_TRUE(RunSim(p, &res)) << "n " << n << ": the scheduler gave up (deadlock)";
+      const std::string what = "lead " + std::to_string(lead_machine) + " n " + std::to_string(n);
+      EXPECT_EQ(CheckHealthy(p, res), "") << what;
+      const std::vector<s32> a = OpenFrames(res.m[0].log);
+      const std::vector<s32> b = OpenFrames(res.m[1].log);
+      ASSERT_EQ(a.size(), 1u) << what << "\n" << res.m[0].log;
+      EXPECT_EQ(a, b) << what;  // the same arm frame on both machines
+      EXPECT_GE(a[0], p.open_at + n) << what;
+      for (const SimMachineResult& m : res.m)
+      {
+        EXPECT_LT(m.max_block_us, 1000000u) << what << ": a wait of a second or more (the deadlock waited 10 s)";
+        EXPECT_FALSE(m.left_session) << what;
+        EXPECT_EQ(m.stats.checks_bad, 0u) << what;
+        EXPECT_NE(m.log.find("CHK start frame="), std::string::npos) << what << ": the START_CHECK was compared";
+      }
+      ++armed_runs;
+    }
+  EXPECT_EQ(armed_runs, 20u);
+}
+
+TEST(Rev3Session, ABothSidesProposalRaceIsSettledByTheHost)
+{
+  // Both gates are ready at the same frame: both propose; the host's proposal wins, the guest's is dropped. One arm, the same frame, no wait.
+  for (u64 seed = 1; seed <= 30; ++seed)
+  {
+    SimParams p;
+    p.seed = seed;
+    p.delay = static_cast<int>(seed % 4);
+    p.maxr = 5;
+    p.net.delay_us = 20000 + (seed % 5) * 20000;
+    p.net.jitter_us = 15000;
+    p.net.loss_pct = 3;
+    p.frames = 300;
+    p.open_at = 30;
+    p.close_at = 280;
+    SimResult res;
+    ASSERT_TRUE(RunSim(p, &res)) << "seed " << seed;
+    EXPECT_EQ(CheckHealthy(p, res), "") << "seed " << seed;
+    const std::vector<s32> a = OpenFrames(res.m[0].log);
+    ASSERT_EQ(a.size(), 1u) << "seed " << seed;
+    EXPECT_EQ(a, OpenFrames(res.m[1].log)) << "seed " << seed;
+    EXPECT_EQ(res.m[1].stats.arm_accepted, 1u) << "seed " << seed << ": the guest accepted the host's proposal\n" << res.m[1].log;
+    EXPECT_EQ(res.m[0].stats.arm_accepted, 0u) << "seed " << seed;
+    EXPECT_EQ(res.m[0].stats.arm_proposed, 1u) << "seed " << seed;
+  }
+}
+
+TEST(Rev3Session, WhenTheOtherGateNeverBecomesReadyBothStayInLockstepAndThePadsKeepFlowing)
+{
+  for (int never = 0; never < 2; ++never)
+  {
+    SimParams p;
+    p.seed = 31;
+    p.delay = 2;
+    p.maxr = 5;
+    p.net.delay_us = 60000;
+    p.net.jitter_us = 20000;
+    p.net.loss_pct = 4;
+    p.frames = 600;
+    p.open_at = 30;
+    p.close_at = 580;
+    p.ready_extra[never] = 1000000;  // this machine's gate is never ready
+    SimResult res;
+    ASSERT_TRUE(RunSim(p, &res)) << never;
+    EXPECT_EQ(CheckHealthy(p, res), "") << never;
+    // The same run with nobody ready at all is the baseline of how long the lockstep takes.
+    SimParams q = p;
+    q.ready_extra[0] = q.ready_extra[1] = 1000000;
+    SimResult base;
+    ASSERT_TRUE(RunSim(q, &base));
+    for (const SimMachineResult& m : res.m)
+    {
+      EXPECT_EQ(m.stats.gate_opens, 0u) << never;
+      EXPECT_EQ(m.stats.predicted_frames, 0u) << never;  // lockstep all the way
+      EXPECT_EQ(m.counter, p.frames) << never;
+      EXPECT_FALSE(m.left_session) << never;
+      EXPECT_LT(m.max_block_us, 1000000u) << never;
+    }
+    const SimMachineResult& ready = res.m[1 - never];
+    EXPECT_GE(ready.stats.arm_proposed, 3u) << never;       // it keeps trying
+    EXPECT_LE(ready.stats.arm_proposed, 20u) << never;      // ... with a back-off, not every frame
+    EXPECT_EQ(ready.stats.arm_proposed, ready.stats.arm_rejected) << never;
+    EXPECT_EQ(res.m[never].stats.arm_refused, ready.stats.arm_proposed) << never;
+    EXPECT_TRUE(res.m[never].log.find("reason=not ready") != std::string::npos) << res.m[never].log;
+    EXPECT_TRUE(ready.log.find("rejected by the peer: not ready") != std::string::npos) << ready.log;
+    // The proposals and rejections cost the run nothing worth measuring.
+    EXPECT_LE(res.end_us, base.end_us + 100000) << never << ": " << res.end_us << " vs " << base.end_us;
+  }
+}
+
 TEST(Rev3Session, ASeedReproducesTheSameLogs)
 {
   const SimParams p = ParamsFromSeed(77);
@@ -3756,15 +4365,25 @@ TEST(Rev3Session, AnInjectedRulesDifferenceIsCaughtAtTheNextCheckFrameByBothSide
     ASSERT_TRUE(res.finished) << "seed " << seed;
     const s32 expected_check = ((p.bug_frame + 1 + 29) / 30) * 30;  // the first check frame whose start state contains the difference
     const std::string want = "DESYNC frame=" + std::to_string(expected_check) + " ";
+    // A gate that opens again after the bug (the machines already differ) is caught by the START_CHECK of that arm, earlier than the check frame:
+    // "DESYNC start frame=<arm frame>" with the arm frame in (bug_frame, expected_check].
+    const auto caught_by = [&](const std::string& log) {
+      if (log.find(want) != std::string::npos)
+        return true;
+      const size_t at = log.find("DESYNC start frame=");
+      if (at == std::string::npos)
+        return false;
+      const s32 frame = std::atoi(log.c_str() + at + std::strlen("DESYNC start frame="));
+      return frame > p.bug_frame && frame <= expected_check;
+    };
     for (int i = 0; i < 2; ++i)
     {
-      EXPECT_TRUE(res.m[i].log.find(want) != std::string::npos) << "seed " << seed << " machine " << i << " wanted '" << want << "'\n"
-                                                                << res.m[i].log;
+      EXPECT_TRUE(caught_by(res.m[i].log)) << "seed " << seed << " machine " << i << " wanted '" << want << "' or a START_CHECK desync\n" << res.m[i].log;
       EXPECT_TRUE(res.m[i].mode == Mode::OFFLINE) << "seed " << seed << " machine " << i;
       EXPECT_EQ(res.m[i].stats.checks_bad, 1u);
       EXPECT_EQ(res.m[i].counter, p.frames);  // the game goes on offline
     }
-    if (res.m[0].log.find(want) != std::string::npos && res.m[1].log.find(want) != std::string::npos)
+    if (caught_by(res.m[0].log) && caught_by(res.m[1].log))
       ++caught;
   }
   EXPECT_EQ(caught, 40u);
@@ -3884,8 +4503,9 @@ TEST(Rev3Session, PacingRemovesTheLeadersPersistentStallsWhenOneSideStartsFiveFr
 {
   u32 compared = 0;
   // (A start 5 frames ahead is not always persistent: a long jitter stall can make the leader's lag exceed MAIN_MAX_FALLBACK, which shifts its schedule
-  // back and ends the lead on its own. These seeds are the ones where it persists with pacing off, which is the case worth fixing.)
-  for (u64 seed : {12ull, 13ull, 15ull, 16ull})
+  // back and ends the lead on its own. These seeds are the ones where it persists with pacing off, which is the case worth fixing. The list was
+  // re-picked on Oct 17, when the arm became an agreed frame: the arm frame moved, and with it which seeds keep their lead.)
+  for (u64 seed : {11ull, 12ull, 13ull, 16ull})
     for (u64 resim_us : {2000ull, 8000ull})
     {
       SimResult off, on;
@@ -3944,7 +4564,7 @@ TEST(Rev3Session, ARollbackThatKeepsTheThrottleScheduleLeavesTheMachineLevelWith
   // EndResim): the guest pays for the re-run out of the following frames (it runs them unthrottled until it is back on its schedule) and stays level
   // with no pacing at all.
   // (Seeds where the two machines happen to come out of the lockstep level: the question here is what the rollbacks do, not the gate skew.)
-  for (u64 seed : {12ull, 13ull})
+  for (u64 seed : {12ull, 16ull})  // (re-picked on Oct 17 with the agreed arm frame: seeds where the two come out level)
     for (u64 resim_us : {2000ull, 8000ull})
     {
       SimParams keep = LoopbackLikeParams(seed, 0, resim_us, false);

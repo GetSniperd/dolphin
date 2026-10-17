@@ -702,7 +702,7 @@ present and unit/loopback tested, but the gate is off until you ask for it.
 | `REV3_NET_ARM=n` | 600 | hook calls in a row with both fighters found before the gate may open (SyncTest's number, 10 s) |
 | `REV3_NET_QUIET=n` | 60 | hook calls in a row without a disc read in flight before the gate may open |
 | `REV3_NET_TIMEOUT_S=n` | 120 | connect + HELLO (the frame-0 barrier). D starts the two emulators by hand |
-| `REV3_NET_WAIT_MS=n` | 10000 | no remote pad this long in lockstep = the peer is gone, play on offline |
+| `REV3_NET_WAIT_MS=n` | 10000 | no remote pad this long in lockstep (or no answer to an ARM_PROPOSE) = the peer is gone, play on offline |
 | `REV3_NET_LOG=file` | `<User>\Logs\rev3_net_<role>.log` | the net log (below). The Rev3 log (`rev3_synctest.log`) only gets a pointer line |
 | `REV3_NET_STABLE=file` | none | `{"ranges":[...]}`: memory whose CRC both sides compare at arm time (START_CHECK); the file's CRC is part of HELLO so both must use the same file |
 | `REV3_NETSIM`, `REV3_NET_BUSY`, `REV3_NET_RANGE_CRC` | | M4, see "Netplay (M4)" |
@@ -724,7 +724,7 @@ counter is the session clock; the first command must be frame 0 or the run leave
 |---|---|---|
 | PAD `0x80` | 1, unsequenced | `u8 id, s32 newest wire frame, u8 sender port, s32 checksum frame, u32 checksum`, then the unacked local pads, 8 bytes each, newest first (Slippi's `SendSlippiPad` layout, big endian) |
 | PAD_ACK `0x81` | 2, unsequenced | `u8 id, s32 acked wire frame, u8 sender port` |
-| HELLO `0x90`, START_CHECK `0x91`, DESYNC_DUMP `0x92`, BYE `0x93`, RANGE_CRC `0x94` (M4, testing) | 0, reliable | `u8 id, u32 sequence, payload` (payloads: `Rev3Session.h`) |
+| HELLO `0x90`, START_CHECK `0x91`, DESYNC_DUMP `0x92`, BYE `0x93`, RANGE_CRC `0x94` (M4, testing), ARM_PROPOSE `0x95`, ARM_ACCEPT `0x96`, ARM_REJECT `0x97` (Oct 17) | 0, reliable | `u8 id, u32 sequence, payload` (payloads: `Rev3Session.h`) |
 
 The receiver stores every pad of a packet by its own frame and acks R, the highest frame with all pads up to it present, so a lost packet
 never makes an ack lie; the first 64 or more remote pads are contiguous from frame 0. A sender re-sends its unacked pads after about
@@ -742,8 +742,9 @@ numbers, and the `REV3_NET_STABLE` file CRC. Two equal roles are a mismatch. The
 ### The arm gate (only with `REV3_NET_ROLLBACK=1`)
 
 Opens after: both fighters found for `REV3_NET_ARM` normal calls in a row, no disc read in flight for `REV3_NET_QUIET` calls, nobody at
-health 0 (fighter + 0x28), the adaptive snapshot set learned, the session in lockstep. Then the snapshot set is installed and both
-machines exchange START_CHECK (the exact state at the same frame) before prediction starts. How it closes again (fighters lost, a
+health 0 (fighter + 0x28), the adaptive snapshot set learned, the session in lockstep. Then the snapshot set is installed and the two
+machines agree on the frame to arm at (ARM_PROPOSE / ARM_ACCEPT, next section); at that frame they exchange START_CHECK (the exact state)
+and prediction starts. How it closes again (fighters lost, a
 fighter at health 0) and what a disc read does is the M4 gate rule below: both machines close at the same frame, decided on final
 frames only. The set never changes while snapshot slots are in use.
 
@@ -819,8 +820,9 @@ Not in v1: skipping the render / SFX of re-run frames inside the game (M6, below
 The shared modes are LOCKSTEP and ARMED. In M3 the gate was evaluated on the live state every call, which a misprediction can change: one machine
 could see a fighter at health 0 in a timeline that never happened and close while the other did not. Now:
 
-- **Open** is decided in LOCKSTEP, where every frame is final. It takes effect at the frame where both START_CHECKs name the same frame and
-  carry the same state; a side whose local conditions differ simply sends none and both stay in lockstep.
+- **Open** is an agreement over the wire (see "Arming is an agreement", below). It is decided in LOCKSTEP, where every frame is final, and takes
+  effect at a frame F both machines named; a side whose local conditions differ answers "not ready" and both stay in lockstep while pads keep
+  flowing. (Until Oct 17 the side that was ready sent START_CHECK and blocked for the peer's; see the deadlock below.)
 - **Close** (a fighter at health 0, or fighters not found) is decided on **final frames only**. The live flags of every call (resimulated
   ones too) are recorded with the capture of the frame; when frame F becomes final (all remote pads below F were played as confirmed) its record
   is the same on both machines. The first final frame F whose record says "lost" schedules the close for frame **F + MAXR + 1**
@@ -842,6 +844,60 @@ other direction (a misprediction hides a real loss until the true timeline makes
 machines log the same `GATE close frame=` lines in the same order and that `gate_late` stays 0. The simulation counts the calls where the live
 state said "lost" and the true timeline did not (a gate that followed the live state would have closed one side there) and the test requires
 that they happen; a mutation that follows the live state makes the tests fail.
+
+### Arming is an agreement, not a wait (Oct 17; the soak deadlock)
+
+**What happened.** D's bot soak 20261016_212543: in 2 of 6 runs both machines left after exactly 10 s at the start of round 2 (`run_6`: guest
+`ARM frame=8848 refused: no START_CHECK from the peer within 10000 ms`, then `LEAVE ... reason=no remote pad for 10000 ms (frame 8851, R=8850)`; `run_2`:
+host, frame 9835). Round 1 had ended with `GATE close` at the same frame and `DRAIN done` on both. The old `TryArm` sent START_CHECK and **blocked** for the
+peer's as soon as ITS gate was ready. The gate inputs are local (the hardware quiet streak, the learned snapshot set, write tracking, the prepare
+step), so the other machine's gate opened some frames later; in those frames it ran lockstep, needed the first machine's pad for frame N + D + 1, and the
+first machine was blocked in the arm wait and had stopped sending pads. Each waited for the other until `wait_timeout_ms`. The host of run_2 then played
+on offline while the runner waited for it (verdict TIMEOUT; see "Bot soak" for the classifier fix).
+
+**The rule.** Nothing may wait for a decision the peer takes from local inputs; a machine that cannot yet arm must not stop the pad stream. Arming is
+now agreed in three small reliable messages (payloads in `Rev3Session.h`; `id` numbers the proposer's proposals):
+
+| message | meaning |
+|---|---|
+| ARM_PROPOSE `id, frame F, at_frame, gate text` | the sender's gate is ready; arm at call F. F = its current call + a margin (about one round trip + 2 * D + 6 frames, at least `arm_margin_min` = 12, at most `arm_margin_cap` = 150; +16 after each TooLate) |
+| ARM_ACCEPT `id, F, at_frame` | the answerer's gate is ready now and F is still ahead of it; it **will** arm at F |
+| ARM_REJECT `id, F, at_frame, reason, gate text` | `not ready` / `too late` (already at or past F: the proposer grows its margin and proposes again at once) / `not lockstep` / `crossed` (both proposed at once: the host's proposal wins, the guest drops its own) / `busy` (already agreed to another) |
+
+- The proposer goes on playing LOCKSTEP (its pads flow) and arms at call F **only if the ACCEPT is in**; the accepter arms at F unconditionally, because
+  it said yes. A rejected side retries with a back-off (30 frames, doubling up to 300) and the rejecter proposes itself when its gate turns ready.
+- At F both machines decide on **shared** state only (both fighters found, nobody at health 0: identical on both in lockstep). If it fails both cancel
+  alike and silently (`ARM id=.. frame=.. cancelled: ...`), a fighter-less F is not an error.
+- The only wait is the proposer's at call F when the answer has not arrived (`Block::ArmAnswer`, `arm_waits` / `arm_wait_ms_max` in SUMMARY). The answer
+  is sent the moment the peer reads the proposal, and every wait of the session reads messages, so it does not depend on the peer's gate. More than
+  `wait_timeout_ms` without it = a dead link = `LEAVE reason=no answer to ARM_PROPOSE id=.. frame=.. within .. ms`.
+- START_CHECK (the exact state at F) is sent when arming and **compared whenever the peer's arrives**, without any wait. A machine that is ARMED while
+  the peer is still in its last lockstep call is safe (lockstep frames are final; the armed one only predicts when the pad is not yet there). A
+  mismatch is `DESYNC start frame=..` and the session is left. The first ARMED call with busy hardware starts as a HOLD (the busy check of that call
+  was not seen by the gate).
+- Review of the other waits (all pad waits, none on a decision): LOCKSTEP / HOLD / STALL / DRAIN wait for the peer's pad of a frame <= the current one,
+  which the peer sent before it could wait (a call stores and sends its own pad for N + D before it blocks); RELAYOUT is a local drain; the scheduled
+  CLOSE has no wait of its own (both enter DRAIN at F + MAXR + 1 from final frames). Header comment "EVERY WAIT AND THE PAD STREAM" has the table.
+  The gate-close rule above is unchanged.
+
+**Log lines** (net log): `ARM propose id=.. frame=.. (call N + margin M; rtt .. ms, delay D) own gate: <inputs>`, `ARM accept id=.. frame=..`,
+`ARM agreed id=.. frame=..`, `ARM reject id=.. frame=.. reason=.. ...; own gate: ..; peer gate: ..` (on the machine that refused), `ARM propose id=.. rejected
+by the peer: <reason> ... own gate / peer gate`, `ARM id=.. frame=.. cancelled: ..`, `ARM armed id=.. frame=.. (own|the peer's proposal)`, `GATE open frame=..`,
+`CHK start frame=.. (both machines agree)`, `ARM crossed: dropping own proposal ...`. The first 8 refusal lines are written in full, then every 20th
+(the rest are counted in `arm_rejected`). The gate inputs are `fighters_found=1 (streak n/ARM) hardware_quiet=1 (streak n/QUIET) health_zero=0
+learning_done=1 layout_pending=0 open=0 prepared=0 write_track=armed learned=.. deferred=.. restarts=.. misses=..` (`GateTracker::Describe`,
+`SyncTest::NetWriteTrackText`) so a refusal says which input held that machine back. SUMMARY gains `arm_proposed arm_accepted arm_rejected arm_cancelled
+arm_waits arm_wait_ms_max` (`arm_refused` counts the refusals this machine gave).
+
+**What to look for in the next soak.** `ARM propose` followed by `ARM accept` and `ARM agreed` / `GATE open frame=` with the same frame on both logs at
+the start of every round; no `LEAVE ... no remote pad` at a round change; `arm_wait_ms_max` in the tens of milliseconds (a round trip), not seconds; if
+one side shows many `ARM reject ... not ready`, the `own gate` text names the input that is slow (a quiet streak that keeps restarting = a disc read
+every few frames; `learning_done=0` = the adaptive set is still learning; `prepare_failed` = the snapshot set was unusable).
+
+Tests: `Rev3Session.*Arm*` (the protocol, crossing, expiry, back-off, cancel at F, START_CHECK compare), the two-machine simulation with one gate ready
+N frames before the other (`OneGateReadyFramesBeforeTheOtherNeverDeadlocksAndBothArmAtTheSameFrame`, N = 1..89 frames, loss and jitter; the old code left
+after 10 s in 4 of 10 sampled cases, all with N >= 8), `WhenTheOtherGateNeverBecomesReadyBothStayInLockstep...` (pads keep flowing, no LEAVE), and the 1000-seed lossy run, whose
+parameters now include a random per-machine gate delay.
 
 ### Busy hardware (disc read / DVD DMA)
 
@@ -979,8 +1035,8 @@ Hard: ahead by more than `t1_us` loses `min(offset - hard_target_us, hard_max_us
 `interval * permille/1000 * min(offset, 2 frames) / 2 frames`. Worst case in the hard window: about 4 checks x 83 ms; afterwards at most 10 ms per 500 ms (2 %).
 
 **Skew at the gate.** In lockstep every call waits for the peer's pad and then runs unthrottled until it is back on its schedule, so neither machine's throttle
-clock says anything about the other. When the gate opens (both at the same frame) the two are some frames apart (about the one-way latency plus jitter plus the START_CHECK
-exchange; the test network starts them 0-8 frames apart). Nothing in the protocol removes it, which is what the hard window is for: the machine that is ahead gives it back
+clock says anything about the other. When the gate opens (both at the same frame) the two are some frames apart (about the one-way latency plus jitter plus the ARM_PROPOSE /
+START_CHECK exchange; the test network starts them 0-8 frames apart). Nothing in the protocol removes it, which is what the hard window is for: the machine that is ahead gives it back
 at once (at most 5 frames per check), the one that is behind does nothing.
 
 ### Variables
@@ -1106,11 +1162,21 @@ Quitting: `Host_Message(WMUserStop)` (the same path as closing the window; Dolph
 confirmation or stays open). `Rev3::Shutdown` then writes `BYE` (reason `planned exit: ...`, so the peer logs `LEAVE reason=the peer left (planned
 exit: ...)`) and `SUMMARY`. If the stop has not ended the process after 20 s (`STOP_GRACE_MS`) it ends with exit code 72.
 
-Exit codes: 0 = clean stop, 70 = freeze, 71 = `REV3_NET_MAX_S`, 72 = stop did not finish. Anything else (and a crash) is the runner's CRASH.
+**An unplanned LEAVE ends the run too (Oct 17).** With `REV3_NET_EXIT` set, a net session that leaves for any reason that is not a planned exit (a wait
+timeout, a desync, a HELLO mismatch, a lost connection, `the peer left (<anything but planned exit / the emulator was closed>)`; `Bot::IsPlannedLeaveReason`)
+makes the exit controller decide at once: the net log gets `EXIT unplanned leave reason=".." frame=.. ko=.. stop_in_calls=.. (exit code 73)`,
+`REV3_NET_EXIT_WAIT_S` seconds later (counted in hook calls, the game keeps running offline meanwhile) the usual `EXIT stop requested` and the stop, and
+`Rev3::Shutdown` ends the process with `std::_Exit(73)` after the logs are closed. Before this a side that had left carried on offline until the runner's
+cap (D's run_2: killed 60 s after the other side exited, verdict TIMEOUT although the LEAVE was the cause). A leave after a planned decision changes
+nothing (that stop is already under way). With `REV3_NET_EXIT` unset the game still goes on offline after a leave, as before. Code 73 skips the rest of
+Dolphin's own shutdown, which a soak does not need.
 
-Log lines (Rev3 log; the net log gets the `EXIT stop requested` line): `NOTE bot on (REV3_PAD_BOT=..)`, `NOTE automatic exit ..`, `NOTE exit watcher ..`, `BOT fight found frame=..`, `BOT takeover frame=.. why=.. seed=.. port=..`, `BOT mode=fight|menu frame=..`, `EXIT watching ..`, `EXIT ko=<n> frame=..`, `EXIT planned reason=".." frame=.. ko=..`, `EXIT stop requested ..`, `EXIT freeze ..`, `EXIT code=70 (freeze)`, `EXIT max_s ..`, `EXIT stop did not end the process ..`, `ERROR REV3_PAD_BOT ..` / `ERROR REV3_NET_EXIT ..`.
+Exit codes: 0 = clean stop, 70 = freeze, 71 = `REV3_NET_MAX_S`, 72 = stop did not finish, 73 = the net session left unplanned (the `LEAVE` and `EXIT unplanned leave` lines
+have the reason). Anything else (and a crash) is the runner's CRASH; rev3-mod `soak.py` reports 73 as PROBLEM with the LEAVE reason.
 
-Tests: `Rev3Bot.*` (29), `Rev3Rollback.*Bot*` / `ReadGameObs*`; `Rev3Session.Mirror*` / `LocalPadDiagnostics*` / `ANeutralLocalPad*` and `Rev3NetLink.PadMirror*` (the mirror, the counters, the 10 s note, the option).
+Log lines (Rev3 log; the net log gets the `EXIT stop requested` line): `NOTE bot on (REV3_PAD_BOT=..)`, `NOTE automatic exit ..`, `NOTE exit watcher ..`, `BOT fight found frame=..`, `BOT takeover frame=.. why=.. seed=.. port=..`, `BOT mode=fight|menu frame=..`, `EXIT watching ..`, `EXIT ko=<n> frame=..`, `EXIT planned reason=".." frame=.. ko=..`, `EXIT unplanned leave reason=".." frame=.. ko=.. ..`, `EXIT stop requested ..`, `EXIT freeze ..`, `EXIT code=70 (freeze)`, `EXIT max_s ..`, `EXIT stop did not end the process ..`, `ERROR REV3_PAD_BOT ..` / `ERROR REV3_NET_EXIT ..`.
+
+Tests: `Rev3Bot.*` (32; `AnUnplannedLeave*`, `ALeaveAfterAPlannedDecision*`, `OnlyThePeersPlannedExit*` for code 73), `Rev3Rollback.*Bot*` / `ReadGameObs*`; `Rev3Session.Mirror*` / `LocalPadDiagnostics*` / `ANeutralLocalPad*` and `Rev3NetLink.PadMirror*` (the mirror, the counters, the 10 s note, the option).
 
 ## Known gaps (after M6 fork side)
 

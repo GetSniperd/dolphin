@@ -3068,7 +3068,7 @@ TEST(Rev3Rollback, NetModeCapturesAndRestoresFramesInARing)
   for (u32 f = 1010; f <= 1020; ++f)
     EXPECT_FALSE(rig.test.NetHas(f)) << f;
   EXPECT_EQ(rig.test.NetSlotSp(1016), 0u);
-  EXPECT_FALSE(rig.test.NetLayoutPending());
+  EXPECT_FALSE(rig.test.NetLayoutPending());  EXPECT_EQ(rig.test.NetWriteTrackText(), "off");  // the text the gate log carries; write tracking is off in this rig
 }
 
 TEST(Rev3Rollback, NetModeLosingTheFightersForgetsTheSet)

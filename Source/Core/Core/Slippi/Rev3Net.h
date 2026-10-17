@@ -200,6 +200,9 @@ public:
   // The reason the BYE carries when the emulator closes (default "the emulator was closed"). The unattended soak sets "planned exit: ..." before
   // it asks the emulator to stop, so the peer's `LEAVE ... reason=the peer left (planned exit: ...)` is told apart from a crash.
   void SetExitReason(const std::string& reason) { m_exit_reason = reason; }
+  // The session left on the last OnCommand for a reason that is not a planned exit (Bot::IsPlannedLeaveReason): returns true once with the LEAVE
+  // reason, then false. The glue hands it to the ExitController (REV3_NET_EXIT: stop the emulator, exit code Bot::EXIT_CODE_LEFT).
+  bool TakeUnplannedLeave(std::string* why);
 
 private:
   void Start(const Command& command);
@@ -221,6 +224,9 @@ private:
   GateTracker m_gate_tracker;
   ResimHiding m_hiding;
   Gate m_last_gate;
+  bool m_unplanned_leave = false;  // set when the session left unplanned (TakeUnplannedLeave)
+  std::string m_leave_why;
+  std::string m_gate_detail;  // Gate::detail of the current call (the gate inputs in words), kept here so the pointer stays valid during OnCommand
   std::unique_ptr<EnetTransport> m_transport;
   std::unique_ptr<SyncTestStore> m_store;
   std::unique_ptr<RollbackSession> m_session;

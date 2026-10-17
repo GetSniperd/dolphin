@@ -13,6 +13,10 @@
 //                              with code EXIT_CODE_FREEZE (0 = off, the default)
 //   REV3_NET_MAX_S=n           hard cap in wall seconds from the first hook command: stop requested, and exit code EXIT_CODE_MAX_S if that
 //                              does not end the process (0 = off, the default)
+//   unplanned LEAVE            with REV3_NET_EXIT set, a netplay session that ends for any reason but the other side's planned exit (a timeout, a
+//                              desync, a lost link) stops the emulator after REV3_NET_EXIT_WAIT_S and the process exits with EXIT_CODE_LEFT
+//                              (ExitController::NoteLeave). Before this a session that left carried on offline and the run only ended at the
+//                              runner's timeout (D's soak, Oct 16: run_2 and run_6).
 //
 // HOW IT FITS IN
 //   Pure logic (no Dolphin, no clock, no files): Rev3Rollback.cpp's DeterminismKit calls PadBotController after the pad script has had its say,
@@ -214,7 +218,8 @@ constexpr u32 EXIT_CALLS_PER_SECOND = 60;
 struct ExitStep
 {
   bool stop = false;  // request the emulator to stop now
-  std::string reason; // "match: ...", "frames:N", "rounds:N"
+  bool left = false;  // the stop is the one NoteLeave decided (the session left unplanned): the process exits with EXIT_CODE_LEFT
+  std::string reason; // "match: ...", "frames:N", "rounds:N", "net session left: <why>"
 };
 
 // Watches the game from the CPU thread (one call per hook call that is not a resimulation) and decides when the run is over:
@@ -229,6 +234,9 @@ class ExitController
 public:
   ExitController(const ExitSpec& spec, const ExitTuning& tuning, LogFn log);
   ExitStep OnCall(u32 frame, const GameObs& obs);
+  // The net session left for a reason that is not a planned exit of either side: the run is over, whatever the game is doing. Decides like a
+  // planned exit (the stop follows wait_calls later) but marks the step `left`. False (and nothing happens) when disabled or already decided.
+  bool NoteLeave(u32 frame, const std::string& why);
 
   u32 Kos() const { return m_ko; }
   bool Decided() const { return m_decided; }
@@ -252,6 +260,7 @@ private:
   u32 m_away_run = 0;
   u32 m_lost_run = 0;
   bool m_decided = false;
+  bool m_left = false;  // the decision is NoteLeave's
   u32 m_decide_call = 0;
   std::string m_reason;
   bool m_stop_sent = false;
@@ -261,7 +270,13 @@ private:
 constexpr int EXIT_CODE_FREEZE = 70;     // the freeze watchdog ended the process (LEAVE ... reason=freeze in the net log)
 constexpr int EXIT_CODE_MAX_S = 71;      // REV3_NET_MAX_S ran out and the stop request did not end the process
 constexpr int EXIT_CODE_STOP_HANG = 72;  // a planned stop was requested and the process did not end in STOP_GRACE_MS
+constexpr int EXIT_CODE_LEFT = 73;       // the net session left unplanned (timeout, desync, lost link) and the run was stopped by REV3_NET_EXIT (LEAVE in the net log)
 constexpr u32 STOP_GRACE_MS = 20000;     // how long a requested stop may take before the process is ended hard (milliseconds)
+
+// Is this LEAVE reason one of a planned end? The session's reasons: "the peer left (<peer's BYE text>)" where the peer's text is its ExitController
+// reason ("planned exit: ...") or "the emulator was closed". Everything else (timeouts, desync, HELLO mismatch, connection lost, ...) is unplanned.
+// Our own planned exit never reaches this: it ends the session from Shutdown, after the last hook command.
+bool IsPlannedLeaveReason(const std::string& why);
 
 // REV3_NET_FREEZE_EXIT_S seconds after the freeze dump's stall limit with no hook command: `age_ms` = time since the last command, `stall_ms` = the
 // dump's stall limit (REV3_SYNCTEST_DUMP_STALL_MS), `blocked` = the net session is deliberately waiting for the peer, `seen` = a command ever arrived.

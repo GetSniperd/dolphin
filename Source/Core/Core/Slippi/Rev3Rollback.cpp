@@ -2890,6 +2890,14 @@ std::string SyncTest::WriteTrackFields() const
                 m_stats.wt_deferred, m_stats.wt_restarts, m_stats.wt_misses);
 }
 
+std::string SyncTest::NetWriteTrackText() const
+{
+  if (m_options.write_track == 0)
+    return "off";
+  return Format("%s learned=%u deferred=%u restarts=%u misses=%u", m_watching ? "armed" : "idle", m_stats.wt_pages_learned, m_stats.wt_deferred,
+                m_stats.wt_restarts, m_stats.wt_misses);
+}
+
 std::string SyncTest::SnapshotLine() const
 {
   const char* kind = (m_watching || m_stats.wt_arms != 0) ? "write_track" : (m_options.adaptive ? "adaptive" : "classic");
@@ -5792,6 +5800,7 @@ struct Module
   std::unique_ptr<DolphinDumpSource> dump_source;  // freeze dump (REV3_SYNCTEST_DUMP); null = off
   std::unique_ptr<FreezeDump> dump;
   std::unique_ptr<StallWatchdog> watchdog;
+  int exit_code = 0;                                // set when the process must end with a code (Bot::EXIT_CODE_LEFT): Shutdown ends it at the very end
   Bot::BotOptions bot_options;                      // REV3_PAD_BOT / REV3_NET_EXIT / REV3_NET_EXIT_WAIT_S / REV3_NET_FREEZE_EXIT_S / REV3_NET_MAX_S
   std::unique_ptr<Bot::PadBotController> bot;       // REV3_PAD_BOT; also held by the kit (SetBot)
   std::unique_ptr<Bot::ExitController> exit_ctl;    // REV3_NET_EXIT
@@ -6423,9 +6432,9 @@ void InitializeBot(Module& module)
   {
     module.exit_watcher = std::make_unique<ExitWatcher>(freeze ? module.dump.get() : nullptr, log, freeze ? options.freeze_exit_s : 0, options.max_s,
                                                         []() { Host_Message(HostMessageID::WMUserStop); });
-    log.Line(Format("NOTE exit watcher: freeze_exit_s=%u max_s=%u stop_grace_ms=%u (exit codes: freeze %d, max_s %d, stop hang %d)",
+    log.Line(Format("NOTE exit watcher: freeze_exit_s=%u max_s=%u stop_grace_ms=%u (exit codes: freeze %d, max_s %d, stop hang %d, unplanned leave %d)",
                     freeze ? options.freeze_exit_s : 0, options.max_s, Bot::STOP_GRACE_MS, Bot::EXIT_CODE_FREEZE, Bot::EXIT_CODE_MAX_S,
-                    Bot::EXIT_CODE_STOP_HANG));
+                    Bot::EXIT_CODE_STOP_HANG, Bot::EXIT_CODE_LEFT));
   }
 }
 
@@ -6598,11 +6607,25 @@ void ObserveExit(Module& module, u32 frame)
   Sink* const log = module.net_sink != nullptr ? static_cast<Sink*>(module.net_sink.get()) : static_cast<Sink*>(module.sink.get());
   if (log != nullptr)
     log->Line(Format("EXIT stop requested frame=%u reason=\"%s\" ko=%u", frame, step.reason.c_str(), module.exit_ctl->Kos()));
-  if (module.net != nullptr)
+  if (module.net != nullptr && !step.left)  // after an unplanned leave the session is offline already: no BYE goes out
     module.net->SetExitReason("planned exit: " + step.reason);
   if (module.exit_watcher != nullptr)
     module.exit_watcher->NoteStop();
   Host_Message(HostMessageID::WMUserStop);
+}
+
+// REV3_NET_EXIT and the net session left for a reason that is not a planned exit (a timeout, a desync, a lost link; D's soak, Oct 16: run_2 and
+// run_6 carried on offline until the runner killed them): the controller decides like for a planned exit (stop after REV3_NET_EXIT_WAIT_S), and
+// the process ends with Bot::EXIT_CODE_LEFT (see Shutdown), so the runner reports PROBLEM with the LEAVE reason instead of a TIMEOUT.
+void ObserveLeave(Module& module, u32 frame)
+{
+  std::string why;
+  if (module.net == nullptr || !module.net->TakeUnplannedLeave(&why))
+    return;
+  if (module.exit_ctl == nullptr)
+    return;  // REV3_NET_EXIT is off: the session left and the game goes on offline, as always
+  if (module.exit_ctl->NoteLeave(frame, why))
+    module.exit_code = Bot::EXIT_CODE_LEFT;
 }
 
 void HandleCommand(Core::System& system, const u8* command, size_t size, std::vector<u8>* read_queue)
@@ -6637,6 +6660,7 @@ void HandleCommand(Core::System& system, const u8* command, size_t size, std::ve
     if (!resimulating)
       ObserveExit(module, parsed.frame);
     reply = module.net->OnCommand(parsed);
+    ObserveLeave(module, parsed.frame);
     if (module.kit != nullptr)
       module.kit->OnReply(parsed, reply, resimulating);
     read_queue->assign(REPLY_SIZE, 0);
@@ -6739,5 +6763,12 @@ void Shutdown()
   module.memory.reset();
   module.sink.reset();
   module.initialized = false;  // the next command reads the environment again and appends to the log
+  if (module.exit_code != 0)
+  {
+    // The net session left unplanned and REV3_NET_EXIT stopped the run (ObserveLeave): Dolphin would exit 0 after a normal stop, so end the process
+    // here with the code the runner looks for. Every log was flushed and closed above; the rest of Dolphin's shutdown is not needed in a soak run.
+    const int code = module.exit_code;
+    std::_Exit(code);
+  }
 }
 }  // namespace Rev3

@@ -1093,6 +1093,8 @@ public:
   const std::array<u32, 2>& NetFighters() const { return m_fighters; }
   // True when the set would change but slots are in use: learned pages, a new hardware cut, or pages the restore verify heal found missing.
   bool NetLayoutPending() const { return m_net_pending; }
+  // The write-tracking state in words for the gate log ("off" | "armed learned=.. deferred=.. restarts=.. misses=.." | "idle"); a pure read.
+  std::string NetWriteTrackText() const;
   // The arm gate is about to open (session in lockstep, no slot in use): re-checks the hardware cuts, installs the current set (stack
   // window of this call's sp included) and verifies that all 61 fields of both fighters are inside it. False (logged): do not arm.
   bool NetPrepareArm();
