@@ -988,7 +988,7 @@ public:
 // ---- SyncTest -------------------------------------------------------------------------------------------------------------
 struct SyncTestOptions
 {
-  int k = 1;                      // frames to roll back, 1..8
+  int k = 1;                      // frames to roll back, 1..8 (netplay: MAXR + 1 + REV3_NET_IO_EXTRA, up to 32)
   int every = 1;                  // roll back when frame % every == 0
   u32 stack_window = 0x4000;      // bytes saved from the hook's sp upward (clipped at the end of its memory region)
   std::string whitelist_path;     // only printed in the header line

@@ -565,6 +565,20 @@ TEST(Rev3NetLink, DefaultsAreThePlansNumbers)
   EXPECT_TRUE(o.warnings.empty());
 }
 
+TEST(Rev3NetLink, IoExtraIsTheNumberOfSlotsAWaitingRollbackHasBeyondMaxrPlusTwo)
+{
+  const GetEnvFn host = EnvOf({{"REV3_NET_ROLE", "host"}, {"REV3_NET_PEER", "127.0.0.1:2627"}});
+  EXPECT_EQ(ParseNetOptions(host).io_extra, 10);  // default
+  NetOptions o = ParseNetOptions(EnvOf({{"REV3_NET_ROLE", "host"}, {"REV3_NET_PEER", "127.0.0.1:2627"}, {"REV3_NET_IO_EXTRA", "0"}}));
+  EXPECT_EQ(o.io_extra, 0);
+  EXPECT_TRUE(o.warnings.empty());
+  o = ParseNetOptions(EnvOf({{"REV3_NET_ROLE", "host"}, {"REV3_NET_PEER", "127.0.0.1:2627"}, {"REV3_NET_IO_EXTRA", "24"}}));
+  EXPECT_EQ(o.io_extra, 24);
+  o = ParseNetOptions(EnvOf({{"REV3_NET_ROLE", "host"}, {"REV3_NET_PEER", "127.0.0.1:2627"}, {"REV3_NET_IO_EXTRA", "25"}}));
+  EXPECT_EQ(o.io_extra, 10);  // above the ceiling: the default, and it says so
+  EXPECT_FALSE(o.warnings.empty());
+}
+
 TEST(Rev3NetLink, EverythingCanBeSet)
 {
   const NetOptions o = ParseNetOptions(EnvOf({{"REV3_NET_ROLE", "Guest"},

@@ -1422,7 +1422,7 @@ SyncTest::SyncTest(const SyncTestOptions& options, std::vector<Range> ranges, Gu
 {
   if (!m_micros)
     m_micros = SteadyMicros;
-  m_options.k = std::clamp(m_options.k, 1, 8);
+  m_options.k = std::clamp(m_options.k, 1, 40);  // netplay: MAXR (<= 7) + 1 + REV3_NET_IO_EXTRA (<= 24); the SyncTest modes ask for 8 at most
   m_options.every = std::max(m_options.every, 1);
   m_options.hardware_check_every = std::max<u32>(m_options.hardware_check_every, 1);
   if (!m_options.adaptive)
@@ -6863,7 +6863,7 @@ u32 ReadDetVoice(Sink& log)
   return text == "0" ? 0u : DET_VOICE;
 }
 
-// Builds module.synctest from the REV3_SYNCTEST_* variables (K frames; in netplay K = MAXR + 1 so the ring has MAXR + 2 slots) and the
+// Builds module.synctest from the REV3_SYNCTEST_* variables (K frames; in netplay K = MAXR + 1 + REV3_NET_IO_EXTRA so the ring has MAXR + 2 + extra slots) and the
 // REV3_WHITELIST seed. False (logged): not usable; module.synctest stays null.
 bool BuildSyncTest(Module& module, Core::System& system, long k, bool net)
 {
@@ -7243,7 +7243,7 @@ void InitializeNet(Module& module, Core::System& system)
     }
   }
 
-  if (options.rollback && !BuildSyncTest(module, system, options.max_rollback + 1, true))
+  if (options.rollback && !BuildSyncTest(module, system, options.max_rollback + 1 + options.io_extra, true))
   {
     log.Line("ERROR the snapshot machinery could not be built (see the Rev3 log); REV3_NET_ROLLBACK is treated as 0 (lockstep only)");
     module.synctest.reset();

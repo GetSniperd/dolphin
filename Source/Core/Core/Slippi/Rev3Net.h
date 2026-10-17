@@ -151,6 +151,7 @@ public:
   std::string SummaryNote() override;
   std::string AfterSummaryLine() override;
   bool Clean(s32 frame) const override;
+  size_t SlotCount() const override;
 
   // Adds the live fighters' fields to the trace without a snapshot (lockstep calls: a desync dump then has every frame).
   void RecordLive(s32 frame);

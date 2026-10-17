@@ -741,8 +741,17 @@ RollbackSession::RollbackSession(const Config& config, Transport& transport, Sna
   m_maxr_eff = m_cfg.max_rollback;
   m_stats.maxr_eff = m_maxr_eff;
   m_stats.maxr_eff_min = m_maxr_eff;
-  Line(Fmt("SESSION start role=%s delay=%d maxr=%d pace=%s maxr_adapt=%s", RoleName(m_cfg.role), m_delay, m_cfg.max_rollback,
-           m_cfg.pace.enabled ? "on" : "off", m_cfg.maxr_adapt ? "on" : "off"));
+  // The ring: MAXR + 2 slots and io_extra more for a rollback that has to wait for a disc read (A RESTORE NEVER RUNS UNDER A READ). The store knows its
+  // own size; a smaller one than asked for lowers the room the wait has, and says so.
+  m_cfg.io_extra = std::max(0, std::min(m_cfg.io_extra, MAX_IO_EXTRA));
+  const size_t wanted_slots = static_cast<size_t>(m_cfg.max_rollback + 2 + m_cfg.io_extra);
+  const size_t store_slots = m_store.SlotCount();
+  m_slots = store_slots != 0 ? store_slots : wanted_slots;
+  if (store_slots != 0 && store_slots < wanted_slots)
+    Line(Fmt("WARNING the snapshot ring has %zu slots, MAXR %d + 2 + io_extra %d asks for %zu: a rollback that waits for a disc read has less room", store_slots,
+             m_cfg.max_rollback, m_cfg.io_extra, wanted_slots));
+  Line(Fmt("SESSION start role=%s delay=%d maxr=%d io_extra=%d slots=%zu pace=%s maxr_adapt=%s", RoleName(m_cfg.role), m_delay, m_cfg.max_rollback,
+           m_cfg.io_extra, m_slots, m_cfg.pace.enabled ? "on" : "off", m_cfg.maxr_adapt ? "on" : "off"));
   if (m_cfg.pad_mirror)
     Line("NOTE pad mirror on (REV3_PAD_MIRROR=1): this side's local pad is the newest confirmed host pad, its own controller is not read");
 }
@@ -1504,12 +1513,25 @@ bool RollbackSession::StepArmed(const Command& command, const Gate& gate, Reply*
   // may be a misprediction's, never closes anything: gate.fighters_found / gate.health_zero are only recorded, below.
   if (m_close_at >= 0 && n >= m_close_at)
   {
+    s32 close_frame = n;
     if (n > m_close_at)
     {
-      ++m_stats.gate_late;
-      Line(Fmt("GATE close late: scheduled for frame %d, applied at frame %d (the peer may have closed at another frame)", m_close_at, n));
+      if (CloseDelayedByWait())
+      {
+        // The lost frame lay behind a rollback that waited for a disc read, so it could be declared final only when that rollback had run. The frames in
+        // between were played with the pads the peer's drain also uses (a wait plays real pads where it can), so the close is the scheduled one.
+        ++m_stats.close_io_delayed;
+        close_frame = m_close_at;
+        Line(Fmt("NOTE GATE close scheduled for frame %d applied at call %d: a rollback waited for a disc read (close_io_delayed=%u)", m_close_at, n,
+                 m_stats.close_io_delayed));
+      }
+      else
+      {
+        ++m_stats.gate_late;
+        Line(Fmt("GATE close late: scheduled for frame %d, applied at frame %d (the peer may have closed at another frame)", m_close_at, n));
+      }
     }
-    EnterDrain(n, m_close_why, false);
+    EnterDrain(close_frame, m_close_why, false);
     return StepDrain(command, gate, reply);
   }
 
@@ -1567,21 +1589,24 @@ bool RollbackSession::StepArmed(const Command& command, const Gate& gate, Reply*
   }
 
   const s32 g = FindMisprediction(n);
+  bool room_to_capture = true;
   if (g >= 0)
   {
     // The frames up to g are final now (everything below g is verified): say so BEFORE a rollback may run, or a run of consecutive
     // rollbacks could keep a final frame from being declared and the scheduled close from reaching both machines in time.
     FinalizeChecks(g);
-    const bool quiet = gate.hardware_quiet;
-    const bool forced = !quiet && n - g >= maxr;  // postponing once more would make the rollback deeper than MAXR
-    if (quiet || forced)
-      return DoRollback(command, g, forced, reply);
-    if (!m_postpone_counted)
+    // A restore never runs under a disc read (A RESTORE NEVER RUNS UNDER A READ): with the hardware busy the rollback waits, however deep it gets.
+    if (gate.hardware_quiet)
+      return DoRollback(command, g, reply);
+    switch (NoteRollbackWait(g, gate.fighters_found))
     {
-      m_postpone_counted = true;
-      ++m_stats.postponed;
-      ++m_win.postponed;
-      DetailLine(Detail::Rollback, Fmt("ROLLBACK postponed frame=%d live=%d depth=%d (hardware busy)", g, n, n - g));
+    case WaitOutcome::Capture:
+      break;
+    case WaitOutcome::NoCapture:
+      room_to_capture = false;
+      break;
+    case WaitOutcome::Left:
+      return EndCall(n, EchoReply(command), reply);
     }
   }
 
@@ -1600,6 +1625,9 @@ bool RollbackSession::StepArmed(const Command& command, const Gate& gate, Reply*
     Pace(n);
     return EndCall(n, MakeReply(local, remote, 0, n), reply);
   }
+
+  if (!room_to_capture)
+    return PlayWithoutCapture(gate, Block::Lockstep, reply);  // the ring is full of what the waiting rollback needs
 
   CaptureInfo info;
   if (!m_store.Capture(n, command.sp, &info))
@@ -1644,6 +1672,112 @@ s32 RollbackSession::FindMisprediction(s32 frame)
 // the rollback goes back to the newest earlier slot that is clean and resimulates the frames in between with the pads they were played with (they are
 // verified: everything below the misprediction is confirmed and correct). With no clean slot in the ring there is no safe target: the rollback is
 // done anyway (the alternative is a desync), counted in io_no_clean_slot and logged as a WARNING.
+s32 RollbackSession::PeekCleanTarget(s32 g) const
+{
+  if (m_store.Clean(g))
+    return g;
+  for (s32 f = g - 1; f >= 0 && m_store.Has(f); --f)
+    if (m_store.Clean(f))
+      return f;
+  return g;
+}
+
+// A rollback is due and the hardware is busy: it waits (the frames keep running so the read can end). The ring keeps the target as long as
+// capturing the next frame would not push it out; when it would, the frame is played with the real pad and no capture (WaitOutcome::NoCapture) and
+// io_overflow says so. A wait that outlasts the session's own per-frame records (RING) leaves the session: restoring under the read is not an option
+// and the corrected timeline can no longer be reconstructed.
+RollbackSession::WaitOutcome RollbackSession::NoteRollbackWait(s32 g, bool capturing)
+{
+  const s32 n = m_cur_frame;
+  const s32 target = PeekCleanTarget(g);
+  if (m_wait_since < 0)
+  {
+    m_wait_since = n;
+    m_wait_calls = 0;
+    m_wait_overflow = false;
+    ++m_stats.io_postponed_rollbacks;
+    DetailLine(Detail::Rollback,
+               Fmt("ROLLBACK postponed frame=%d target=%d live=%d depth=%d (a disc read is in flight: a restore never runs under one; ring %zu slots)", g,
+                   target, n, n - target, m_slots));
+  }
+  // A call that blocks for a pad runs this again when it is retried: count it once.
+  const bool first_in_call = !m_postpone_counted;
+  if (first_in_call)
+  {
+    m_postpone_counted = true;
+    ++m_wait_calls;
+    ++m_stats.postponed;
+    ++m_win.postponed;
+    m_stats.io_postponed_max_calls = std::max(m_stats.io_postponed_max_calls, m_wait_calls);
+  }
+  if (n - target >= static_cast<s32>(RING) - 4)
+  {
+    ++m_stats.io_overflow;
+    Line(Fmt("ERROR ROLLBACK frame=%d target=%d live=%d: the disc read has lasted %u calls and the rollback is %d frames deep, beyond the %zu frame records; "
+             "a restore under the read is not done",
+             g, target, n, m_wait_calls, n - target, RING));
+    LeaveSession(Fmt("a rollback to frame %d waited %u calls for the disc and ran out of records", g, m_wait_calls), true);
+    return WaitOutcome::Left;
+  }
+  // Capturing frame n would overwrite the slot of frame n - slots. The target must stay.
+  if (capturing && n - target >= static_cast<s32>(m_slots))
+  {
+    if (!m_wait_overflow)
+    {
+      m_wait_overflow = true;
+      ++m_stats.io_overflow;
+      Line(Fmt("WARNING ROLLBACK frame=%d target=%d live=%d: the disc read outlasts the ring (%zu slots = MAXR %d + 2 + io_extra %d); frames are played with real pads and "
+               "no snapshot until it ends, then the rollback runs %d+ frames deep io_overflow=%u",
+               g, target, n, m_slots, m_cfg.max_rollback, m_cfg.io_extra, n - target, m_stats.io_overflow));
+    }
+    if (first_in_call)
+      ++m_stats.io_overflow_calls;
+    return WaitOutcome::NoCapture;
+  }
+  return WaitOutcome::Capture;
+}
+
+// Is a close that is overdue explained by a rollback wait? Frames behind a waiting rollback are declared final after it, so a close scheduled from one
+// of them is known only then (A RESTORE NEVER RUNS UNDER A READ). True when a wait covers the scheduled frame (now, or the one that ended last).
+bool RollbackSession::CloseDelayedByWait() const
+{
+  if (m_wait_since >= 0)
+    return m_wait_since <= m_close_at;
+  return m_wait_span_end >= 0 && m_close_at >= m_wait_span_start && m_close_at <= m_wait_span_end;
+}
+
+void RollbackSession::EndRollbackWait()
+{
+  if (m_wait_since >= 0)
+  {
+    m_wait_span_start = m_wait_since;
+    m_wait_span_end = m_cur_frame;
+  }
+  m_wait_since = -1;
+  m_wait_calls = 0;
+  m_wait_overflow = false;
+}
+
+// A frame played with its real remote pad and no snapshot: the same as a call without fighters. Used by a rollback that waits for a disc read when the
+// ring has no room left for another capture, and by a DRAIN that has to wait for one (a drain captures nothing anyway).
+bool RollbackSession::PlayWithoutCapture(const Gate& gate, Block block, Reply* reply)
+{
+  const s32 n = m_cur_frame;
+  if (Confirmed() < n)
+    return Blocked(block);
+  const Pad8 local = LocalAt(n);
+  const Pad8 remote = RemoteAt(n);
+  CaptureUsed(n, local, remote, false, nullptr, LostKind(gate));
+  FinalizeChecks(n);
+  if (m_mode == Mode::ARMED)
+  {
+    if (!m_stalled_this_call)
+      NoteCallWithoutStall();
+    Pace(n);
+  }
+  return EndCall(n, MakeReply(local, remote, 0, n), reply);
+}
+
 s32 RollbackSession::ChooseCleanTarget(s32 g)
 {
   if (m_store.Clean(g))
@@ -1664,11 +1798,13 @@ s32 RollbackSession::ChooseCleanTarget(s32 g)
   return g;
 }
 
-bool RollbackSession::DoRollback(const Command& command, s32 target, bool forced, Reply* reply)
+bool RollbackSession::DoRollback(const Command& command, s32 target, Reply* reply)
 {
   const s32 n = m_cur_frame;
   target = ChooseCleanTarget(target);
   const s32 depth = n - target;
+  const u32 waited = m_wait_since >= 0 ? m_wait_calls : 0;
+  EndRollbackWait();
   m_resim_start_us = m_net.Now();  // the cost of a rollback = restore + K re-run frames, measured from here to the end of the resimulation
   m_resim_depth = depth;
   m_resim_blocked = false;
@@ -1700,13 +1836,16 @@ bool RollbackSession::DoRollback(const Command& command, s32 target, bool forced
   const size_t bucket = std::min<size_t>(static_cast<size_t>(depth), m_stats.depth_hist.size() - 1);
   ++m_stats.depth_hist[bucket];
   ++m_win.depth[bucket];
-  if (forced)
+  if (waited != 0 && depth > m_cfg.max_rollback)
   {
-    ++m_stats.forced_hw;
-    ++m_win.forced;
+    // Deeper than MAXR is only possible after a wait for a disc read: always logged (rare), with the depth and the wait.
+    ++m_stats.deep_rollbacks;
+    if (m_stats.deep_rollbacks <= MAX_DEEP_LOGS)
+      Line(Fmt("ROLLBACK deep depth=%d (MAXR %d) frame=%d live=%d R=%d waited=%u calls for the disc deep_rollbacks=%u", depth, m_cfg.max_rollback, target, n,
+               Confirmed(), waited, m_stats.deep_rollbacks));
   }
-  m_resim_logged = DetailLine(
-      Detail::Rollback, Fmt("ROLLBACK depth=%d frame=%d live=%d R=%d%s", depth, target, n, Confirmed(), forced ? " forced=hardware_busy" : ""));
+  m_resim_logged = DetailLine(Detail::Rollback, Fmt("ROLLBACK depth=%d frame=%d live=%d R=%d%s", depth, target, n, Confirmed(),
+                                                    waited != 0 ? Fmt(" waited=%u", waited).c_str() : ""));
 
   // The pads FOR the target frame: the remote one is known (that is how the misprediction was found).
   const Pad8 local = LocalAt(target);
@@ -1799,6 +1938,11 @@ bool RollbackSession::StepResim(const Command& command, const Gate& gate, Reply*
   }
   if (drain)
     return FinishDrain(command, gate, reply);
+  // The corrected frames are in. Verify them against the confirmed pads now and declare final what is final, so that a close scheduled from one of them is
+  // known before the next call: THE GATE RULE needs a final frame F declared by call F + MAXR, and a rollback made deeper than MAXR by a wait for a disc
+  // read would otherwise delay it by a call.
+  const s32 again = FindMisprediction(m);
+  FinalizeChecks(again >= 0 ? again : m);
   return EndCall(m, MakeReply(local, remote, 0, m), reply);
 }
 
@@ -1827,7 +1971,15 @@ bool RollbackSession::StepDrain(const Command& command, const Gate& gate, Reply*
     return Blocked(Block::DrainA);
   const s32 g = FindMisprediction(n);
   if (g >= 0)
-    return DoRollback(command, g, !gate.hardware_quiet, reply);  // draining cannot wait for the hardware: a rollback is due now
+  {
+    if (gate.hardware_quiet)
+      return DoRollback(command, g, reply);
+    // A disc read is in flight: the rollback waits for it (a restore never runs under one). A drain captures nothing, so the ring cannot lose the
+    // target; the drain's frames are played with their real pads until the read has ended, the way a HOLD plays them.
+    if (NoteRollbackWait(g, false) == WaitOutcome::Left)
+      return EndCall(n, EchoReply(command), reply);
+    return PlayWithoutCapture(gate, Block::DrainB, reply);
+  }
   return FinishDrain(command, gate, reply);
 }
 
@@ -2428,6 +2580,7 @@ void RollbackSession::LeaveSession(const std::string& why, bool tell_peer)
   m_close_at = -1;
   m_cur_frame = -1;
   m_block = Block::None;
+  EndRollbackWait();
   m_store.Clear();
 }
 
@@ -2460,12 +2613,13 @@ void RollbackSession::SummaryLine(const char* tag)
       pmax / 1000.0, m_stats.maxr_eff, m_stats.maxr_eff_min, m_stats.maxr_changes);
   const std::string store_note = m_store.SummaryNote();  // may write the `NOTE learned summary` line, so before the SUMMARY line below
   Line(Fmt("%s mode=%s frame=%d calls=%u resim_calls=%u rollbacks=%u max_depth=%u depth_hist=[%s] predicted=%u stalls=%u stall_ms_max=%.1f "
-           "postponed=%u forced_hw=%u hw_holds=%u hold_calls=%u relayouts=%u chk_ok=%u chk_bad=%u gate_opens=%u gate_closes=%u gate_late=%u "
+           "postponed=%u forced_hw=%u io_postponed_rollbacks=%u io_postponed_max_calls=%u deep_rollbacks=%u io_overflow=%u io_overflow_calls=%u hw_holds=%u hold_calls=%u relayouts=%u chk_ok=%u chk_bad=%u gate_opens=%u gate_closes=%u gate_late=%u close_io_delayed=%u "
            "arm_refused=%u arm_proposed=%u arm_accepted=%u arm_rejected=%u arm_cancelled=%u arm_waits=%u arm_wait_ms_max=%.1f log_suppressed=%u io_redirected=%u io_no_clean_slot=%u local_active=%u local_mirrored=%u err_hist=[%u,%u,%u,%u,%u]%s%s%s",
            tag, ModeName(m_mode), m_expected_next, m_stats.calls, m_stats.resim_calls, m_stats.rollbacks, m_stats.max_depth, hist.c_str(),
            m_stats.predicted_frames, m_stats.stalls, static_cast<double>(m_stats.stall_us_max) / 1000.0, m_stats.postponed,
-           m_stats.forced_hw, m_stats.hw_holds, m_stats.hold_calls, m_stats.relayouts, m_stats.checks_ok, m_stats.checks_bad,
-           m_stats.gate_opens, m_stats.gate_closes, m_stats.gate_late, m_stats.arm_refused, m_stats.arm_proposed, m_stats.arm_accepted, m_stats.arm_rejected, m_stats.arm_cancelled, m_stats.arm_waits, static_cast<double>(m_stats.arm_wait_us_max) / 1000.0, m_stats.log_suppressed, m_stats.io_redirected,
+           m_stats.forced_hw, m_stats.io_postponed_rollbacks, m_stats.io_postponed_max_calls, m_stats.deep_rollbacks, m_stats.io_overflow,
+           m_stats.io_overflow_calls, m_stats.hw_holds, m_stats.hold_calls, m_stats.relayouts, m_stats.checks_ok, m_stats.checks_bad,
+           m_stats.gate_opens, m_stats.gate_closes, m_stats.gate_late, m_stats.close_io_delayed, m_stats.arm_refused, m_stats.arm_proposed, m_stats.arm_accepted, m_stats.arm_rejected, m_stats.arm_cancelled, m_stats.arm_waits, static_cast<double>(m_stats.arm_wait_us_max) / 1000.0, m_stats.log_suppressed, m_stats.io_redirected,
            m_stats.io_no_clean_slot, m_stats.local_active, m_stats.local_mirrored, m_stats.local_err[0], m_stats.local_err[1],
            m_stats.local_err[2], m_stats.local_err[3], m_stats.local_err[4], sim.c_str(),
            ranges.c_str(), m5.c_str()) +

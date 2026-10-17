@@ -173,6 +173,8 @@ struct NetOptions
   PaceConfig pace;                 // REV3_NET_PACE=0|1 (default 1), REV3_NET_PACE_T1_US, REV3_NET_PACE_HARD_MAX_US, REV3_NET_PACE_SLICE_US, REV3_NET_PACE_GENTLE_PERMILLE
   bool maxr_adapt = false;         // REV3_NET_MAXR_ADAPT=1: the stall rule's limit follows the measured cost of resimulation (off by default)
   u32 maxr_budget_us = 14000;      // REV3_NET_MAXR_BUDGET_US: resimulation of K frames should cost less than this at its p95 (microseconds)
+  int io_extra = 10;               // REV3_NET_IO_EXTRA (frames = snapshot slots, 0..24): slots beyond MAXR + 2 so a rollback that must wait for a disc read (a restore never
+                                   // runs under one) keeps its target in the ring for that many more frames. Local to a machine; 10 slots are ~65 MB more memory
   bool pad_mirror = false;         // REV3_PAD_MIRROR=1 (guest only; the session ignores it on the host): the local pad is the newest confirmed remote pad. Local to a machine
 };
 using GetEnvFn = std::function<std::string(const char*)>;  // "" for unset

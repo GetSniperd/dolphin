@@ -233,6 +233,7 @@ public:
     return relayout_ok;
   }
   bool Clean(s32 frame) const override { return dirty.count(frame) == 0; }
+  size_t SlotCount() const override { return capacity; }
   std::string AfterSummaryLine() override { return after_summary; }
 
   struct Slot
@@ -394,9 +395,12 @@ Gate NoFighters()
 // One machine of the unit tests: session + scripted transport + fake game, with a tiny "game loop" (the hook counter, applying the reply).
 struct Rig
 {
-  explicit Rig(Role role = Role::Host, int delay = 0, int maxr = 5, bool range_crc = false) : store(&game, static_cast<size_t>(maxr) + 2)
+  // `io_extra`: Config::io_extra, and the FakeStore holds that many more slots than MAXR + 2.
+  explicit Rig(Role role = Role::Host, int delay = 0, int maxr = 5, bool range_crc = false, int io_extra = 0)
+      : store(&game, static_cast<size_t>(maxr + io_extra) + 2)
   {
     cfg.range_crc = range_crc;
+    cfg.io_extra = io_extra;
     cfg.role = role;
     cfg.delay = delay;
     cfg.max_rollback = maxr;
@@ -1986,27 +1990,197 @@ TEST(Rev3Session, RollbackDepthNeverExceedsMaxrEvenWhenPadsArriveDuringAStall)
 
 // ---- hardware busy ---------------------------------------------------------------------------------------------------------------
 
-TEST(Rev3Session, BusyHardwarePostponesARollbackUntilItWouldExceedMaxr)
+TEST(Rev3Session, BusyHardwareDefersARollbackPastMaxrAndItRunsAtTheGreaterDepthOnceTheReadEnds)
 {
-  Rig rig(Role::Host, 0, 4);
+  // D's soak 20261017_113023: the old rule restored anyway when postponing once more would have made the rollback deeper than MAXR ("forced",
+  // forced_hw 36 / 34) and the nw4r stream thread froze afterwards. Now the restore waits for the read, however deep that makes it, as long as the
+  // ring (MAXR + 2 + io_extra slots) still holds the target.
+  Rig rig(Role::Host, 0, 4, false, 6);
   rig.ReadyToArm(10);
   for (s32 f = 10; f <= 11; ++f)
     rig.Frame(LocalPad(f), Open());
   rig.net.Deliver(10, P(0xA1));  // frame 10 was mispredicted
   Reply r;
-  ASSERT_TRUE(rig.TryFrame(LocalPad(12), Busy(), &r));  // depth 2 < 4: postponed, normal reply
-  EXPECT_EQ(r.flags, 0u);
-  EXPECT_EQ(rig.session->stats().postponed, 1u);
+  for (s32 f = 12; f <= 17; ++f)  // depth 2 .. 7 at the call: past MAXR (4) from frame 14 on
+  {
+    rig.net.Deliver(f - 1, RemotePadScript(f - 1));  // R follows the calls: what limits the wait is the disc, not the stall rule (predicted <= MAXR)
+    ASSERT_TRUE(rig.TryFrame(LocalPad(f), Busy(), &r)) << f;
+    EXPECT_EQ(r.flags, 0u) << "a restore under a disc read at frame " << f;
+  }
   EXPECT_TRUE(rig.store.restored.empty());
-  ASSERT_TRUE(rig.TryFrame(LocalPad(13), Busy(), &r));  // depth 3 < 4
-  EXPECT_EQ(r.flags, 0u);
-  EXPECT_EQ(rig.session->stats().postponed, 2u);
-  ASSERT_TRUE(rig.TryFrame(LocalPad(14), Busy(), &r));  // depth 4 == MAXR: forced
+  EXPECT_EQ(rig.session->stats().postponed, 6u);
+  EXPECT_EQ(rig.session->stats().io_postponed_rollbacks, 1u);
+  EXPECT_EQ(rig.session->stats().io_postponed_max_calls, 6u);
+  EXPECT_EQ(rig.session->stats().forced_hw, 0u);
+  EXPECT_EQ(rig.session->stats().io_overflow, 0u);
+  // The read ends: the rollback runs at once, to the same target, 8 frames deep (call 18 - frame 10), and is counted and logged as a deep one.
+  rig.net.Deliver(17, RemotePadScript(17));
+  ASSERT_TRUE(rig.TryFrame(LocalPad(18), Open(), &r));
   EXPECT_EQ(r.flags, REPLY_FLAG_RESTORED);
   EXPECT_EQ(r.frame, 10u);
-  EXPECT_EQ(rig.session->stats().forced_hw, 1u);
-  EXPECT_EQ(rig.session->stats().max_depth, 4u);
-  EXPECT_TRUE(rig.sink.Has("forced=hardware_busy"));
+  EXPECT_EQ(rig.session->stats().max_depth, 8u);
+  EXPECT_EQ(rig.session->stats().deep_rollbacks, 1u);
+  EXPECT_EQ(rig.session->stats().forced_hw, 0u);
+  EXPECT_TRUE(rig.sink.Has("ROLLBACK deep depth=8 (MAXR 4) frame=10 live=18"));
+  EXPECT_TRUE(rig.sink.Has("waited=6"));
+  EXPECT_FALSE(rig.sink.Has("forced"));
+  // The resimulation of the 8 frames works and the session carries on armed.
+  for (s32 f = 11; f <= 18; ++f)
+    rig.Frame(LocalPad(f), Open());
+  EXPECT_FALSE(rig.sink.Has("ERROR"));
+  EXPECT_TRUE(rig.session->mode() == Mode::ARMED);
+  EXPECT_FALSE(rig.session->Resimulating());
+  EXPECT_EQ(rig.store.restored.size(), 1u);
+}
+
+TEST(Rev3Session, ADeferredRollbackKeepsItsTargetInTheRingByNotCapturingWhenTheRingIsFull)
+{
+  // MAXR 2 + io_extra 3 = 7 slots. The read lasts longer: the target (frame 10) would be overwritten by the capture of frame 17, so from there on
+  // the frames are played with real pads and no snapshot (io_overflow), and the restore still goes to frame 10 when the read ends.
+  Rig rig(Role::Host, 0, 2, false, 3);
+  rig.ReadyToArm(10);
+  rig.Frame(LocalPad(10), Open());
+  rig.net.Deliver(10, P(0xA1));  // frame 10 mispredicted (D = 0: it was predicted from the neutral pad before)
+  Reply r;
+  for (s32 f = 11; f <= 16; ++f)
+  {
+    if (f > 11)
+      rig.net.Deliver(f - 1, RemotePadScript(f - 1));  // R follows, so the stall rule (predicted <= MAXR) is not what limits the wait
+    ASSERT_TRUE(rig.TryFrame(LocalPad(f), Busy(), &r)) << f;
+    EXPECT_EQ(r.flags, 0u);
+  }
+  EXPECT_EQ(rig.session->stats().io_overflow, 0u) << "frames 11..16 still fit the 7 slots with frame 10";
+  EXPECT_TRUE(rig.store.Has(10));
+  const u32 captures = rig.store.captures;
+  rig.net.Deliver(16, RemotePadScript(16));
+  // Frame 17: capturing it would evict frame 10. The remote pad of 17 is not here (the stall rule's business is predictions only, and none is made).
+  EXPECT_FALSE(rig.TryFrame(LocalPad(17), Busy(), &r)) << "no capture, no prediction: the call waits for the real pad of its own frame";
+  rig.net.Deliver(17, RemotePadScript(17));
+  ASSERT_TRUE(rig.TryFrame(LocalPad(17), Busy(), &r));
+  EXPECT_EQ(r.flags, 0u);
+  EXPECT_TRUE(SanitizePad(r.pads[1]) == RemotePadScript(17));
+  EXPECT_EQ(rig.store.captures, captures) << "frame 17 was not captured";
+  EXPECT_TRUE(rig.store.Has(10));
+  EXPECT_EQ(rig.session->stats().io_overflow, 1u);
+  EXPECT_EQ(rig.session->stats().io_overflow_calls, 1u);
+  EXPECT_TRUE(rig.sink.Has("WARNING ROLLBACK frame=10 target=10 live=17"));
+  for (s32 f = 18; f <= 20; ++f)
+  {
+    rig.net.Deliver(f, RemotePadScript(f));
+    ASSERT_TRUE(rig.TryFrame(LocalPad(f), Busy(), &r)) << f;
+    EXPECT_EQ(r.flags, 0u) << "never a restore while the read is in flight";
+  }
+  EXPECT_EQ(rig.session->stats().io_overflow, 1u) << "one wait is counted once";
+  EXPECT_EQ(rig.session->stats().io_overflow_calls, 4u);
+  EXPECT_TRUE(rig.store.restored.empty());
+  rig.net.Deliver(21, RemotePadScript(21));
+  ASSERT_TRUE(rig.TryFrame(LocalPad(21), Open(), &r));
+  EXPECT_EQ(r.flags, REPLY_FLAG_RESTORED);
+  EXPECT_EQ(r.frame, 10u);
+  EXPECT_EQ(rig.session->stats().max_depth, 11u);
+  EXPECT_EQ(rig.session->stats().deep_rollbacks, 1u);
+  EXPECT_EQ(rig.session->stats().forced_hw, 0u);
+  // 11 frames of resimulation with the confirmed pads; the game state is the one a game that never mispredicted would have.
+  for (s32 f = 11; f <= 21; ++f)
+    rig.Frame(LocalPad(f), Open());
+  EXPECT_FALSE(rig.sink.Has("ERROR"));
+  EXPECT_FALSE(rig.session->Resimulating());
+  EXPECT_TRUE(rig.session->mode() == Mode::ARMED);
+}
+
+TEST(Rev3Session, TheCleanTargetRedirectCountsForTheRingRoomOfAWaitingRollback)
+{
+  // Frame 11's slot is dirty (captured under a read): the rollback for a misprediction at 11 goes back to 10, and the ring has to keep 10.
+  Rig rig(Role::Host, 0, 2, false, 2);  // 6 slots
+  rig.ReadyToArm(10);
+  rig.Frame(LocalPad(10), Open());
+  rig.Frame(LocalPad(11), Open());
+  rig.store.dirty = {11};
+  rig.net.Deliver(10, RemotePadScript(9));
+  rig.net.Deliver(11, P(0xA1));
+  Reply r;
+  for (s32 f = 12; f <= 14; ++f)
+  {
+    if (f > 12)
+      rig.net.Deliver(f - 1, RemotePadScript(f - 1));
+    ASSERT_TRUE(rig.TryFrame(LocalPad(f), Busy(), &r)) << f;
+  }
+  EXPECT_EQ(rig.session->stats().io_overflow, 0u);
+  // Capturing frame 16 would evict frame 10 (6 slots: 11..16): the call at 15 is the last that captures (10..15).
+  rig.net.Deliver(14, RemotePadScript(14));
+  ASSERT_TRUE(rig.TryFrame(LocalPad(15), Busy(), &r));
+  EXPECT_EQ(rig.session->stats().io_overflow, 0u);
+  EXPECT_FALSE(rig.TryFrame(LocalPad(16), Busy(), &r));  // overflow: waits for its real pad, no capture
+  EXPECT_EQ(rig.session->stats().io_overflow, 1u);
+  EXPECT_TRUE(rig.sink.Has("WARNING ROLLBACK frame=11 target=10 live=16"));
+  EXPECT_TRUE(rig.store.Has(10));
+}
+
+TEST(Rev3Session, ADrainDoesNotRestoreUnderAReadItPlaysItsFramesWithRealPadsUntilTheReadEnds)
+{
+  // The scheduled close arrives while a rollback waits for a disc read: the drain captures nothing, so it keeps playing (real pads) until the
+  // read has ended and only then restores.
+  Rig rig(Role::Host, 0, 5, false, 4);
+  rig.ArmedAt(10);
+  const Pad8 predicted = RemotePadScript(9);
+  rig.Frame(LocalPad(10), Lost());
+  for (s32 f = 11; f <= 12; ++f)
+    rig.Frame(LocalPad(f), Open());
+  rig.net.Deliver(10, predicted);
+  rig.net.Deliver(11, predicted);
+  rig.net.Deliver(12, P(0xA1));  // frame 12 mispredicted
+  for (s32 f = 13; f <= 15; ++f)
+    rig.Frame(LocalPad(f), Busy());
+  EXPECT_TRUE(rig.store.restored.empty());
+  // Call 16 = the agreed close: DRAIN. Everything below 16 must be confirmed, and the hardware is still busy.
+  EXPECT_FALSE(rig.TryFrame(LocalPad(16), Busy()));
+  EXPECT_TRUE(rig.session->mode() == Mode::DRAIN);
+  for (s32 f = 13; f <= 15; ++f)
+    rig.net.Deliver(f, predicted);
+  rig.net.Deliver(16, P(0xD3));
+  Reply r;
+  ASSERT_TRUE(rig.TryFrame(LocalPad(16), Busy(), &r));
+  EXPECT_EQ(r.flags, 0u) << "no restore under the read, not even in a drain";
+  EXPECT_TRUE(SanitizePad(r.pads[1]) == P(0xD3));
+  EXPECT_TRUE(rig.store.restored.empty());
+  EXPECT_TRUE(rig.session->mode() == Mode::DRAIN);
+  rig.net.Deliver(17, P(0x17));
+  ASSERT_TRUE(rig.TryFrame(LocalPad(17), Busy(), &r));
+  EXPECT_EQ(r.flags, 0u);
+  EXPECT_EQ(rig.session->stats().forced_hw, 0u);
+  // The read ends at call 18: the rollback to frame 12 runs, 6 frames deep, and the drain finishes after the resimulation.
+  rig.net.Deliver(18, P(0x18));
+  ASSERT_TRUE(rig.TryFrame(LocalPad(18), Open(), &r));
+  EXPECT_EQ(r.flags, REPLY_FLAG_RESTORED);
+  EXPECT_EQ(r.frame, 12u);
+  EXPECT_EQ(rig.session->stats().max_depth, 6u);
+  EXPECT_EQ(rig.session->stats().deep_rollbacks, 1u);
+  for (s32 f = 13; f <= 18; ++f)
+    rig.Frame(LocalPad(f), Open());
+  EXPECT_TRUE(rig.session->mode() == Mode::LOCKSTEP);
+  EXPECT_FALSE(rig.sink.Has("ERROR"));
+  EXPECT_EQ(rig.session->stats().gate_late, 0u);
+}
+
+TEST(Rev3Session, AWaitThatOutlastsTheSessionsRecordsLeavesInsteadOfRestoringUnderTheRead)
+{
+  Rig rig(Role::Host, 0, 2, false, 0);
+  rig.ReadyToArm(10);
+  rig.Frame(LocalPad(10), Open());
+  rig.net.Deliver(10, P(0xA1));
+  Reply r;
+  s32 f = 11;
+  for (; f < 80 && rig.session->mode() == Mode::ARMED; ++f)
+  {
+    rig.net.Deliver(f, RemotePadScript(f));
+    if (!rig.TryFrame(LocalPad(f), Busy(), &r))
+      break;
+    EXPECT_EQ(r.flags, 0u);
+  }
+  EXPECT_TRUE(rig.session->mode() == Mode::OFFLINE);
+  EXPECT_TRUE(rig.sink.Has("ERROR ROLLBACK frame=10"));
+  EXPECT_TRUE(rig.store.restored.empty());
+  EXPECT_EQ(rig.session->stats().forced_hw, 0u);
 }
 
 TEST(Rev3Session, QuietHardwareRollsBackAtOnce)
@@ -2073,9 +2247,10 @@ TEST(Rev3Session, ALostFinalFrameClosesTheGateMaxrPlusOneFramesLaterDrainsRollsB
     rig.net.Deliver(f, predicted);
   EXPECT_TRUE(rig.session->BlockSatisfied());
 
-  // The rollback that is still due (frame 12) is done, whatever the hardware says: a drain cannot wait.
+  // The rollback that is still due (frame 12) is done now that the hardware is quiet (with a read in flight the drain would wait for it: see
+  // ADrainDoesNotRestoreUnderAReadItPlaysItsFramesWithRealPadsUntilTheReadEnds).
   Reply r;
-  ASSERT_TRUE(rig.TryFrame(LocalPad(16), Busy(), &r));
+  ASSERT_TRUE(rig.TryFrame(LocalPad(16), Open(), &r));
   EXPECT_EQ(r.flags, REPLY_FLAG_RESTORED);
   EXPECT_EQ(r.frame, 12u);
   EXPECT_TRUE(SanitizePad(r.pads[1]) == real12);
@@ -2209,8 +2384,8 @@ TEST(Rev3Session, ALostFrameThatIsMispredictedAtFirstClosesWhenTheTrueTimelineMa
   EXPECT_EQ(r.flags, REPLY_FLAG_RESTORED);
   rig.Frame(LocalPad(11), Lost());  // resim: the true state of frame 11
   rig.net.Deliver(11, P(0xA1));
-  rig.Frame(LocalPad(12), Open());  // second run of 12
-  EXPECT_FALSE(rig.sink.Has("GATE close scheduled"));  // 11 is not final yet: pad 11 only just arrived and frame 12 was predicted
+  rig.Frame(LocalPad(12), Open());  // second run of 12: the end of the resimulation verifies and finalizes frame 11 (its pad arrived just before)
+  EXPECT_TRUE(rig.sink.Has("GATE close scheduled final_frame=11 effective_frame=17"));
   rig.net.Deliver(12, P(0xA1));
   rig.Frame(LocalPad(13), Open());
   EXPECT_TRUE(rig.sink.Has("GATE close scheduled final_frame=11 effective_frame=17"));
@@ -3608,6 +3783,8 @@ struct SimParams
   u32 change_pct = 15;                 // chance per frame that a player's pad changes (otherwise a prediction is right)
   s32 guest_change_pct = -1;           // >= 0: the guest's pad changes at this rate instead (0: it never moves, so the HOST never rolls back: D's loopback)
   bool busy_hardware = false;          // each machine independently reports "hardware busy" on ~10% of its calls, and in bursts (HOLD)
+  bool busy_long = false;              // busy_hardware: the bursts last 3..42 calls instead of 3..8, so a rollback waits longer than the ring is deep (io_overflow)
+  int io_extra = 0;                    // Config::io_extra of both machines; their FakeStores hold maxr + 2 + io_extra slots
   u32 lost_mod = 0;                    // != 0: a fighter is "at health 0" when (state word 0 >> 5) % lost_mod == 0, a function of the LIVE state:
                                        // a mispredicted timeline can show it where the real one does not (0 = only the frame windows below)
   u32 relayout_pct = 0;                // chance per armed call that THIS machine wants a new snapshot set (local: the peer never knows)
@@ -3640,6 +3817,7 @@ struct SimMachineResult
   SessionStats stats;
   Mode mode = Mode::OFFLINE;
   std::map<s32, u32> finals;  // frame -> checksum the session called final
+  u32 restores_while_busy = 0;  // RESTORED replies given in a call whose gate said "hardware busy": must stay 0 (A RESTORE NEVER RUNS UNDER A READ)
   u32 phantom_lost = 0;       // normal ARMED calls whose live state said "lost" where the true timeline does not (a live-following gate would close here)
   std::string log;
   size_t chk_lines = 0;
@@ -3730,7 +3908,7 @@ public:
 struct SimMachine
 {
   SimMachine(int idx_, const SimParams& p, SimNet* net, const std::vector<Pad8>& script_)
-      : idx(idx_), store(&game, static_cast<size_t>(p.maxr) + 2), script(script_), rng(p.seed * 7 + static_cast<u64>(idx_))
+      : idx(idx_), store(&game, static_cast<size_t>(p.maxr + p.io_extra) + 2), script(script_), rng(p.seed * 7 + static_cast<u64>(idx_))
   {
     if (idx == 1)
       game.bug_frame = p.bug_frame;
@@ -3739,6 +3917,7 @@ struct SimMachine
     cfg.role = idx == 0 ? Role::Host : Role::Guest;
     cfg.delay = idx == 0 ? p.delay : (p.delay + 1) % 5;  // the guest asks for something else; the host's value must win
     cfg.max_rollback = p.maxr;
+    cfg.io_extra = p.io_extra;
     cfg.hello.game_id = "RNEEDA";
     cfg.hello.items = {{"cpu_core", "JIT64"}};
     session = std::make_unique<RollbackSession>(cfg, net->ep[idx], store, sink, nullptr);
@@ -3770,6 +3949,7 @@ struct SimMachine
   u64 block_start = 0;
   u64 max_block_us = 0;
   u32 phantom_lost = 0;
+  u32 restores_while_busy = 0;
   SimPacer pacer;
   u64 target_us = 0;     // catch_up: when the throttle wants the next call
   bool skewed = false;
@@ -3828,8 +4008,11 @@ bool RunSim(const SimParams& p, SimResult* out)
       Gate gate;
       gate.health_zero = LostAt(p, m.game, m.counter);
       gate.open = GateAt(p, m.counter) && !gate.health_zero && m.counter >= p.open_at + p.ready_extra[m.idx];
-      gate.hardware_quiet = !(p.busy_hardware && (m.busy_left > 0 || m.rng.Below(10) == 0));
-      gate.hardware_hold = m.busy_left > 0 && m.busy_streak >= 3;  // GateTracker: busy for 3 calls in a row
+      // The disc is quiet for the last frames of a run: a rollback that waits for a read has to be able to run before the run's end (a real game does
+      // not stop in the middle of a read).
+      const bool disc_may_be_busy = p.busy_hardware && m.counter < p.frames - 10;
+      gate.hardware_quiet = !(disc_may_be_busy && (m.busy_left > 0 || m.rng.Below(10) == 0));
+      gate.hardware_hold = disc_may_be_busy && m.busy_left > 0 && m.busy_streak >= 3;  // GateTracker: busy for 3 calls in a row
       gate.layout_pending = m.layout_pending && m.session->mode() == Mode::ARMED;
       gate.why = "sim";
       const bool armed_call = m.session->mode() == Mode::ARMED && !m.session->Resimulating();
@@ -3854,6 +4037,8 @@ bool RunSim(const SimParams& p, SimResult* out)
       if (m.blocking)
         m.max_block_us = std::max(m.max_block_us, net.now - m.block_start);
       m.blocking = false;
+      if ((r.flags & REPLY_FLAG_RESTORED) != 0 && !gate.hardware_quiet)
+        ++m.restores_while_busy;
       if (armed_call && gate.health_zero && m.counter >= 0 && static_cast<size_t>(m.counter) < out->reference_states.size())
       {
         FakeGame truth;
@@ -3872,7 +4057,7 @@ bool RunSim(const SimParams& p, SimResult* out)
         {
           m.busy_streak = 0;
           if (m.rng.Below(40) == 0)
-            m.busy_left = 3 + static_cast<u32>(m.rng.Below(6));
+            m.busy_left = 3 + static_cast<u32>(m.rng.Below(p.busy_long ? 40 : 6));
         }
       }
       if (m.session->stats().relayouts != m.relayouts_seen)
@@ -3934,6 +4119,7 @@ bool RunSim(const SimParams& p, SimResult* out)
     r.mode = m.session->mode();
     r.finals = m.finals;
     r.phantom_lost = m.phantom_lost;
+    r.restores_while_busy = m.restores_while_busy;
     r.log = m.sink.Dump();
     r.chk_lines = m.sink.Count("CHK frame=");
     r.counter = m.counter;
@@ -3982,6 +4168,9 @@ SimParams ParamsFromSeed(u64 seed)
   // (Drawn last so every older parameter of a seed is unchanged.) The two gates become ready at different frames in most runs.
   p.ready_extra[0] = r.Below(3) == 0 ? 0 : static_cast<s32>(r.Below(30));
   p.ready_extra[1] = r.Below(3) == 0 ? 0 : static_cast<s32>(r.Below(30));
+  // (Drawn after those, again so no older parameter changes.) The slots a rollback may wait in and how long a disc read lasts.
+  p.io_extra = r.Below(3) == 0 ? 0 : static_cast<int>(r.Below(13));
+  p.busy_long = r.Below(4) == 0;
   return p;
 }
 
@@ -4016,8 +4205,15 @@ std::string CheckHealthy(const SimParams& p, const SimResult& res)
     const SimMachineResult& m = res.m[i];
     if (m.left_session || m.log.find("DESYNC") != std::string::npos || m.log.find("ERROR") != std::string::npos)
       return "machine " + std::to_string(i) + " logged LEAVE/DESYNC/ERROR:\n" + m.log;
-    if (m.stats.max_depth > static_cast<u32>(p.maxr))
-      return "machine " + std::to_string(i) + " rolled back " + std::to_string(m.stats.max_depth) + " deep, MAXR " + std::to_string(p.maxr);
+    // A restore never runs under a disc read; a rollback that has to wait for one may go deeper than MAXR: up to the ring (MAXR + 2 + io_extra slots)
+    // while it captures, up to the session's records (RING - 4) once frames are played without a capture or in a drain.
+    const u32 depth_limit = p.busy_hardware ? 59u : static_cast<u32>(p.maxr);  // (a DRAIN that waits captures nothing, so it has no ring limit either)
+    if (m.restores_while_busy != 0 || m.stats.forced_hw != 0)
+      return "machine " + std::to_string(i) + " restored under a disc read " + std::to_string(m.restores_while_busy) + " times, forced_hw " +
+             std::to_string(m.stats.forced_hw);
+    if (m.stats.max_depth > depth_limit)
+      return "machine " + std::to_string(i) + " rolled back " + std::to_string(m.stats.max_depth) + " deep, MAXR " + std::to_string(p.maxr) +
+             " io_extra " + std::to_string(p.io_extra);
     for (const auto& f : m.finals)
     {
       if (f.first < 0 || static_cast<size_t>(f.first) >= res.reference_checksum.size())
@@ -4267,6 +4463,7 @@ TEST(Rev3Session, ASeedReproducesTheSameLogs)
 TEST(Rev3Session, ThousandSeedsWithDelayJitterAndLossAgreeWithTheReference)
 {
   u64 rollbacks = 0, stalls = 0, postponed = 0, forced = 0, checks = 0, reopens = 0, deep = 0, predicted = 0, finals = 0;
+  u64 deep_rollbacks = 0, overflows = 0, overflow_calls = 0, waited_rollbacks = 0, busy_restores = 0, beyond_maxr = 0;
   u32 failures = 0;
   for (u64 seed = 1; seed <= 1000; ++seed)
   {
@@ -4277,7 +4474,7 @@ TEST(Rev3Session, ThousandSeedsWithDelayJitterAndLossAgreeWithTheReference)
     if (!problem.empty())
     {
       EXPECT_EQ(problem, "") << "seed " << seed << " (delay " << p.delay << " maxr " << p.maxr << " net " << p.net.delay_us << "/"
-                             << p.net.jitter_us << "/" << p.net.loss_pct << "%)";
+                             << p.net.jitter_us << "/" << p.net.loss_pct << "%): " << problem.substr(0, 600);
       if (++failures >= 5)  // do not flood the output
         break;
       continue;
@@ -4288,6 +4485,13 @@ TEST(Rev3Session, ThousandSeedsWithDelayJitterAndLossAgreeWithTheReference)
       stalls += m.stats.stalls;
       postponed += m.stats.postponed;
       forced += m.stats.forced_hw;
+      deep_rollbacks += m.stats.deep_rollbacks;
+      overflows += m.stats.io_overflow;
+      overflow_calls += m.stats.io_overflow_calls;
+      waited_rollbacks += m.stats.io_postponed_rollbacks;
+      busy_restores += m.restores_while_busy;
+      if (m.stats.max_depth > static_cast<u32>(p.maxr))
+        ++beyond_maxr;
       checks += m.stats.checks_ok;
       predicted += m.stats.predicted_frames;
       finals += m.finals.size();
@@ -4304,9 +4508,17 @@ TEST(Rev3Session, ThousandSeedsWithDelayJitterAndLossAgreeWithTheReference)
   EXPECT_GT(reopens, 100u);
   EXPECT_GT(predicted, 50000u);
   EXPECT_GT(finals, 200000u);
-  EXPECT_GT(forced, 20u);
-  EXPECT_GE(deep, 5u);
-  EXPECT_LE(deep, 7u);
+  // A restore never runs under a disc read (the sim's busy windows include long ones): none did, none was forced, and the rollbacks that had to
+  // wait for one went deeper than MAXR, some of them past the ring (io_overflow: real pads, no capture) and still agreed with the reference.
+  EXPECT_EQ(forced, 0u);
+  EXPECT_EQ(busy_restores, 0u);
+  EXPECT_GT(waited_rollbacks, 100u);
+  EXPECT_GT(deep_rollbacks, 20u);
+  EXPECT_GT(beyond_maxr, 5u);
+  EXPECT_GT(overflows, 3u);
+  EXPECT_GT(overflow_calls, overflows);
+  EXPECT_GE(deep, 7u);
+  EXPECT_LE(deep, 59u);
 }
 
 TEST(Rev3Session, LiveStatesThatLookLostOnOneSideOnlyNeverCloseTheGateOnOneSideOnly)
@@ -4334,7 +4546,7 @@ TEST(Rev3Session, LiveStatesThatLookLostOnOneSideOnlyNeverCloseTheGateOnOneSideO
     SimResult res;
     RunSim(p, &res);
     const std::string problem = CheckHealthy(p, res);
-    ASSERT_EQ(problem, "") << "seed " << seed;
+    ASSERT_EQ(problem, "") << "seed " << seed << ": " << problem.substr(0, 600);
     for (const SimMachineResult& m : res.m)
     {
       phantom += m.phantom_lost;
@@ -4679,7 +4891,7 @@ TEST(Rev3Session, ThousandSeedsWithThrottleAndPacingAgreeWithTheReferenceAndNeve
     const std::string problem = CheckHealthy(p, res);
     if (!problem.empty())
     {
-      EXPECT_EQ(problem, "") << "seed " << seed;
+      EXPECT_EQ(problem, "") << "seed " << seed << ": " << problem.substr(0, 600);
       if (++failures >= 5)
         break;
       continue;
@@ -4712,4 +4924,3 @@ TEST(Rev3Session, ThousandSeedsWithThrottleAndPacingAgreeWithTheReferenceAndNeve
 
 
 }  // namespace
-

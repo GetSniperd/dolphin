@@ -408,6 +408,9 @@ NetOptions ParseNetOptions(const GetEnvFn& get_env)
   v = o.maxr_budget_us;
   ReadNumber(get_env, "REV3_NET_MAXR_BUDGET_US", 1000, 100000, &v, &o.warnings);
   o.maxr_budget_us = static_cast<u32>(v);
+  v = o.io_extra;
+  ReadNumber(get_env, "REV3_NET_IO_EXTRA", 0, MAX_IO_EXTRA, &v, &o.warnings);
+  o.io_extra = static_cast<int>(v);
   const std::string mirror = get_env("REV3_PAD_MIRROR");
   if (mirror == "1")
     o.pad_mirror = true;

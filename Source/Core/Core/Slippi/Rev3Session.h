@@ -104,6 +104,23 @@
 //   own (stalls are local): with Config::maxr_adapt the cost of every rollback (RESTORED reply to the end of the resimulation) is measured and
 //   MAXR_eff is the largest K for which K frames of resimulation fit the budget at the p95 per-frame cost. See AdaptMaxr().
 //
+// A RESTORE NEVER RUNS UNDER A READ (Oct 17, D's soak 20261017_113023: 4 of 10 runs froze on one side, three of them in the nw4r stream thread)
+//   A restore rewinds the game's memory but not the disc: a read that was started before the restore finishes after it, and its DVD callback
+//   writes into a command block that, on the rewound stack, belongs to something else (DVDReadPrio is synchronous: the block lives on the
+//   caller's stack). The old rule postponed a rollback while the hardware was busy only until it would have been deeper than MAXR and then
+//   restored anyway ("forced", forced_hw 36 / 34 in that soak). Now the rule has no exception:
+//     - Gate::hardware_quiet false (the game's DVD library has a command executing, the DI / IOS is busy; with REV3_RB_IOS_GATE=1 also a pending
+//       IPC event) means NO restore in this call. The rollback waits; frames keep being captured and played (the best known pads) so the emulated
+//       read can finish, and the restore then goes to the same target at the greater depth (up to MAXR + io_extra + 1 frames; logged and counted
+//       in deep_rollbacks). The stall rule (N - R <= MAXR) is about predicted REMOTE pads and does not count frames that only wait for the disc.
+//     - The ring has Config::io_extra more slots (REV3_NET_IO_EXTRA, default 10) for that wait. If capturing one more frame would push the
+//       target (after the clean-slot redirect) out of the ring, the call is played with the real pad of its own frame (a wait for the peer as
+//       in a HOLD, the usual stall) and WITHOUT a capture, so the ring stays as it is: io_overflow counts it and the log says so loudly.
+//     - DRAIN does not capture, so nothing can fall off the ring there: a rollback that is due while a read is in flight plays the drain's
+//       frames with real pads until the read has ended, then restores. A wait that would outlast the session's records (RING) leaves the session.
+//   A scheduled close (THE GATE RULE) is not delayed by this, but a lost frame that lies behind a waiting rollback is declared final only after
+//   it: if the wait outlasts the close frame the close is applied late (gate_late, logged), which needs a KO inside a read of more than MAXR frames.
+//
 // NOT DONE YET (later milestones)
 //   M6: the game-side render / SFX skip. See also the header notes at the declarations marked "M3".
 
@@ -131,6 +148,8 @@ constexpr s32 CHECK_INTERVAL = 30;            // frames between exchanged checks
 constexpr size_t CHECK_KEEP = 8;              // own and peer checksums kept
 constexpr int MAX_ROLLBACK_CEILING = 7;       // SlippiNetplay.h ROLLBACK_MAX_FRAMES: the largest MAXR a config may ask for
 constexpr int MAX_DELAY = 15;                 // largest input delay accepted (frames)
+constexpr int MAX_IO_EXTRA = 24;              // largest Config::io_extra (frames = extra snapshot slots); the session's pad / record rings (RING) must outlast MAXR + 2 + this
+constexpr size_t DEPTH_HIST_SIZE = static_cast<size_t>(MAX_ROLLBACK_CEILING) + static_cast<size_t>(MAX_IO_EXTRA) + 2;  // depth_hist buckets: depths 0..MAXR + extra + 1
 constexpr u32 FIELDS_VERSION = 1;             // rbchecksum.FIELDS_VERSION
 constexpr u32 FIELDS_DIGEST_V1 = 0xD4076EF2;  // rbchecksum.fields_digest() for version 1 (a test keeps FIELDS and this equal)
 
@@ -323,7 +342,8 @@ struct CaptureInfo
 // One memory range and the CRC-32 of its bytes (REV3_NET_RANGE_CRC).
 using RangeCrc = RangeHash;  // Rev3Rollback.h
 
-// Snapshot slots keyed by hook frame; M3 implements this on Rev3Rollback's capture/restore. The session needs MAXR + 2 slots.
+// Snapshot slots keyed by hook frame; M3 implements this on Rev3Rollback's capture/restore. The session needs MAXR + 2 slots, plus
+// Config::io_extra more so a rollback that has to wait for a disc read keeps its target in the ring (see "A RESTORE NEVER RUNS UNDER A READ").
 class SnapshotStore
 {
 public:
@@ -355,6 +375,8 @@ public:
   // False when the slot of `frame` was captured with a disc read in flight (hardware / IOS or the game's own DVD library): restoring it would leave
   // the game waiting for a read that already finished, so the session never rolls back to such a slot while an earlier clean one exists.
   virtual bool Clean(s32 /*frame*/) const { return true; }
+  // The number of slots in the ring (the newest SlotCount() captured frames are kept). 0 = unknown: the session then trusts MAXR + 2 + io_extra.
+  virtual size_t SlotCount() const { return 0; }
   // Called before every SUMMARY line (also the final one): the store may write its own lines first (the `NOTE learned summary` line of the
   // snapshot machinery) and returns fields appended to the SUMMARY line (restore verify counters, resimulation hiding counters), with a
   // leading space, or "".
@@ -484,6 +506,9 @@ struct Config
                                       // two sides still agree on what the game gets
   u32 maxr_budget_us = 14000;         // M5, adaptive MAXR: the resimulation of K frames should cost less than this at its p95 (microseconds; ~ one 60 Hz
                                       // frame of 16.7 ms minus the live frame's own work)
+  int io_extra = 0;                   // REV3_NET_IO_EXTRA (frames = snapshot slots, 0..MAX_IO_EXTRA): slots beyond MAXR + 2 so that a rollback that must wait for a
+                                      // disc read to end (a restore never runs under one) keeps its target frame in the ring for that many more frames. Local to a
+                                      // machine (the peer never learns of it). The store must have MAXR + 2 + io_extra slots (SnapshotStore::SlotCount).
   Hello hello;                        // this side's HELLO (role and delay are filled in from this config when the session starts)
 };
 
@@ -511,13 +536,19 @@ struct SessionStats
   u32 resim_calls = 0;                // of which re-runs after a RESTORED reply
   u32 rollbacks = 0;
   u32 max_depth = 0;
-  std::array<u32, MAX_ROLLBACK_CEILING + 2> depth_hist{};  // [d] = rollbacks of depth d
+  std::array<u32, DEPTH_HIST_SIZE> depth_hist{};  // [d] = rollbacks of depth d (the last bucket also takes deeper ones)
   u32 predicted_frames = 0;           // frames whose remote pad was a prediction when replied
   u32 stalls = 0;                     // calls that had to wait because N - R > MAXR
   u64 stall_us_total = 0;
   u64 stall_us_max = 0;
   u32 postponed = 0;                  // rollbacks postponed because hardware was busy
-  u32 forced_hw = 0;                  // rollbacks done while busy because postponing would have exceeded MAXR (or in DRAIN)
+  u32 forced_hw = 0;                  // rollbacks done under a disc read: since the io_extra rule this is always 0 (kept so the reports keep their column)
+  u32 io_postponed_rollbacks = 0;     // rollbacks that waited for a disc read to end before they could run (episodes; `postponed` counts the calls spent waiting)
+  u32 io_postponed_max_calls = 0;     // ... the longest such wait, in calls (frames)
+  u32 deep_rollbacks = 0;             // rollbacks deeper than MAXR (only possible after such a wait)
+  u32 io_overflow = 0;                // waits whose target would have fallen off the ring (extended by io_extra): the frames were then played with real pads and no capture
+  u32 io_overflow_calls = 0;          // ... calls answered that way
+  u32 close_io_delayed = 0;           // scheduled closes applied after their frame because a lost frame lay behind a rollback that waited for a disc read (not gate_late)
   u32 io_dirty_targets = 0;           // rollbacks whose target slot had been captured with a disc read in flight
   u32 io_redirected = 0;              // ... of which went to the newest earlier clean slot instead (more frames resimulated)
   u32 io_no_clean_slot = 0;           // ... and of which found no clean slot in the ring: restored anyway (a desync risk, logged loudly)
@@ -682,6 +713,8 @@ private:
   };
 
   static constexpr size_t RING = 64;
+  static constexpr u32 MAX_DEEP_LOGS = 400;  // `ROLLBACK deep` lines written in full
+  static_assert(RING > static_cast<size_t>(MAX_ROLLBACK_CEILING + MAX_IO_EXTRA) + 8, "the frame records must outlast the deepest rollback the ring allows");
 
   // ---- inputs
   s32 Confirmed() const;  // R, with the neutral frames below D counted as known
@@ -699,10 +732,25 @@ private:
   bool StepArmed(const Command& command, const Gate& gate, Reply* reply);
   bool StepDrain(const Command& command, const Gate& gate, Reply* reply);
   bool StepResim(const Command& command, const Gate& gate, Reply* reply);
-  bool DoRollback(const Command& command, s32 target, bool forced, Reply* reply);
+  bool DoRollback(const Command& command, s32 target, Reply* reply);
   // The frame to restore for a misprediction at `g`: g itself, or the newest earlier frame whose slot was captured with no disc read in flight when
   // g's own slot was not (SnapshotStore::Clean). Counts and logs both cases.
   s32 ChooseCleanTarget(s32 g);
+  // The same frame without counting or logging (the wait for a read asks it at every call).
+  s32 PeekCleanTarget(s32 g) const;
+  // A rollback is due (misprediction at g) but the hardware is busy: the bookkeeping of the wait (episode start, calls, logs). `capturing`: this call
+  // would capture a snapshot. NoCapture: that capture must be left out because it would push the rollback's target out of the ring.
+  enum class WaitOutcome : u8
+  {
+    Capture,
+    NoCapture,
+    Left,  // the wait outlasted the session's records: the session was left
+  };
+  WaitOutcome NoteRollbackWait(s32 g, bool capturing);
+  void EndRollbackWait();
+  bool CloseDelayedByWait() const;
+  // Plays the call with the real remote pad and no capture (a wait that has no room to capture, or a DRAIN frame): blocks until the pad is there.
+  bool PlayWithoutCapture(const Gate& gate, Block block, Reply* reply);
   bool FinishDrain(const Command& command, const Gate& gate, Reply* reply);
   bool FinishRelayout(const Command& command, const Gate& gate, Reply* reply);
   bool EndCall(s32 frame, const Reply& reply, Reply* out);
@@ -829,6 +877,12 @@ private:
   s32 m_finalized = -1;            // highest frame already handed to the observer / check bookkeeping
   std::array<Used, RING> m_used{};
   bool m_postpone_counted = false; // the postponed counter was bumped for this call
+  size_t m_slots = 0;              // ring slots the store keeps (MAXR + 2 + io_extra, or what the store reports)
+  s32 m_wait_since = -1;           // the frame at which the current wait for a disc read began (-1 = no rollback waits)
+  u32 m_wait_calls = 0;            // calls answered during that wait
+  bool m_wait_overflow = false;    // the wait has already been counted as an overflow
+  s32 m_wait_span_start = -1;      // the last wait that ended with its rollback: from this frame ...
+  s32 m_wait_span_end = -1;        // ... to the call that ran it (CloseDelayedByWait)
 
   // agreed close, local relayout / hold (see THE GATE RULE)
   s32 m_close_at = -1;             // the frame both machines enter DRAIN at (scheduled from a final frame); -1 = none
@@ -882,7 +936,7 @@ private:
     u32 forced = 0;
     u32 suppressed = 0;
     u64 stall_us = 0;
-    std::array<u32, MAX_ROLLBACK_CEILING + 2> depth{};
+    std::array<u32, DEPTH_HIST_SIZE> depth{};
   } m_win;
 
   // M5 pacing

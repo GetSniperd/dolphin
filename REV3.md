@@ -80,7 +80,7 @@ Run (set the variables before starting Slippi_Dolphin.exe; the patched game with
 | `REV3_SNAPSHOT_PAD=n` | 0..16, default 0 = off. Every page the tracker learns also pulls n neighbouring 4 KB pages on each side into the snapshot set (clipped to MEM1 / MEM2, cuts still win; `NOTE learn pad pages=n ..` at start). Costs snapshot bytes (up to 2n pages per learned run), saves relayouts when a game block spans pages that start to change one after the other. Whether it would have helped a run is in `NOTE learned adjacency` (below) |
 | `REV3_EFCHECK=N\|all\|0` | the ef list check around restores (see "Effect pool"): unset = the first 200 restores, `N` = the first N, `all` = every restore, `0` = off |
 | `REV3_ALARMCHECK=0\|1` | the OS alarm queue watch (default 1, see "Alarm queue"): the queue is walked at every capture and around every restore |
-| `REV3_RB_IOS_GATE=1` | a pending IOS IPC event (CoreTiming `IPCEvent` / `IPCInterrupt` / `FinishDICommand`) counts like a disc read in flight (default 0 = only counted, see "Alarm queue") |
+| `REV3_RB_IOS_GATE=1` | a pending IOS IPC event (CoreTiming `IPCEvent` / `IPCInterrupt` / `FinishDICommand`) counts like a disc read in flight: slots are not targets, SyncTest postpones, and the netplay gate (HOLD / quiet / no restore) sees it (default 0 = only counted, see "Alarm queue") |
 | `REV3_SYNCTEST_LOG=path` | log file (default `<User>\Logs\rev3_synctest.log`), appended, flushed per line |
 
 Hardware regions (computed from Dolphin's emulated hardware when SyncTest arms and re-checked every 600 hook calls; the set
@@ -844,6 +844,7 @@ long match, and a desync report that names the first wrong field. Files: `Slippi
 | variable | default | meaning |
 |---|---|---|
 | `REV3_NETSIM=delay_ms=80,jitter_ms=30,loss_pct=5,seed=1` | unset = off | the network simulator (below). Any subset of keys, any order; unset keys are 0, `seed` defaults to 1. A bad value is `ERROR NET REV3_NETSIM=...` in the net log and **no** simulation (the run is not the test that was asked for) |
+| `REV3_NET_IO_EXTRA=n` | 10 | frames (= extra snapshot slots, 0..24) a rollback that must wait for a disc read can wait before its target would leave the ring (above, "A restore never runs under a read"). Local to a machine, not part of HELLO |
 | `REV3_NET_BUSY=n` | 1 | consecutive armed calls with a disc read in flight before a HOLD starts (below; 1 = from the first busy call, was 3 until the dirty-slot fix); 0 = never hold. 0..1000. Local to a machine, not part of HELLO |
 | `REV3_NET_RANGE_CRC=1` | 0 | testing only: both sides exchange the CRC of every snapshot range at each checksum frame (below). Both machines should set it; one side without it simply gets no comparison |
 
@@ -962,13 +963,13 @@ parameters now include a random per-machine gate delay.
 
 ### Busy hardware (disc read / DVD DMA)
 
-A rollback while a disc read is in flight can't rewind the read, so in M3 it was postponed until it would exceed MAXR and then **forced**
-(`forced=hardware_busy` on the ROLLBACK line). M4 stops that from happening in normal play without changing the shared mode: after
+A rollback while a disc read is in flight can't rewind the read. In M3 it was postponed until it would exceed MAXR and then **forced**
+(`forced=hardware_busy` on the ROLLBACK line); since Oct 17 it is never forced, see "A restore never runs under a read" below. M4 stops that from happening in normal play without changing the shared mode: after
 `REV3_NET_BUSY` (1, the first busy call) armed calls in a row with a disc read in flight the machine starts a **HOLD**: it predicts nothing while the read lasts
 (each call waits for the real remote pad of its own frame, `GATE hold frame=..`), so no rollback can become due while the hardware is busy. The
 HOLD ends after 2 calls without a read (`GATE hold end frame=.. held_calls=..`). A misprediction made before the hold is still postponed
-while the depth allows, as before. The gate itself stays open for the peer: a HOLD is invisible on the wire, it is only a machine that
-waits for pads more often. `SUMMARY` counts `hw_holds`, `hold_calls`, `postponed`, `forced_hw`; a `forced_hw` that is not 0 in normal play is a bug report. This
+until the read has ended. The gate itself stays open for the peer: a HOLD is invisible on the wire, it is only a machine that
+waits for pads more often. `SUMMARY` counts `hw_holds`, `hold_calls`, `postponed`, `forced_hw` (always 0 now; kept so reports keep the column). This
 is the one place where the brief's "close the gate on sustained busy hardware" is done as "hold" instead: a close must be the same on both
 machines, and the peer cannot see our disc.
 
@@ -987,9 +988,42 @@ slot it restores the dirty one anyway and writes `WARNING ROLLBACK frame=g: its 
 risk, counted); (3) the HOLD starts at the first busy call (`REV3_NET_BUSY=1`), so no frame is predicted while a read is in flight and a dirty slot is practically never a misprediction.
 SyncTest cannot redirect (its ring is K + 1 slots): a restore of a dirty slot is skipped (`io_dirty_skipped`). SUMMARY lines (net: the session's, then the store's note; SyncTest: its own) carry
 `io_redirected=.. io_no_clean_slot=..` (session) and ` io_dirty_slots=.. io_dirty_hw=.. io_dirty_game=.. io_dirty_skipped=..` (snapshot machinery; `io_dirty_game` counts captures where only
-the game view saw the read). Residual: a rollback that is FORCED while a read is in flight (depth reached MAXR) restores into a game whose library may already have moved on; `forced_hw` must stay 0.
+the game view saw the read). (The residual of a rollback FORCED under a read is gone: see the next section.)
 Tests: `Rev3Session.ARollbackWhoseSlotWasCaptured*`, `TheRedirectSkips*`, `WithNoCleanSlotInTheRing*`, `CleanSlotsRollBack*`; `Rev3Rollback.TheGamesDvdLibraryView*`, `NetModeRecordsWhetherADiscRead*`,
 `TheHardwareViewMarksSlotsDirtyToo`, `SyncTestDoesNotRestoreASlotCaptured*`, `TheGameViewPostpones*`; `Rev3NetLink.TheDefaultHoldStartsAtTheFirstBusyCall*`.
+
+### A restore never runs under a read (Oct 17, 2026; D's soak `20261017_113023`)
+
+**Why.** A restore rewinds the game's memory, not the disc. `DVDReadPrio` (0x802D04F4) is synchronous: its DVD command block lives on the calling thread's stack and the DVD
+callback writes into it and wakes the thread. A restore made while a read is in flight rewinds that stack to a frame before the read; IOS then finishes the read and the callback writes
+into an address that now belongs to something else. Soak `20261017_113023` (seeds 11-20, write tracking on, hide off): 6 clean, 0 desync, 4 freezes on one side: 3 x the nw4r stream
+thread (0x80404190) takes an ISI at 0x00400000 with the same r1 `0x909C9488` and BRSTM header words (`RSTM`, `FEFF0100`) on the stack at the `DVDReadPrio` frame, 1 x an endless OS alarm-list walk. The old
+rule restored anyway when postponing once more would have made the rollback deeper than MAXR (`forced=hardware_busy`; `forced_hw` 36 host / 34 guest in that soak; the forced lines
+in the logs sit on the first busy call of a read with `hardware=1 game_dvd=1`, depth = MAXR exactly).
+
+**The rule now.** `Gate::hardware_quiet` false (the game's DVD library has a command executing at 0x8049D870, the DI / IOS is busy, and with `REV3_RB_IOS_GATE=1` also a pending IPC event:
+`SyncTest::DiscBusy`) means no restore in that call, in ARMED and in DRAIN, whatever the depth. There is no "forced" any more.
+- The rollback **waits**: `ROLLBACK postponed frame=g target=t live=n depth=d (a disc read is in flight ...; ring N slots)`. The frames keep being captured and played (a HOLD already plays the
+  real pads, otherwise the best known ones), so the emulated read can finish. When the hardware is quiet the restore goes to the same target at the greater depth; the resimulation uses the
+  confirmed pads. Depth up to MAXR + 2 + `REV3_NET_IO_EXTRA` with captures. `ROLLBACK deep depth=.. (MAXR ..) frame=.. live=.. waited=<calls>` is written (not rate limited, first 400) for every
+  rollback deeper than MAXR; the ordinary `ROLLBACK depth=..` line gets ` waited=<calls>`.
+- The stall rule (`N - R <= MAXR_eff`) is about **predicted remote pads** and does not count frames that only wait for the disc: `R` keeps moving while the rollback waits.
+- **`REV3_NET_IO_EXTRA`** (default 10, 0..24, frames = snapshot slots; local to a machine, not in HELLO): the ring has MAXR + 2 + extra slots (`k = MAXR + 1 + extra` in `BuildSyncTest`; about 6.5 MB per
+  slot, 10 slots ~ 65 MB). `NET start ... io_extra=..` and `SESSION start ... io_extra=.. slots=..` say what is in force.
+- **Overflow.** If capturing frame n would overwrite the target (after the clean-slot redirect: `n - target >= slots`) the call is played with the real pad of its own frame (a wait for the peer
+  as in a HOLD) and **no capture**, so the ring stays as it is; `WARNING ROLLBACK frame=g target=t live=n: the disc read outlasts the ring (..)` once per wait, `io_overflow` (waits) and
+  `io_overflow_calls` in SUMMARY. The restore still goes to the same target when the read ends. (A "stall" cannot be a plain block: the emulated read only finishes while frames run.)
+- **DRAIN** captures nothing, so the ring cannot lose the target there: a due rollback with a read in flight plays the drain's frames with real pads until the read has ended, then restores.
+  A wait that outlasts the session's frame records (`RING` 64, depth >= 60) is `ERROR ROLLBACK ...` + `LEAVE` (counted in `io_overflow`); it needs a read of more than a second.
+- **Closes.** A lost frame behind a waiting rollback is declared final only after it. The end of a resimulation now verifies the replayed frames and finalizes at once (so the close is known before
+  the next call, as the gate rule needs); if a scheduled close is still overdue because a wait covered its frame, `NOTE GATE close scheduled for frame F applied at call N: a rollback waited for a disc read`
+  and `close_io_delayed` (not `gate_late`) count it, and the close line shows the scheduled frame.
+- **IOS gate.** `REV3_RB_IOS_GATE=1` (still opt-in) now also feeds the netplay gate (HOLD / quiet / restore): `NetModule::EvaluateGate` asks `SyncTest::DiscBusy`, which includes
+  `IosEventsPending` when the gate is on; it already marked slots dirty.
+- SUMMARY: `io_postponed_rollbacks` (waits), `io_postponed_max_calls`, `deep_rollbacks`, `io_overflow`, `io_overflow_calls`, `close_io_delayed`, `forced_hw` (must be 0).
+Tests: `Rev3Session.BusyHardwareDefersARollbackPastMaxr*`, `ADeferredRollbackKeepsItsTarget*`, `TheCleanTargetRedirectCountsForTheRingRoom*`, `ADrainDoesNotRestoreUnderARead*`,
+`AWaitThatOutlastsTheSessionsRecords*`, the 1000-seed lossy run (busy windows of 3..42 calls, random `io_extra`; `restores_while_busy` and `forced_hw` must be 0, rollbacks deeper than MAXR and
+`io_overflow` must occur, final states equal the reference); `Rev3Rollback.NetModeWithIoExtraSlots*`, `TheNetplayBusyViewFollowsTheDisc*`; `Rev3NetLink.IoExtra*`.
 
 ### Log volume
 
@@ -1251,6 +1285,7 @@ Tests: `Rev3Bot.*` (32; `AnUnplannedLeave*`, `ALeaveAfterAPlannedDecision*`, `On
 - Pacing and MAXR measurement are built (M5) but only run in the test network; the real numbers are D's loopback (above). Not done: a pacing OSD line (the log has it), and the adaptive MAXR is off by default.
 - Hiding in the game (M6) needs the INI regenerated with protocol 3 and is untested in the real game; with a protocol 2 hook only the v1 hiding (throttle off + mute) runs.
 - Internet play (NAT traversal beyond simultaneous open, relay, matchmaking) is M7; direct connect only.
-- A HOLD makes a machine wait for the peer's pads more often during a disc read; there is no measurement of how often yet.
+- A HOLD makes a machine wait for the peer's pads more often during a disc read; there is no measurement of how often yet. A rollback that waits for a read is deeper than MAXR when it runs
+  (resimulation cost grows with the depth: watch `resim_ms_max` and `deep_rollbacks`); the soak after Oct 17 is the first measurement.
 - No spectators, no replay file; rollback depth is capped at 7; the first command must be frame 0 (a game already in progress cannot join); a
   window closed while the peer waits ends the peer's wait through the BYE (or the wait timeout), not instantly if the machine crashes.

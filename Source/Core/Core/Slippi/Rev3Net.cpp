@@ -521,6 +521,11 @@ bool SyncTestStore::Clean(s32 frame) const
   return m_sync == nullptr || frame < 0 || m_sync->NetClean(static_cast<u32>(frame));
 }
 
+size_t SyncTestStore::SlotCount() const
+{
+  return m_sync != nullptr ? m_sync->NetSlotCount() : 0;
+}
+
 bool SyncTestStore::Has(s32 frame) const
 {
   return m_sync != nullptr && frame >= 0 && m_sync->NetHas(static_cast<u32>(frame));
@@ -739,6 +744,7 @@ void NetModule::Start(const Command& command)
   config.role = m_options.role;
   config.delay = m_options.delay;
   config.max_rollback = m_options.max_rollback;
+  config.io_extra = m_options.io_extra;
   config.barrier_timeout_ms = m_options.connect_timeout_ms;
   config.wait_timeout_ms = m_options.wait_timeout_ms;
   config.range_crc = m_options.range_crc;
@@ -747,9 +753,9 @@ void NetModule::Start(const Command& command)
   config.maxr_budget_us = m_options.maxr_budget_us;
   config.pad_mirror = m_options.pad_mirror;  // the session ignores it on the host (and says so)
   config.hello = BuildHello(hello_inputs, m_options.role, m_options.delay);
-  m_log.Line(Fmt("NET start role=%s listen=%u peer=%s delay=%d rollback=%d maxr=%d gate=arm:%u,quiet:%u game=%s build=%s",
+  m_log.Line(Fmt("NET start role=%s listen=%u peer=%s delay=%d rollback=%d maxr=%d io_extra=%d gate=arm:%u,quiet:%u game=%s build=%s",
                  RoleText(m_options.role), static_cast<unsigned>(m_options.listen_port), m_transport->PeerText().c_str(), m_options.delay,
-                 m_options.rollback ? 1 : 0, m_options.max_rollback, m_options.arm_calls, m_options.quiet_calls,
+                 m_options.rollback ? 1 : 0, m_options.max_rollback, m_options.io_extra, m_options.arm_calls, m_options.quiet_calls,
                  hello_inputs.game_id.c_str(), hello_inputs.build.c_str()));
   if (m_options.range_crc)
     m_log.Line("NOTE REV3_NET_RANGE_CRC=1: the CRCs of the snapshot ranges are exchanged at every checksum frame (testing only; differences are logged, never a desync)");
@@ -796,9 +802,10 @@ Gate NetModule::EvaluateGate(Mode mode, bool resimulating)
 
   GateInputs in;
   in.fighters_found = gate.fighters_found;
-  // Busy = a disc read in flight as the hardware / IOS see it OR as the game's own DVD library does (a command executing): a frame played in
-  // either state could later be restored into a game that waits for a completion that has already happened.
-  in.hardware_busy = (m_hardware != nullptr && m_hardware->DiscReadInFlight()) || m_sync->GameDvdBusy();
+  // Busy = a disc read in flight as the hardware / IOS see it OR as the game's own DVD library does (a command executing), or, with REV3_RB_IOS_GATE=1,
+  // an IOS IPC event on its way (SyncTest::DiscBusy). No restore runs while this is true (A RESTORE NEVER RUNS UNDER A READ, Rev3Session.h), and a frame
+  // played in this state could later be restored into a game that waits for a completion that has already happened.
+  in.hardware_busy = (m_hardware != nullptr && m_hardware->DiscReadInFlight()) || m_sync->DiscBusy();
   in.health_zero = gate.health_zero;
   in.learning_done = m_sync->LearningDone();
   in.set_pending = m_sync->NetLayoutPending();

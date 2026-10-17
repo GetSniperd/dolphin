@@ -7638,3 +7638,71 @@ TEST(Rev3Alarm, TheIosGateKeepsRollbacksAwayFromSlotsAndMomentsWithAnIpcEventOnI
     game.Frame(test);
   EXPECT_GE(test.Stats().rollbacks, 5u);
 }
+
+// ---- a restore never runs under a read (Oct 17): the extended ring and the IOS gate of the netplay hardware view ----------------------
+
+TEST(Rev3Rollback, NetModeWithIoExtraSlotsKeepsARestorableTargetSixteenFramesBack)
+{
+  // Rev3::Net builds the ring with k = MAXR + 1 + REV3_NET_IO_EXTRA (5 + 1 + 10): 17 slots. The clamp of k used to stop at 8, which would have
+  // given a rollback that waits for a disc read no more room than MAXR + 2.
+  NetRig rig(Options(16), NetSeed());
+  EXPECT_EQ(rig.test.NetSlotCount(), 17u);
+  u32 f = 1000;
+  for (; f < 1010; ++f)
+  {
+    rig.Observe(f);
+    rig.Advance(f);
+  }
+  rig.Observe(f);
+  ASSERT_TRUE(rig.test.NetPrepareArm());
+
+  std::map<u32, std::array<u32, 3>> state;
+  for (f = 1010; f <= 1026; ++f)  // 17 captures: every one of them is still in the ring
+  {
+    if (f != 1010)
+      rig.Observe(f);
+    ASSERT_TRUE(rig.Capture(f)) << f;
+    state[f] = {rig.game.Mem().U32(STATE_A), rig.game.Mem().U32(STATE_A + 0x80), rig.game.Mem().U32(STATE_B + 4)};
+    rig.Advance(f);
+  }
+  for (u32 g = 1010; g <= 1026; ++g)
+    EXPECT_TRUE(rig.test.NetHas(g)) << g;
+  rig.Observe(1027);
+  ASSERT_TRUE(rig.Capture(1027));  // the 18th capture takes the slot of frame 1010 (the session leaves it out when that frame is a waiting target)
+  EXPECT_FALSE(rig.test.NetHas(1010));
+  EXPECT_TRUE(rig.test.NetHas(1011));
+  // The oldest frame still there restores to exactly its state: a rollback 16 frames deep is possible.
+  ASSERT_TRUE(rig.test.NetRestore(1011));
+  EXPECT_EQ(rig.game.Mem().U32(STATE_A), state[1011][0]);
+  EXPECT_EQ(rig.game.Mem().U32(STATE_A + 0x80), state[1011][1]);
+  EXPECT_EQ(rig.game.Mem().U32(STATE_B + 4), state[1011][2]);
+  EXPECT_EQ(rig.game.Mem().U32(SP), 1011u);
+}
+
+TEST(Rev3Rollback, TheNetplayBusyViewFollowsTheDiscTheGamesDvdLibraryAndOnlyWithTheGateTheIosEvents)
+{
+  // SyncTest::DiscBusy is what the netplay gate asks (Rev3::Net::NetModule::EvaluateGate): no restore runs while it is true.
+  FakeGame game(false);
+  FakeSink sink;
+  FakeHardware hw;
+  SyncTest plain(Options(2), game.Ranges(), game.Mem(), sink, FakeClock(), &hw);
+  SyncTestOptions gated_options = Options(2);
+  gated_options.ios_gate = true;
+  SyncTest gated(gated_options, game.Ranges(), game.Mem(), sink, FakeClock(), &hw);
+  EXPECT_FALSE(plain.DiscBusy());
+  EXPECT_FALSE(gated.DiscBusy());
+  hw.ios_events = 1;  // an IPC reply on its way
+  EXPECT_FALSE(plain.DiscBusy()) << "default: counted at the captures, not a gate";
+  EXPECT_TRUE(gated.DiscBusy()) << "REV3_RB_IOS_GATE=1: the same as a read in flight";
+  hw.ios_events = 0;
+  hw.disc_busy = true;
+  EXPECT_TRUE(plain.DiscBusy());
+  EXPECT_TRUE(gated.DiscBusy());
+  hw.disc_busy = false;
+  game.Mem().SetU32(DVD_EXECUTING_ADDR, DVD_BLOCK);
+  EXPECT_TRUE(plain.DiscBusy());
+  EXPECT_TRUE(gated.DiscBusy());
+  game.Mem().SetU32(DVD_EXECUTING_ADDR, 0);
+  EXPECT_FALSE(plain.DiscBusy());
+  EXPECT_FALSE(gated.DiscBusy());
+}
