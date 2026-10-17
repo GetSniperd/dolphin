@@ -819,6 +819,12 @@ Gate NetModule::EvaluateGate(Mode mode, bool resimulating)
     decision = m_gate_tracker.Update(in, [this] { return m_sync->NetPrepareArm(); });
     break;
   }
+  // The inputs in words for the ARM proposal / refusal lines (Rev3Session logs Gate::detail). Only in lockstep, where a proposal can wait on it.
+  if (mode == Mode::LOCKSTEP)
+    m_gate_detail = m_gate_tracker.Describe(in, m_sync->NetWriteTrackText().c_str());
+  else
+    m_gate_detail.clear();
+  gate.detail = m_gate_detail.c_str();
   gate.open = decision.open;
   gate.hardware_quiet = decision.hardware_quiet;
   gate.hardware_hold = decision.hold;
@@ -853,6 +859,11 @@ Reply NetModule::OnCommand(const Command& command)
   // RAM is writable again at once; the SUMMARY the session wrote already carries the counters).
   if (after == Mode::OFFLINE && before != Mode::OFFLINE && m_sync != nullptr)
     m_sync->NetLeave();
+  if (after == Mode::OFFLINE && before != Mode::OFFLINE && !Bot::IsPlannedLeaveReason(m_session->leave_reason()))
+  {
+    m_unplanned_leave = true;
+    m_leave_why = m_session->leave_reason();
+  }
   // An armed stretch that ended (DRAIN done): the tracker must see the gate shut to open it again later.
   if (after == Mode::LOCKSTEP && (before == Mode::ARMED || before == Mode::DRAIN))
     m_gate_tracker.Close();
@@ -867,6 +878,15 @@ Reply NetModule::OnCommand(const Command& command)
                       m_session->delay()));
   }
   return reply;
+}
+
+bool NetModule::TakeUnplannedLeave(std::string* why)
+{
+  if (!m_unplanned_leave)
+    return false;
+  m_unplanned_leave = false;
+  *why = m_leave_why;
+  return true;
 }
 
 void NetModule::Shutdown()

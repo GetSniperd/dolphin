@@ -566,6 +566,64 @@ TEST(Rev3Bot, ZeroWaitStopsOnTheCallThatDecides)
   EXPECT_EQ(m.stop_call, 10u);
 }
 
+TEST(Rev3Bot, AnUnplannedLeaveStopsTheRunAfterTheWaitAndSaysSo)
+{
+  // D's soak, Oct 16 (run_2 / run_6): the session left at the start of round 2 and the run carried on offline until the runner killed it.
+  Match m(Spec(ExitKind::Match), SmallTuning());
+  m.Feed(200, Obs(true, false));
+  m.Feed(30, Obs(true, true));  // KO 1
+  m.Feed(40, Obs(true, false));
+  const u32 leave_call = m.call;
+  EXPECT_TRUE(m.controller.NoteLeave(m.call, "no remote pad for 10000 ms (frame 8851, R=8850)"));
+  EXPECT_TRUE(m.controller.Decided());
+  EXPECT_EQ(m.log.Count("EXIT unplanned leave"), 1u);
+  EXPECT_EQ(m.log.Count("EXIT planned"), 0u);
+  bool left = false;
+  for (u32 i = 0; i < 300 && m.stop_call == 0; ++i)
+  {
+    ++m.call;
+    const ExitStep step = m.controller.OnCall(m.call, Obs(true, false));
+    if (step.stop)
+    {
+      m.stop_call = m.call;
+      m.reason = step.reason;
+      left = step.left;
+    }
+  }
+  EXPECT_EQ(m.stop_call, leave_call + 100);  // wait_calls later
+  EXPECT_TRUE(left);
+  EXPECT_NE(m.reason.find("net session left: no remote pad for 10000 ms"), std::string::npos) << m.reason;
+}
+
+TEST(Rev3Bot, ALeaveAfterAPlannedDecisionOrWithTheExitOffChangesNothing)
+{
+  Match m(Spec(ExitKind::Frames, 5), SmallTuning());
+  m.Feed(5, Obs(true, false));
+  ASSERT_TRUE(m.controller.Decided());
+  EXPECT_FALSE(m.controller.NoteLeave(m.call, "connection lost"));  // the planned exit is under way: the same stop, not a PROBLEM
+  m.Feed(200, Obs(true, false));
+  EXPECT_EQ(m.stop_call, 5u + 100u);
+  Lines log;
+  ExitSpec off;
+  ExitController disabled(off, SmallTuning(), log.Fn());
+  EXPECT_FALSE(disabled.NoteLeave(1, "connection lost"));
+  EXPECT_EQ(log.Count("EXIT"), 0u);
+}
+
+TEST(Rev3Bot, OnlyThePeersPlannedExitOrItsClosedEmulatorIsAPlannedLeave)
+{
+  EXPECT_TRUE(IsPlannedLeaveReason("the peer left (planned exit: match: the scene changed (2 -> 3) after 2 KOs)"));
+  EXPECT_TRUE(IsPlannedLeaveReason("the peer left (the emulator was closed)"));
+  EXPECT_FALSE(IsPlannedLeaveReason("the peer left (no remote pad for 10000 ms (frame 8851, R=8850))"));
+  EXPECT_FALSE(IsPlannedLeaveReason("no remote pad for 10000 ms (frame 8851, R=8850)"));
+  EXPECT_FALSE(IsPlannedLeaveReason("connection lost"));
+  EXPECT_FALSE(IsPlannedLeaveReason("desync (START_CHECK mismatch)"));
+  EXPECT_FALSE(IsPlannedLeaveReason(""));
+  EXPECT_EQ(EXIT_CODE_LEFT, 73);
+  for (const int code : {EXIT_CODE_FREEZE, EXIT_CODE_MAX_S, EXIT_CODE_STOP_HANG})
+    EXPECT_NE(EXIT_CODE_LEFT, code);
+}
+
 // ---- host-side exits -------------------------------------------------------------------------------------------------------------
 
 TEST(Rev3Bot, FreezeExitWaitsForTheStallLimitPlusItsSecondsAndIgnoresDeliberateWaits)
@@ -588,7 +646,7 @@ TEST(Rev3Bot, MaxSecondsAndStopHang)
   EXPECT_NE(EXIT_CODE_FREEZE, EXIT_CODE_MAX_S);
   EXPECT_NE(EXIT_CODE_FREEZE, EXIT_CODE_STOP_HANG);
   EXPECT_NE(EXIT_CODE_MAX_S, EXIT_CODE_STOP_HANG);
-  for (const int code : {EXIT_CODE_FREEZE, EXIT_CODE_MAX_S, EXIT_CODE_STOP_HANG})
+  for (const int code : {EXIT_CODE_FREEZE, EXIT_CODE_MAX_S, EXIT_CODE_STOP_HANG, EXIT_CODE_LEFT})
     EXPECT_GT(code, 1);  // not 0 (clean) and not 1 (Dolphin's own generic failure)
 }
 

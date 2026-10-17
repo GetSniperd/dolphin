@@ -40,9 +40,17 @@
 // THE GATE RULE (M4: both machines always agree on WHEN the shared mode changes)
 //   The shared modes are LOCKSTEP and ARMED. Whatever changes them must be a function of state both machines have, applied at a frame both
 //   know. Three kinds of decisions exist; each is handled in the one way that keeps the machines in agreement:
-//   OPEN   decided in LOCKSTEP, where every frame is final (all inputs confirmed). Applied at the frame where both sides' START_CHECKs
-//          name the same frame and carry the same state; a side whose local conditions (quiet hardware, snapshot set learned) differ
-//          simply sends no matching START_CHECK, and both stay in lockstep (a mismatch of frames is refused on both sides).
+//   OPEN   is an AGREEMENT over the wire, never a blocking wait (Oct 17: D's soak run_6 and run_2 deadlocked for 10 s at the start of round 2,
+//          because one side's gate was ready and it blocked for the peer's START_CHECK while the other side, whose gate inputs (hardware quiet
+//          streak, learned set, write tracking) are local and differ by a few frames, kept waiting for the first side's pads). A side whose gate
+//          is ready sends ARM_PROPOSE(frame F = its call + a margin of about one round trip) and goes on playing LOCKSTEP, pads flowing. The
+//          peer answers at once: ARM_ACCEPT if its own gate is ready now and F is still ahead of it, else ARM_REJECT with the reason and its gate
+//          inputs (it proposes itself when it gets ready; two proposals at once: the host's wins). The proposer arms at call F only with the
+//          ACCEPT in hand; the accepter arms at call F unconditionally, because it said yes. Both decide at F on SHARED state only: fighters
+//          found and nobody at health 0 (identical on both machines in lockstep); if that fails both cancel alike, without a message. Nothing
+//          here stops a machine from sending its pad: the only wait is the proposer's at call F, if the answer is not there yet, and that wait
+//          depends on a message the peer sends the moment it reads the proposal (it reads messages in every wait too), never on the peer's gate.
+//          The START_CHECK of the state at F is sent when arming and compared whenever the peer's arrives (a mismatch is a DESYNC).
 //   CLOSE  (a fighter at health 0, fighters not found) decided ONLY on FINAL frames: the state recorded at the capture of frame F is
 //          identical on both machines once F is final (every remote pad below F was played as confirmed). The first final frame F whose
 //          record says "lost" schedules the close for frame F + MAXR + 1, on both machines alike. F is always declared final by call
@@ -57,6 +65,15 @@
 //          Both are invisible on the wire, and the frames played are the same, so the final states cannot differ.
 //   A frame without fighters cannot be snapshotted, so such a frame is never predicted (the call waits for the real pad), and a live state
 //   without fighters is recorded as "lost" like a health-0 fighter.
+//
+// EVERY WAIT AND THE PAD STREAM (reviewed Oct 17 after the arm deadlock)
+//   A call stores and sends its own pad for frame N + D BEFORE it can wait (StoreLocal precedes every Block), so whatever a machine waits for,
+//   the peer can always run on up to call N + D. The waits, and what each depends on:
+//     LOCKSTEP / HOLD / DRAIN A / DRAIN B / STALL   the peer's PAD for a frame <= N (it sent it at call <= N - D + ...): a pad, not a decision
+//     ARM ANSWER (proposer, at call F only)         the peer's ARM_ACCEPT / ARM_REJECT, sent when it reads the proposal; every wait reads messages
+//     RELAYOUT (local drain)                         the peer's pads, like any DRAIN
+//     scheduled CLOSE                                no wait of its own: both enter DRAIN at F + MAXR + 1, a function of final frames
+//   Nothing waits for a decision the peer takes from LOCAL inputs. A wait that exceeds wait_timeout_ms leaves the session (the link is dead).
 //
 // PACING (M5): keeping the two machines in step so that neither one stalls
 //   Rollback bounds how far a machine may run ahead of what it knows (the stall rule, N - R > MAXR), but it does not say who is ahead. Two
@@ -95,6 +112,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 #include <string>
@@ -239,6 +257,9 @@ enum class MsgType : u8
   DesyncDump = 0x92,
   Bye = 0x93,
   RangeCrc = 0x94,  // M4, REV3_NET_RANGE_CRC=1 only: the CRCs of the snapshot ranges at a checksum frame (testing)
+  ArmPropose = 0x95,  // the sender's gate is ready: arm at frame F (the agreement that replaced the blocking START_CHECK wait, Oct 17)
+  ArmAccept = 0x96,   // the answer: yes, both arm at F
+  ArmReject = 0x97,   // the answer: no, with the reason and the sender's gate inputs
 };
 
 struct Message
@@ -366,7 +387,8 @@ bool ParseHello(const std::vector<u8>& bytes, Hello* out);
 // are each side's own HELLO; a delay difference is not listed, two equal roles are.
 std::vector<std::string> HelloMismatches(const Hello& mine, const Hello& theirs);
 
-// Sent by both sides at the frame the arm gate opens (lockstep, so the same frame): the exact state must agree before prediction starts.
+// Sent by both sides at the frame they arm (the agreed frame, lockstep, so the same state): the exact state must agree; compared when the peer's
+// arrives (it never blocks). A mismatch is a DESYNC.
 struct StartCheck
 {
   s32 frame = 0;
@@ -377,6 +399,46 @@ struct StartCheck
 std::vector<u8> SerializeStartCheck(const StartCheck& check);
 bool ParseStartCheck(const std::vector<u8>& bytes, StartCheck* out);
 std::vector<std::string> StartCheckMismatches(const StartCheck& mine, const StartCheck& theirs);  // empty = equal
+
+// ARM_PROPOSE / ARM_ACCEPT / ARM_REJECT (Oct 17): how two machines agree to arm without either one waiting for the other's gate. `id` numbers
+// the proposer's proposals (answers name it); `frame` is the frame F to arm at; `at_frame` is the sender's own hook call when it sent the message
+// (the receiver can see how far apart the two are); `gate` is free text with the sender's gate inputs, for the log only.
+enum class ArmReason : u8
+{
+  NotReady = 1,     // the answerer's gate is not ready (its inputs are in `gate`); it proposes itself when it is
+  TooLate = 2,      // the answerer is already at or past F
+  NotLockstep = 3,  // the answerer is ARMED / draining (cannot happen between agreeing sessions, answered for completeness)
+  Crossed = 4,      // both proposed at once; the host's proposal wins
+  Busy = 5,         // the answerer has already agreed to another arm
+};
+const char* ArmReasonName(u8 reason);
+struct ArmPropose
+{
+  u32 id = 0;
+  s32 frame = 0;
+  s32 at_frame = 0;
+  std::string gate;
+};
+struct ArmAccept
+{
+  u32 id = 0;
+  s32 frame = 0;
+  s32 at_frame = 0;
+};
+struct ArmReject
+{
+  u32 id = 0;
+  s32 frame = 0;
+  s32 at_frame = 0;
+  u8 reason = 0;  // ArmReason
+  std::string gate;
+};
+std::vector<u8> SerializeArmPropose(const ArmPropose& m);
+bool ParseArmPropose(const std::vector<u8>& bytes, ArmPropose* out);
+std::vector<u8> SerializeArmAccept(const ArmAccept& m);
+bool ParseArmAccept(const std::vector<u8>& bytes, ArmAccept* out);
+std::vector<u8> SerializeArmReject(const ArmReject& m);
+bool ParseArmReject(const std::vector<u8>& bytes, ArmReject* out);
 
 // REV3_NET_RANGE_CRC=1 (testing): at each checksum frame both sides send the CRC of every snapshot range; a difference is logged (the
 // names of the memory ranges that differ) and never ends the session. It finds the whitelist range that is missing when the field
@@ -408,7 +470,11 @@ struct Config
   u32 wait_timeout_ms = 10000;        // lockstep / drain / ARMED waits for a peer that sends nothing
   u32 stall_disconnect_frames = 420;  // Slippi's number (EXI_DeviceSlippi.cpp:1396, 7 s): a stall (N - R > MAXR) that lasts this many frames (x 1/60 s)
                                       // ends the session, and so does this many CONSECUTIVE stalled calls whose waits add up to as many frame times
-  u32 start_check_timeout_ms = 10000; // waiting for the peer's START_CHECK at arm time (a timeout only refuses to arm)
+  s32 arm_margin_min = 12;            // ARM_PROPOSE: the least number of frames between the proposing call and the arm frame F (frames)
+  s32 arm_margin_cap = 150;           // ... and the most (frames); the margin is about one round trip + 2 * D + 6, and grows by arm_margin_step after a TooLate
+  s32 arm_margin_step = 16;           // frames added to the margin after the peer answered TooLate (reset when an arm happened)
+  s32 arm_retry_frames = 30;          // frames before this side proposes again after a rejection (doubles each time, up to arm_retry_cap_frames)
+  s32 arm_retry_cap_frames = 300;     // largest wait between two proposals (frames)
   bool range_crc = false;             // REV3_NET_RANGE_CRC=1: exchange the CRCs of the snapshot ranges at every checksum frame (testing only)
   PaceConfig pace;                    // M5: pacing (REV3_NET_PACE and friends)
   bool maxr_adapt = false;            // M5, REV3_NET_MAXR_ADAPT=1: the stall rule uses MAXR_eff <= max_rollback, lowered when resimulation gets slow
@@ -436,6 +502,7 @@ struct Gate
   bool hardware_hold = false;   // ARMED: the hardware has been busy for several calls in a row: predict nothing while it lasts
   bool layout_pending = false;  // ARMED: the snapshot set would change (learned pages / a hardware cut): re-install it at a drain
   const char* why = "";         // logged with GATE open
+  const char* detail = "";      // the gate inputs in words (found / quiet streaks, learning, set, write tracking): logged with ARM proposals and rejections
 };
 
 struct SessionStats
@@ -465,7 +532,14 @@ struct SessionStats
   u32 checks_bad = 0;
   u32 gate_opens = 0;
   u32 gate_closes = 0;
-  u32 arm_refused = 0;
+  u32 arm_refused = 0;                // proposals of the peer this side answered with ARM_REJECT
+  u32 arm_proposed = 0;               // ARM_PROPOSE sent
+  u32 arm_rejected = 0;               // ... of which the peer rejected
+  u32 arm_accepted = 0;               // proposals of the peer this side answered with ARM_ACCEPT
+  u32 arm_cancelled = 0;              // agreed frames cancelled alike on both sides (no fighters / a fighter at health 0 at F)
+  u32 arm_waits = 0;                  // times the proposer had to wait at call F for the answer (the only wait of the arm agreement)
+  u64 arm_wait_us_total = 0;
+  u64 arm_wait_us_max = 0;
   // M5 pacing (checks = decisions taken; the offset sums are microseconds, positive = ahead)
   u32 pace_checks = 0;
   u32 pace_slowdowns = 0;             // checks that asked for a delay
@@ -544,7 +618,7 @@ public:
   bool Step(const Command& command, const Gate& gate, Reply* reply);
   bool BlockSatisfied();    // pumps the transport and messages; true when Step() may be retried
   u32 BlockTimeoutMs() const;
-  void BlockTimedOut();     // logs, and leaves the session (or, for the START_CHECK wait, refuses to arm)
+  void BlockTimedOut();     // logs, and leaves the session
 
   // Writes SUMMARY (once; also written when the session is left).
   void Finish();
@@ -557,6 +631,7 @@ public:
   bool Resimulating() const { return m_resim; }  // the game is re-running frames after a RESTORED reply (v1 hiding: throttle off + mute)
   const SessionStats& stats() const { return m_stats; }
   int delay() const { return m_delay; }
+  const std::string& leave_reason() const { return m_leave_reason; }  // the reason of the LEAVE line; empty while the session is on
   s32 verified_frame() const { return m_verified; }  // ARMED: every remote input <= this is confirmed and was played as it was confirmed
 
   // Called for every frame that becomes final while ARMED (all inputs below it verified): (frame, Rev3Checksum of its start state).
@@ -578,7 +653,7 @@ private:
     Stall,
     DrainA,       // R >= N - 1
     DrainB,       // R >= N
-    StartCheck,
+    ArmAnswer,    // the proposer is at the arm frame F and the peer's answer to its ARM_PROPOSE is not here yet
   };
 
   struct Used  // what the game was given for a frame, and its start-state checksum
@@ -632,7 +707,28 @@ private:
   bool FinishRelayout(const Command& command, const Gate& gate, Reply* reply);
   bool EndCall(s32 frame, const Reply& reply, Reply* out);
   bool Blocked(Block block);
-  int TryArm(const Gate& gate);  // 0 = waiting, 1 = armed, 2 = refused
+  // ---- the arm agreement (see THE GATE RULE, OPEN)
+  enum class ArmOutcome : u8
+  {
+    Lockstep,  // carry on in LOCKSTEP
+    Wait,      // blocked on the peer's answer (Block::ArmAnswer)
+    Armed,     // the mode is ARMED now: run the call as an ARMED one
+    Left,      // the session was left in this call
+  };
+  ArmOutcome StepArm(const Gate& gate);
+  ArmOutcome DoArm(const Gate& gate);
+  void SendPropose();
+  void ProcessArmMessages();
+  void OnArmPropose(const ArmPropose& m);
+  void OnArmAccept(const ArmAccept& m);
+  void OnArmReject(const ArmReject& m);
+  void SendArmReject(const ArmPropose& m, ArmReason reason);
+  void CancelArm(const char* why);
+  void CompareStart();
+  s32 ArmMargin() const;
+  s32 CurrentFrame() const;  // the frame of the call in progress, else the next call's
+  std::string DescribeGate(const Gate& gate) const;
+  void ArmLine(const std::string& text);  // a rate limited ARM line (refusals repeat while a gate stays unready)
   void StartLockstep();
   void EnterDrain(s32 frame, const std::string& why, bool relayout);
   void ScheduleClose(s32 final_frame, u8 lost);
@@ -700,10 +796,34 @@ private:
   bool m_peer_hello_ok = false;
 
   // arm
-  bool m_arm_blocked = false;      // refused (or timed out) at this gate opening; cleared when the gate closes
-  s32 m_arm_sent_frame = -1;       // the frame our START_CHECK was sent for
+  enum class ArmPhase : u8
+  {
+    None,     // no proposal alive
+    Pending,  // our ARM_PROPOSE is out, no answer yet
+    Agreed,   // the peer accepted ours, or we accepted the peer's: both arm at `frame` (call F)
+  };
+  struct ArmState
+  {
+    ArmPhase phase = ArmPhase::None;
+    bool own = false;  // we proposed it
+    u32 id = 0;
+    s32 frame = -1;    // F
+  };
+  ArmState m_arm;
+  bool m_gate_ready = false;       // the gate of the latest LOCKSTEP call was open, with fighters and nobody at health 0: a proposal that arrives now is accepted
+  std::string m_gate_text;         // DescribeGate() of that gate: what a proposal or a rejection says about this side (kept: a wait has no gate)
+  std::deque<Message> m_arm_in;    // ARM_* messages not yet looked at (answered in the lockstep step or in a wait)
+  u32 m_arm_next_id = 1;
+  s32 m_arm_retry_at = 0;          // no own proposal before this call (a rejection backs off)
+  s32 m_arm_retry_gap = 0;         // the gap used after the latest rejection (doubles)
+  s32 m_arm_margin_extra = 0;      // added to the margin after a TooLate
+  u32 m_arm_log_lines = 0;         // ARM refusal lines written (rate limit)
+  u32 m_arm_log_left_out = 0;
+  u64 m_arm_wait_start_us = 0;     // Now() when the proposer began to wait for the answer (0 = not waiting)
+  bool m_start_pending = false;    // our START_CHECK for m_armed_frame is out and the peer's has not been compared yet
   StartCheck m_arm_mine;
   std::map<s32, StartCheck> m_peer_start;
+  std::string m_leave_reason;      // why the session left (empty while it has not)
   s32 m_armed_frame = -1;
   s32 m_verified = -1;
   s32 m_finalized = -1;            // highest frame already handed to the observer / check bookkeeping

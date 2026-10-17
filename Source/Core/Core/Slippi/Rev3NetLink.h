@@ -254,6 +254,9 @@ public:
   // The session left the armed stretch (drained into lockstep): the gate is shut until it opens again through Update().
   void Close();
   bool open() const { return m_open; }
+  // The inputs and the tracker's own streaks in words, for the log lines of a refused / pending ARM proposal (Oct 17: D's soak run_2 / run_6 showed
+  // one gate ready and the other not, with no way to tell which input held it). `write_track` is the SyncTest's text (NetWriteTrackText).
+  std::string Describe(const GateInputs& in, const char* write_track) const;
 
 private:
   GateConfig m_cfg;

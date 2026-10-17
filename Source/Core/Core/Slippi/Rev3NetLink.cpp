@@ -218,7 +218,7 @@ std::vector<u8> EncodeReliable(MsgType type, u32 sequence, const std::vector<u8>
 
 bool DecodeReliable(const u8* data, size_t size, MsgType* type, u32* sequence, std::vector<u8>* payload)
 {
-  if (size < RELIABLE_HEADER_BYTES || data[0] < static_cast<u8>(MsgType::Hello) || data[0] > static_cast<u8>(MsgType::RangeCrc))
+  if (size < RELIABLE_HEADER_BYTES || data[0] < static_cast<u8>(MsgType::Hello) || data[0] > static_cast<u8>(MsgType::ArmReject))  // 0x90..0x97 (ARM_* 0x95..0x97 added Oct 17)
     return false;
   *type = static_cast<MsgType>(data[0]);
   *sequence = GetU32(data + 1);
@@ -464,6 +464,15 @@ void GateTracker::Close()
   m_busy_streak = 0;
   m_release_streak = 0;
   m_holding = false;
+}
+
+std::string GateTracker::Describe(const GateInputs& in, const char* write_track) const
+{
+  return Fmt("fighters_found=%d (streak %u/%u) hardware_quiet=%d (streak %u/%u) health_zero=%d learning_done=%d layout_pending=%d open=%d prepared=%d%s "
+             "write_track=%s",
+             in.fighters_found ? 1 : 0, m_found_streak, m_cfg.arm_calls, in.hardware_busy ? 0 : 1, m_quiet_streak, m_cfg.quiet_calls,
+             in.health_zero ? 1 : 0, in.learning_done ? 1 : 0, in.set_pending ? 1 : 0, m_open ? 1 : 0, m_prepared ? 1 : 0,
+             m_prepare_failed ? " prepare_failed" : "", write_track != nullptr ? write_track : "?");
 }
 
 GateDecision GateTracker::UpdateArmed(const GateInputs& in)

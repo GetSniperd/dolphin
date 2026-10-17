@@ -476,6 +476,20 @@ void ExitController::Decide(u32 frame, const std::string& reason)
     m_log(Fmt("EXIT planned reason=\"%s\" frame=%u ko=%u stop_in_calls=%u", reason.c_str(), frame, m_ko, m_tuning.wait_calls));
 }
 
+bool ExitController::NoteLeave(u32 frame, const std::string& why)
+{
+  if (!m_spec.enabled || m_decided || m_stop_sent)
+    return false;
+  m_decided = true;
+  m_left = true;
+  m_decide_call = m_calls;
+  m_reason = "net session left: " + why;
+  if (m_log)
+    m_log(Fmt("EXIT unplanned leave reason=\"%s\" frame=%u ko=%u stop_in_calls=%u (exit code %d)", why.c_str(), frame, m_ko, m_tuning.wait_calls,
+              EXIT_CODE_LEFT));
+  return true;
+}
+
 ExitStep ExitController::OnCall(u32 frame, const GameObs& obs)
 {
   ExitStep step;
@@ -544,9 +558,15 @@ ExitStep ExitController::OnCall(u32 frame, const GameObs& obs)
   {
     m_stop_sent = true;
     step.stop = true;
+    step.left = m_left;
     step.reason = m_reason;
   }
   return step;
+}
+
+bool IsPlannedLeaveReason(const std::string& why)
+{
+  return why.rfind("the peer left (planned exit", 0) == 0 || why.rfind("the peer left (the emulator was closed", 0) == 0;
 }
 
 bool FreezeExitDue(u64 age_ms, bool seen, bool blocked, u32 stall_ms, u32 exit_s)

@@ -461,7 +461,7 @@ TEST(Rev3NetLink, ReliableEnvelopeRoundTrips)
   EXPECT_EQ(type, MsgType::StartCheck);
   EXPECT_EQ(sequence, 0x01020304u);
   EXPECT_EQ(back, payload);
-  // An empty payload is fine; ids outside 0x90..0x94 and short buffers are not.
+  // An empty payload is fine; ids outside 0x90..0x97 and short buffers are not.
   const std::vector<u8> bye = EncodeReliable(MsgType::Bye, 9, {});
   EXPECT_TRUE(DecodeReliable(bye.data(), bye.size(), &type, &sequence, &back));
   EXPECT_TRUE(back.empty());
@@ -471,7 +471,13 @@ TEST(Rev3NetLink, ReliableEnvelopeRoundTrips)
   bad[0] = 0x94;  // RANGE_CRC (M4)
   EXPECT_TRUE(DecodeReliable(bad.data(), bad.size(), &type, &sequence, &back));
   EXPECT_EQ(type, MsgType::RangeCrc);
-  bad[0] = 0x95;
+  bad[0] = 0x95;  // ARM_PROPOSE (Oct 17)
+  EXPECT_TRUE(DecodeReliable(bad.data(), bad.size(), &type, &sequence, &back));
+  EXPECT_EQ(type, MsgType::ArmPropose);
+  bad[0] = 0x97;  // ARM_REJECT
+  EXPECT_TRUE(DecodeReliable(bad.data(), bad.size(), &type, &sequence, &back));
+  EXPECT_EQ(type, MsgType::ArmReject);
+  bad[0] = 0x98;
   EXPECT_FALSE(DecodeReliable(bad.data(), bad.size(), &type, &sequence, &back));
   EXPECT_FALSE(DecodeReliable(wire.data(), RELIABLE_HEADER_BYTES - 1, &type, &sequence, &back));
 }
@@ -1010,6 +1016,24 @@ TEST(Rev3NetLink, AnUnusableSnapshotSetKeepsTheGateShutUntilTheFightersAreLostAn
   t.Update(GateInputs(), nullptr);  // fighters lost
   EXPECT_TRUE(t.Update(Good(), [&] { ++prepared; return true; }).open);
   EXPECT_EQ(prepared, 2);
+}
+
+TEST(Rev3NetLink, DescribeNamesEveryGateInputForTheArmLogLines)
+{
+  GateTracker t(Cfg(3, 5));
+  GateInputs busy = Good();
+  busy.hardware_busy = true;
+  t.Update(Good(), nullptr);
+  t.Update(busy, nullptr);
+  const std::string text = t.Describe(busy, "armed learned=2 deferred=0 restarts=0 misses=0");
+  EXPECT_NE(text.find("fighters_found=1 (streak 2/3)"), std::string::npos) << text;
+  EXPECT_NE(text.find("hardware_quiet=0 (streak 0/5)"), std::string::npos) << text;
+  EXPECT_NE(text.find("health_zero=0"), std::string::npos) << text;
+  EXPECT_NE(text.find("learning_done=1"), std::string::npos) << text;
+  EXPECT_NE(text.find("layout_pending=0"), std::string::npos) << text;
+  EXPECT_NE(text.find("open=0"), std::string::npos) << text;
+  EXPECT_NE(text.find("write_track=armed learned=2"), std::string::npos) << text;
+  EXPECT_NE(t.Describe(GateInputs(), nullptr).find("write_track=?"), std::string::npos);
 }
 
 TEST(Rev3NetLink, RoleText)
