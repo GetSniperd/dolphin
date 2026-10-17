@@ -89,6 +89,8 @@ constexpr u32 MAX_LEARN_LOGS = 10;                // "NOTE learned" lines writte
 constexpr u32 LEARN_LOG_EVERY = 300;
 constexpr u32 MAX_IO_POSTPONE_LOGS = 5;           // "NOTE rollback postponed" lines (the count continues in SUMMARY)
 constexpr u32 MAX_EXCLUSION_LINES = 64;           // "NOTE exclude" lines (buffers that alternate would otherwise flood the log)
+constexpr u32 ALARM_BAD_LOGS = 12;                // ALARMCHECK bad lines written in full (each with the queue); later failures are only counted
+constexpr u32 ALARM_OK_LOGS = 1;                  // ALARMCHECK ok lines in all (one, at the first capture): a log that shows the check ran
 
 constexpr u32 MAX_DETAILED_MISMATCH_FRAMES = 20;  // full field / range detail for this many mismatching frames, then counts only
 constexpr u32 MAX_LOGGED_ERRORS = 50;             // error lines (sp mismatch, capture failure ...) before they go silent
@@ -1812,17 +1814,26 @@ bool SyncTest::Capture(Slot& slot, const Command& command, const std::array<u32,
   {
     const bool hw = m_hardware != nullptr && m_hardware->DiscReadInFlight();
     const bool game = GameDvdBusy();
-    slot.io_dirty = hw || game;
+    // IOS IPC events (CoreTiming IPCEvent / IPCInterrupt / FinishDICommand) still on their way: a reply that lands after a restore of this
+    // slot. Counted always (ipc_slots); a rollback target only with options.ios_gate (REV3_RB_IOS_GATE).
+    std::string ipc_text;
+    const u32 ipc = IosPending(&ipc_text);
+    if (ipc != 0)
+      ++m_stats.ipc_slots;
+    const bool ios = ipc != 0 && m_options.ios_gate;
+    slot.io_dirty = hw || game || ios;
     if (slot.io_dirty)
     {
       ++m_stats.io_dirty_slots;
       m_stats.io_dirty_hw += hw ? 1 : 0;
       m_stats.io_dirty_game += game ? 1 : 0;
       if (m_stats.io_dirty_slots <= MAX_IO_POSTPONE_LOGS)
-        m_sink.Line(Format("NOTE slot of frame %u captured with a disc read in flight (hardware=%d game_dvd=%d): not a rollback target", command.frame, hw ? 1 : 0,
-                           game ? 1 : 0));
+        m_sink.Line(Format("NOTE slot of frame %u captured with a disc read in flight (hardware=%d game_dvd=%d): not a rollback target%s", command.frame, hw ? 1 : 0,
+                           game ? 1 : 0, ios ? Format(" ios_events=%s", ipc_text.c_str()).c_str() : ""));
     }
   }
+  // The OS alarm queue at this moment (the live state, rolled back or not): the first bad frame places the damage between two captures.
+  AlarmWatch(command.frame);
   // Restore verify: a full copy of guest memory at this very moment, for the frames a restore may land on (a failed copy is logged by the
   // verifier and only means this frame is not verified).
   if (m_verify != nullptr && m_verify->WantsShadow(command.frame))
@@ -1978,6 +1989,20 @@ bool SyncTest::Restore(const Slot& s, const Command& command, u32 to)
   if (dump_hw)
     m_sink.Line(m_dump->RestoreHwLine(command.frame, to, false));
 
+  // IOS replies still on their way across this restore (the hypothesis for a double-queued alarm; see REV3.md "Alarm queue").
+  m_alarm_restore_from = command.frame;
+  m_alarm_restore_to = to;
+  m_alarm_restore_ipc.clear();
+  if (IosPending(&m_alarm_restore_ipc) != 0)
+  {
+    ++m_stats.ipc_restores;
+    if (m_stats.ipc_restores <= MAX_IO_POSTPONE_LOGS)
+      m_sink.Line(Format("NOTE restore %u -> %u with IOS events pending: %s (%u so far)", command.frame, to, m_alarm_restore_ipc.c_str(),
+                         m_stats.ipc_restores));
+  }
+  // The alarm queue as the game left it, just before the write-back.
+  AlarmCheck("before", command.frame, to);
+
   // The ef lists as the game left them, just before they are overwritten (the first options.ef_check_restores restores).
   EfCheck("before", command.frame, to);
 
@@ -2030,6 +2055,8 @@ bool SyncTest::Restore(const Slot& s, const Command& command, u32 to)
 
   // The ef lists after the write-back: the same checker, this time on the rewound state (the one the game resumes from).
   EfCheck("after", command.frame, to);
+  // The alarm queue after the write-back (and the time base / audio restore): the state the game resumes from.
+  AlarmCheck("after", command.frame, to);
   m_last_restore_call = m_armed_calls;
   VerifyAfterRestore(s, command, to);  // after the timings above: the comparison is not part of the restore cost
 
@@ -2191,7 +2218,99 @@ bool SyncTest::GameDvdBusy() const
 
 bool SyncTest::DiscBusy()
 {
-  return (m_hardware != nullptr && m_hardware->DiscReadInFlight()) || GameDvdBusy();
+  return (m_hardware != nullptr && m_hardware->DiscReadInFlight()) || GameDvdBusy() || (m_options.ios_gate && IosPending(nullptr) != 0);
+}
+
+u32 SyncTest::IosPending(std::string* what) const
+{
+  if (m_hardware == nullptr)
+    return 0;
+  return m_hardware->IosEventsPending(what);
+}
+
+// ---- the alarm queue watch ---------------------------------------------------------------------------------------------------------
+// Rev3: the SDK's OSAlarm queue is one doubly linked list (head 0x8049DA38, tail 0x8049DA3C); a cycle makes InsertAlarm spin for ever with
+// interrupts off (soak 20261016_233913 run 7). AlarmWatch looks at the live state at each capture, AlarmCheck around each restore, so the
+// log says WHEN the queue went bad: in the first run (capture bad), between the last good capture and a restore (before bad, with
+// last_ok_frame), or by the restore itself (before ok, after bad: the write-back, TB / DEC left alone, or IOS replies that crossed it).
+void SyncTest::AlarmWatch(u32 frame)
+{
+  if (m_options.alarm_check == 0)
+    return;
+  const AlarmQueueReport r = ReadAlarmQueue(m_memory);
+  ++m_stats.alarm_checks;
+  if (r.Ok())
+  {
+    if (m_alarm_was_bad)
+      m_sink.Line(Format("ALARMCHECK ok again at capture of frame %u (was bad since after frame %u)", frame, m_alarm_last_ok_frame));
+    m_alarm_was_bad = false;
+    m_alarm_last_ok_frame = frame;
+    if (m_alarm_ok_logs < ALARM_OK_LOGS)
+      AlarmLog(Format("ok capture frame %u", frame).c_str(), r);
+    return;
+  }
+  ++m_stats.alarm_bad_captures;
+  if (!m_alarm_was_bad)
+  {
+    // Only the transition is logged (a cyclic queue stays cyclic): the frame, the last good frame, the latest restore and its IOS events.
+    AlarmLog(Format("bad capture frame %u last_ok_frame=%u last_restore=%u->%u ios=[%s]", frame, m_alarm_last_ok_frame, m_alarm_restore_from,
+                    m_alarm_restore_to, m_alarm_restore_ipc.c_str())
+                 .c_str(),
+             r);
+  }
+  m_alarm_was_bad = true;
+}
+
+void SyncTest::AlarmCheck(const char* when, u32 from, u32 to)
+{
+  if (m_options.alarm_check == 0)
+    return;
+  const bool after = std::strcmp(when, "after") == 0;
+  const AlarmQueueReport r = ReadAlarmQueue(m_memory);
+  ++m_stats.alarm_checks;
+  if (r.Ok())
+    return;  // no log line: the line after "RESTOREHW .. after" must stay the RESTORE result line; the count is in SUMMARY alarm_checks
+  if (after)
+    ++m_stats.alarm_bad_after;
+  else
+    ++m_stats.alarm_bad_before;
+  AlarmLog(Format("bad %s restore %u -> %u last_ok_frame=%u ios=[%s]", when, from, to, m_alarm_last_ok_frame, m_alarm_restore_ipc.c_str()).c_str(), r);
+}
+
+// One header line `ALARMCHECK <what> status=<Status()>` and, for a bad queue, the `alarmq` lines of the walk (as a freeze dump prints them).
+// Bad results: the first ALARM_BAD_LOGS are written, then one line says the rest is only counted. Good results: ALARM_OK_LOGS lines.
+void SyncTest::AlarmLog(const char* what, const AlarmQueueReport& r)
+{
+  if (r.Ok())
+  {
+    ++m_alarm_ok_logs;
+    m_sink.Line(Format("ALARMCHECK %s status=%s n=%zu", what, r.Status().c_str(), r.nodes.size()));
+    return;
+  }
+  ++m_alarm_bad_logs;
+  if (m_alarm_bad_logs > ALARM_BAD_LOGS)
+  {
+    if (m_alarm_bad_logs == ALARM_BAD_LOGS + 1)
+      m_sink.Line("ALARMCHECK further failures are only counted (SUMMARY alarm_bad_captures / alarm_bad_before / alarm_bad_after)");
+    return;
+  }
+  m_sink.Line(Format("ALARMCHECK %s status=%s", what, r.Status().c_str()));
+  std::optional<s64> now;
+  u64 tb = 0;
+  if (m_memory.ReadTimeBase(&tb))
+    now = AlarmSystemTime(m_memory, tb);
+  u32 tps = 0;
+  u8 bus[4];
+  if (m_memory.Read(OS_BUS_CLOCK, bus, sizeof(bus)))
+    tps = ReadBE32(bus) / 4;
+  for (const std::string& line : AlarmQueueLines(r, now, tps, {}))
+    m_sink.Line("ALARMCHECK " + line);
+}
+
+std::string SyncTest::AlarmStatsFields() const
+{
+  return Format(" alarm_checks=%u alarm_bad_captures=%u alarm_bad_before=%u alarm_bad_after=%u ipc_slots=%u ipc_restores=%u", m_stats.alarm_checks,
+                m_stats.alarm_bad_captures, m_stats.alarm_bad_before, m_stats.alarm_bad_after, m_stats.ipc_slots, m_stats.ipc_restores);
 }
 
 bool SyncTest::NetClean(u32 frame) const
@@ -2447,7 +2566,7 @@ void SyncTest::SummaryLine(const char* tag)
                      m_stats.audio_restores != 0 ? static_cast<double>(m_stats.audio_us_total) / m_stats.audio_restores : 0.0,
                      static_cast<unsigned long long>(m_stats.audio_us_max), m_stats.ef_checks, m_stats.ef_bad, m_stats.ef_bad_before,
                      m_stats.layout_refused, m_stats.late_learn_rollbacks) +
-              IoStatsFields() + VerifyStatsFields() + HashCheckStatsFields() +
+              IoStatsFields() + AlarmStatsFields() + VerifyStatsFields() + HashCheckStatsFields() +
               (m_hide != nullptr ? m_hide->SummaryFields() : std::string()));
   m_sink.Line(SnapshotLine());
 }
@@ -3816,13 +3935,13 @@ std::string SyncTest::NetStatsLine() const
                 m_stats.sp_mismatches, static_cast<unsigned long long>(m_stats.scans), mean(m_stats.scan_us_total, m_stats.scans),
                 static_cast<unsigned long long>(m_stats.scan_us_max), m_stats.ef_checks, m_stats.ef_bad, m_stats.ef_bad_before,
                 m_stats.layout_refused, m_stats.late_learn_rollbacks) +
-         IoStatsFields() + VerifyStatsFields() + HashCheckStatsFields() + WriteTrackFields();
+         IoStatsFields() + AlarmStatsFields() + VerifyStatsFields() + HashCheckStatsFields() + WriteTrackFields();
 }
 
 std::string SyncTest::NetSummaryNote()
 {
   LearnedSummaryLine();  // only when the learned pages changed since the last such line
-  std::string text = IoStatsFields() + VerifyStatsFields() + HashCheckStatsFields() + WriteTrackFields();
+  std::string text = IoStatsFields() + AlarmStatsFields() + VerifyStatsFields() + HashCheckStatsFields() + WriteTrackFields();
   if (m_verify != nullptr)
     text += Format(" verify_pages_added=%u", m_stats.verify_pages_added);
   if (m_hide_counters != nullptr)
@@ -4779,6 +4898,347 @@ size_t WalkBackChain(const GuestMemory& memory, u32 sp, size_t max_frames, std::
   return out->size();
 }
 
+// ---- the OS alarm queue (see Rev3Rollback.h "THE ALARM QUEUE") ------------------------------------------------------------------
+
+namespace
+{
+constexpr u32 ALARM_BYTES = 0x2C;              // OSAlarm: handler .. userData
+constexpr size_t ALARM_PROBLEMS_PER_KIND = 3;  // problems of one kind named in a report (a cycle makes every later node "wrong")
+
+struct KnownAddress
+{
+  u32 address;
+  const char* name;
+};
+// Alarm objects that are statics in this build (decomp: the first argument of OSSetAlarm / OSSetPeriodicAlarm / OSCreateAlarm).
+constexpr KnownAddress ALARM_OBJECTS[] = {
+    {0x80465320, "playrecord"},      // OSPlayRecord: 1 s retry or 60 s write timer of the play record (NAND)
+    {0x804654C0, "playtime"},        // OSPlayTime: trial time limit
+    {0x8040BBA0, "wpad"},            // WPAD manage timer, periodic
+    {0x8040FA90, "wud"},             // WUD state machine timer, periodic
+    {0x804531A0, "bte"},             // Bluetooth stack tick, periodic
+    {0x80460550, "dvd_fatal"},       // dvd FatalAlarmHandler
+    {0x80460580, "dvd_cover"},       // dvd CoverAlarmHandler, periodic
+    {0x80460620, "dvd_reset"},       // dvd ResetAlarmHandler
+    {0x80403870, "remote_speaker"},  // RemoteSpeakerManager singleton 0x80403868 + 8, periodic 405000 ticks (6.67 ms)
+};
+constexpr KnownAddress ALARM_HANDLERS[] = {
+    {0x8031D128, "SleepAlarmHandler"},  // OSSleepTicks: resumes the sleeping thread (userData)
+    {0x8031E258, "PlayRecordAlarmCallback"},
+    {0x8031F204, "__OSPlayTimeAlarmExpired"},
+    {0x802887F8, "WPADiManageHandler0"},
+    {0x80296790, "__wudInitHandler0"},
+    {0x802968C0, "__wudShutdownHandler0"},
+    {0x80295128, "__wudSyncHandler0"},
+    {0x80295A0C, "__wudStackHandler0"},
+    {0x8029578C, "__wudDeleteHandler0"},
+    {0x802A4AFC, "BTUInterruptHandler"},
+    {0x802D0B2C, "FatalAlarmHandler"},
+    {0x802D32B0, "CoverAlarmHandler"},
+    {0x802D289C, "ResetAlarmHandler"},
+    {0x8020FB2C, "RemoteSpeakerAlarmProc"},
+};
+
+u64 ReadBE64(const u8* p)
+{
+  return (static_cast<u64>(ReadBE32(p)) << 32) | ReadBE32(p + 4);
+}
+
+bool ReadAlarmNode(const GuestMemory& memory, u32 addr, AlarmNode* out)
+{
+  u8 raw[ALARM_BYTES];
+  if (!DumpPtrOk(addr) || !memory.Read(addr, raw, sizeof(raw)))
+    return false;
+  out->addr = addr;
+  out->handler = ReadBE32(raw + 0x00);
+  out->tag = ReadBE32(raw + 0x04);
+  out->fire = static_cast<s64>(ReadBE64(raw + 0x08));
+  out->prev = ReadBE32(raw + 0x10);
+  out->next = ReadBE32(raw + 0x14);
+  out->period = static_cast<s64>(ReadBE64(raw + 0x18));
+  out->start = static_cast<s64>(ReadBE64(raw + 0x20));
+  out->user = ReadBE32(raw + 0x28);
+  return true;
+}
+
+// Adds a problem unless ALARM_PROBLEMS_PER_KIND of the same kind (the text up to the first '(') are already there.
+void AddAlarmProblem(AlarmQueueReport* r, const std::string& text)
+{
+  const std::string kind = text.substr(0, text.find('('));
+  size_t same = 0;
+  for (const std::string& p : r->problems)
+  {
+    if (p.compare(0, kind.size(), kind) == 0 && (p.size() == kind.size() || p[kind.size()] == '('))
+      ++same;
+  }
+  if (same < ALARM_PROBLEMS_PER_KIND)
+    r->problems.push_back(text);
+}
+
+bool HasNode(const std::vector<AlarmNode>& nodes, u32 addr)
+{
+  for (const AlarmNode& n : nodes)
+  {
+    if (n.addr == addr)
+      return true;
+  }
+  return false;
+}
+}  // namespace
+
+const char* AlarmObjectName(u32 address)
+{
+  for (const KnownAddress& k : ALARM_OBJECTS)
+  {
+    if (k.address == address)
+      return k.name;
+  }
+  return nullptr;
+}
+
+const char* AlarmHandlerName(u32 address)
+{
+  for (const KnownAddress& k : ALARM_HANDLERS)
+  {
+    if (k.address == address)
+      return k.name;
+  }
+  return nullptr;
+}
+
+std::string AlarmQueueReport::Status() const
+{
+  if (!readable)
+    return "unreadable";
+  if (problems.empty())
+    return nodes.empty() ? "empty" : "ok";
+  std::string text;
+  for (const std::string& p : problems)
+    text += (text.empty() ? "" : ";") + p;
+  return text;
+}
+
+// The same walk as InsertAlarm (head, then each node's +0x14 next), with a repeat check. Forward: every node's prev must be the node before
+// it (InsertAlarm and the decrementer callback keep that), the fire times must not decrease (InsertAlarm inserts before the first node that
+// fires later), the last node must be the tail. Backward from the tail by +0x10 prev must end at the head; nodes only that chain finds
+// are the ones a double insertion lost from the forward list.
+AlarmQueueReport ReadAlarmQueue(const GuestMemory& memory)
+{
+  AlarmQueueReport r;
+  const std::optional<u32> head = Rd32(memory, ALARM_QUEUE_HEAD);
+  const std::optional<u32> tail = Rd32(memory, ALARM_QUEUE_TAIL);
+  if (!head || !tail)
+    return r;
+  r.readable = true;
+  r.head = *head;
+  r.tail = *tail;
+  if ((r.head == 0) != (r.tail == 0))
+    AddAlarmProblem(&r, Format("head_tail(head=0x%08X tail=0x%08X)", r.head, r.tail));
+
+  u32 cur = r.head;
+  u32 expected_prev = 0;
+  bool forward_clean_end = false;
+  while (true)
+  {
+    if (cur == 0)
+    {
+      forward_clean_end = true;
+      break;
+    }
+    if (r.nodes.size() >= ALARM_WALK_MAX)
+    {
+      AddAlarmProblem(&r, Format("too_long(%zu nodes)", r.nodes.size()));
+      break;
+    }
+    if (HasNode(r.nodes, cur))
+    {
+      size_t first = 0;
+      while (first < r.nodes.size() && r.nodes[first].addr != cur)
+        ++first;
+      AddAlarmProblem(&r, Format("cycle(0x%08X index %zu is index %zu)", cur, r.nodes.size(), first));
+      break;
+    }
+    AlarmNode n;
+    if (!ReadAlarmNode(memory, cur, &n))
+    {
+      AddAlarmProblem(&r, r.nodes.empty() ? Format("bad_pointer(0x%08X as the head)", cur) :
+                                         Format("bad_pointer(0x%08X after index %zu)", cur, r.nodes.size() - 1));
+      break;
+    }
+    n.prev_ok = n.prev == expected_prev;
+    if (!n.prev_ok)
+      AddAlarmProblem(&r, Format("prev_link(index %zu 0x%08X prev=0x%08X expected=0x%08X)", r.nodes.size(), cur, n.prev, expected_prev));
+    if (!r.nodes.empty())
+    {
+      n.order_ok = n.fire >= r.nodes.back().fire;
+      if (!n.order_ok)
+        AddAlarmProblem(&r, Format("order(index %zu 0x%08X fires before index %zu)", r.nodes.size(), cur, r.nodes.size() - 1));
+    }
+    expected_prev = cur;
+    cur = n.next;
+    r.nodes.push_back(n);
+  }
+  if (forward_clean_end && !r.nodes.empty() && r.nodes.back().addr != r.tail)
+    AddAlarmProblem(&r, Format("tail(0x%08X, the walk ends at 0x%08X)", r.tail, r.nodes.back().addr));
+
+  // Backward from the tail.
+  std::vector<AlarmNode> back;
+  u32 b = r.tail;
+  while (b != 0)
+  {
+    if (back.size() >= ALARM_WALK_MAX || HasNode(back, b))
+    {
+      AddAlarmProblem(&r, Format("backward_cycle(0x%08X)", b));
+      break;
+    }
+    AlarmNode n;
+    if (!ReadAlarmNode(memory, b, &n))
+    {
+      AddAlarmProblem(&r, Format("backward_bad_pointer(0x%08X)", b));
+      break;
+    }
+    back.push_back(n);
+    b = n.prev;
+  }
+  if (!back.empty() && b == 0 && back.back().addr != r.head)
+    AddAlarmProblem(&r, Format("backward_end(0x%08X is not the head)", back.back().addr));
+  for (const AlarmNode& n : back)
+  {
+    if (r.orphans.size() < 8 && !HasNode(r.nodes, n.addr))
+      r.orphans.push_back(n);
+  }
+  return r;
+}
+
+std::optional<s64> AlarmSystemTime(const GuestMemory& memory, u64 tb)
+{
+  u8 raw[8];
+  if (!memory.Read(OS_SYSTEM_TIME_BIAS, raw, sizeof(raw)))
+    return std::nullopt;
+  return static_cast<s64>(tb + ReadBE64(raw));
+}
+
+namespace
+{
+std::string AlarmNodeText(const AlarmNode& n, const std::optional<s64>& now, u32 tps, const std::vector<AlarmThreadStack>& stacks)
+{
+  std::string name;
+  if (const char* known = AlarmObjectName(n.addr))
+    name = Format(" name=%s", known);
+  for (const AlarmThreadStack& t : stacks)
+  {
+    if (n.addr >= t.stack_end && n.addr < t.stack_base)
+      name += Format(" on_stack_of=0x%08X", t.thread);
+  }
+  std::string handler = Format("0x%08X", n.handler);
+  if (const char* known = AlarmHandlerName(n.handler))
+    handler += Format("(%s)", known);
+  std::string due;
+  if (now && tps != 0)
+    due = Format(" due=%+.3fms", static_cast<double>(n.fire - *now) * 1000.0 / static_cast<double>(tps));
+  std::string period;
+  if (n.period != 0)
+  {
+    period = tps != 0 ? Format(" period=%lld(%.3fms)", static_cast<long long>(n.period),
+                               static_cast<double>(n.period) * 1000.0 / static_cast<double>(tps)) :
+                        Format(" period=%lld", static_cast<long long>(n.period));
+  }
+  std::string flags;
+  if (!n.prev_ok)
+    flags += " prev_bad";
+  if (!n.order_ok)
+    flags += " order_bad";
+  return Format("at=0x%08X%s handler=%s fire=0x%016llX%s%s prev=0x%08X next=0x%08X user=0x%08X tag=0x%08X%s", n.addr, name.c_str(),
+                handler.c_str(), static_cast<unsigned long long>(n.fire), due.c_str(), period.c_str(), n.prev, n.next, n.user, n.tag,
+                flags.c_str());
+}
+}  // namespace
+
+std::vector<std::string> AlarmQueueLines(const AlarmQueueReport& report, const std::optional<s64>& now, u32 ticks_per_second,
+                                         const std::vector<AlarmThreadStack>& thread_stacks)
+{
+  std::vector<std::string> out;
+  if (!report.readable)
+  {
+    out.push_back(Format("alarmq unreadable: head 0x%08X / tail 0x%08X are not in guest memory", ALARM_QUEUE_HEAD, ALARM_QUEUE_TAIL));
+    return out;
+  }
+  const std::string now_text = now ? Format("0x%016llX", static_cast<unsigned long long>(*now)) : std::string("?");
+  out.push_back(Format("alarmq head=0x%08X tail=0x%08X n=%zu orphans=%zu status=%s now=%s tps=%u", report.head, report.tail,
+                       report.nodes.size(), report.orphans.size(), report.Status().c_str(), now_text.c_str(), ticks_per_second));
+  for (size_t i = 0; i < report.nodes.size(); ++i)
+  {
+    if (i >= ALARM_LINES_MAX)
+    {
+      out.push_back(Format("alarmq ... %zu more nodes", report.nodes.size() - i));
+      break;
+    }
+    out.push_back(Format("alarmq[%zu] ", i) + AlarmNodeText(report.nodes[i], now, ticks_per_second, thread_stacks));
+  }
+  for (size_t i = 0; i < report.orphans.size(); ++i)
+    out.push_back(Format("alarmq orphan[%zu] ", i) + AlarmNodeText(report.orphans[i], now, ticks_per_second, thread_stacks));
+  return out;
+}
+
+namespace
+{
+// The active threads' stacks, for "this alarm sits on that thread's stack" (a sleeping thread's OSSleepTicks alarm lives in its frame).
+std::vector<AlarmThreadStack> AlarmThreadStacks(const GuestMemory& memory)
+{
+  std::vector<AlarmThreadStack> out;
+  u32 t = Rd32(memory, OS_ACTIVE_THREADS).value_or(0);
+  while (t != 0 && DumpPtrOk(t) && out.size() < DUMP_MAX_THREADS)
+  {
+    bool seen = false;
+    for (const AlarmThreadStack& known : out)
+      seen = seen || known.thread == t;
+    if (seen)
+      break;
+    AlarmThreadStack s;
+    s.thread = t;
+    s.stack_end = Rd32(memory, t + TH_STACK_END).value_or(0);
+    s.stack_base = Rd32(memory, t + TH_STACK_BASE).value_or(0);
+    out.push_back(s);
+    t = Rd32(memory, t + TH_ACTIVE_NEXT).value_or(0);
+  }
+  return out;
+}
+
+// The PlayRecord state machine's words (decomp PlayRecordCallback @ 0x8031E264): its alarm is the usual neighbour of a lost IOS reply.
+void AppendPlayRecord(std::vector<std::string>* out, const GuestMemory& memory)
+{
+  out->push_back(Format("playrecord state=%s retry=%s last_result=%s error=%s stop=%s", Signed(Rd32(memory, 0x8049C9A8)).c_str(),
+                        Hex32(Rd32(memory, 0x8049DB08)).c_str(), Signed(Rd32(memory, 0x8049DB0C)).c_str(),
+                        Hex32(Rd32(memory, 0x8049DAFC)).c_str(), Hex32(Rd32(memory, 0x8049DB00)).c_str()));
+}
+
+// `time ...` (the clocks) and the alarm queue of a freeze dump. Without a clock the alarm lines carry no relative times.
+void AppendAlarms(std::vector<std::string>* out, const GuestMemory& memory, const DumpClock& clock, bool clock_ok)
+{
+  u32 tps = 0;
+  if (const std::optional<u32> bus = Rd32(memory, OS_BUS_CLOCK); bus && *bus != 0)
+    tps = *bus / 4;
+  std::optional<s64> now;
+  if (clock_ok)
+  {
+    now = AlarmSystemTime(memory, clock.tb);
+    const std::string dec_event = !clock.dec_event_known ? std::string("dec_event=?") :
+                                  clock.dec_event      ? Format("dec_event=+%lld cycles", static_cast<long long>(clock.dec_event_cycles)) :
+                                                         std::string("dec_event=none");
+    out->push_back(Format("time tb=0x%016llX dec=0x%08X %s core_ticks=%llu", static_cast<unsigned long long>(clock.tb), clock.dec,
+                          dec_event.c_str(), static_cast<unsigned long long>(clock.core_ticks)));
+  }
+  else
+  {
+    out->push_back("time unavailable");
+  }
+  const AlarmQueueReport report = ReadAlarmQueue(memory);
+  for (std::string& line : AlarmQueueLines(report, now, tps, AlarmThreadStacks(memory)))
+    out->push_back(std::move(line));
+  AppendPlayRecord(out, memory);
+}
+}  // namespace
+
 FreezeDump::FreezeDump(const GuestMemory& memory, Sink& sink, DumpSource& source, u32 stall_ms, std::function<u64()> now_ms)
     : m_memory(memory), m_sink(sink), m_source(source), m_stall_ms(std::max<u32>(stall_ms, 1)), m_now_ms(std::move(now_ms))
 {
@@ -4796,6 +5256,11 @@ std::vector<std::string> FreezeDump::Lines(bool full, bool racy)
   AppendCpu(&out, m_memory, cpu, cpu_ok);
   AppendOs(&out, m_memory, cpu, cpu_ok);
   AppendQueues(&out, m_memory);
+  {
+    DumpClock clock;
+    const bool clock_ok = m_source.ReadClock(&clock, racy) && clock.valid;
+    AppendAlarms(&out, m_memory, clock, clock_ok);
+  }
   // The effect system's lists (a spinning ParticleManager::Calc is a list that never ends): `ef ...` lines, read only.
   for (std::string& line : EfDumpLines(m_memory))
     out.push_back(std::move(line));
@@ -5373,7 +5838,46 @@ public:
     return false;
   }
 
+  // Wii IOS requests and replies on their way: CoreTiming events IPCEvent (EmulationKernel::EnqueueIPCReply / EnqueueIPCRequest: IOS writes
+  // the reply into guest memory at once and the event hands it to the PPC), IPCInterrupt (the IPC interrupt to the PPC) and FinishDICommand.
+  // CPU thread only (GetPendingEvents). *what = "IPCEvent+123,IPCInterrupt+40" (remaining CPU cycles).
+  u32 IosEventsPending(std::string* what) override
+  {
+    if (!m_system.IsWii())
+      return 0;
+    auto& core_timing = m_system.GetCoreTiming();
+    if (!m_ios_types_looked_up)
+    {
+      for (const char* name : IOS_EVENT_TYPES)
+      {
+        if (CoreTiming::EventType* type = core_timing.FindEventType(name); type != nullptr)
+          m_ios_types.push_back(type);
+      }
+      m_ios_types_looked_up = !m_ios_types.empty();
+    }
+    if (m_ios_types.empty())
+      return 0;
+    const s64 now = static_cast<s64>(core_timing.GetTicks());
+    u32 count = 0;
+    std::string list;
+    for (const CoreTiming::Event& event : core_timing.GetPendingEvents())
+    {
+      if (event.type == nullptr || std::find(m_ios_types.begin(), m_ios_types.end(), event.type) == m_ios_types.end())
+        continue;
+      ++count;
+      if (what != nullptr && count <= 8)
+        list += Format("%s%s+%lld", list.empty() ? "" : ",", event.type->name->c_str(), static_cast<long long>(std::max<s64>(event.time - now, 0)));
+    }
+    if (what != nullptr)
+      *what = list;
+    return count;
+  }
+
 private:
+  static constexpr const char* IOS_EVENT_TYPES[] = {"IPCEvent", "IPCInterrupt", "FinishDICommand"};
+  std::vector<CoreTiming::EventType*> m_ios_types;
+  bool m_ios_types_looked_up = false;
+
   void QueryDvd(std::vector<Exclusion>* out, MMIO::Mapping* mmio, u32 base, const char* what)
   {
     const u32 address = mmio->Read<u32>(m_system, base + 0x14);
@@ -5607,6 +6111,37 @@ public:
     return true;
   }
 
+  // The clocks the OS alarm module depends on. Rev3: the game's OSGetTime is the fake time base; the alarm module programs the decrementer
+  // (mtdec) for the earliest alarm and Dolphin keeps it as the CoreTiming event "DecCallback" plus FakeDecStartValue / Ticks. A restore leaves
+  // both alone unless REV3_SYNCTEST_TB=1 (time base only); this line is what to compare with the `alarmq` fire times.
+  bool ReadClock(DumpClock* out, bool racy) override
+  {
+    auto& timers = m_system.GetSystemTimers();
+    auto& core_timing = m_system.GetCoreTiming();
+    out->tb = timers.GetFakeTimeBase();
+    out->dec = timers.GetFakeDecrementer();
+    out->core_ticks = core_timing.GetTicks();
+    if (!racy)
+    {
+      out->dec_event_known = true;
+      if (CoreTiming::EventType* type = core_timing.FindEventType("DecCallback"); type != nullptr)
+      {
+        const s64 now = static_cast<s64>(out->core_ticks);
+        for (const CoreTiming::Event& event : core_timing.GetPendingEvents())
+        {
+          if (event.type == type)
+          {
+            out->dec_event = true;
+            out->dec_event_cycles = event.time - now;
+            break;
+          }
+        }
+      }
+    }
+    out->valid = true;
+    return true;
+  }
+
   bool ReadHw(DumpHw* out) override
   {
     if (MMIO::Mapping* mmio = m_system.GetMemory().GetMMIOMapping(); mmio != nullptr)
@@ -5652,6 +6187,26 @@ public:
   void ExtraLines(std::vector<std::string>* out, bool racy) override
   {
     MMIO::Mapping* mmio = m_system.GetMemory().GetMMIOMapping();
+    if (!racy)
+    {
+      // Every pending CoreTiming event by type (count and the soonest in CPU cycles): what is still on its way (IPC replies, VI, audio).
+      auto& core_timing = m_system.GetCoreTiming();
+      const s64 now = static_cast<s64>(core_timing.GetTicks());
+      std::vector<std::pair<std::string, std::pair<u32, s64>>> by_type;
+      for (const CoreTiming::Event& event : core_timing.GetPendingEvents())
+      {
+        const std::string name = event.type != nullptr && event.type->name != nullptr ? *event.type->name : std::string("?");
+        auto it = std::find_if(by_type.begin(), by_type.end(), [&](const auto& e) { return e.first == name; });
+        if (it == by_type.end())
+          by_type.push_back({name, {1, event.time - now}});
+        else
+          ++it->second.first;  // events are in firing order: the first one seen is the soonest
+      }
+      std::string list;
+      for (const auto& e : by_type)
+        list += Format("%s%s x%u +%lld", list.empty() ? "" : ", ", e.first.c_str(), e.second.first, static_cast<long long>(e.second.second));
+      out->push_back(Format("ct events %zu types [%s]", by_type.size(), list.c_str()));
+    }
     std::string ios = "n/a";
     if (m_system.IsWii())
     {
@@ -6351,12 +6906,22 @@ bool BuildSyncTest(Module& module, Core::System& system, long k, bool net)
     else
       ERROR_LOG_FMT(SLIPPI, "Rev3 SyncTest: ignoring REV3_EFCHECK={} (a number, 0 or all)", efcheck);
   }
+  // REV3_ALARMCHECK: 1 (default) = the OS alarm queue is walked at every capture and around every restore, 0 = off.
+  const std::string alarmcheck = GetEnv("REV3_ALARMCHECK");
+  if (alarmcheck == "0" || alarmcheck == "1")
+    options.alarm_check = alarmcheck == "1" ? 1 : 0;
+  else if (!alarmcheck.empty())
+    ERROR_LOG_FMT(SLIPPI, "Rev3 SyncTest: ignoring REV3_ALARMCHECK={} (0 or 1)", alarmcheck);
+  // REV3_RB_IOS_GATE=1: a pending IOS IPC event counts like a disc read in flight (default 0: counted only).
+  options.ios_gate = GetEnv("REV3_RB_IOS_GATE") == "1";
   const bool hardware_exclude = GetEnv("REV3_SYNCTEST_HW_EXCLUDE") != "0";
 
   std::string log_path;
   EnsureSink(module, &log_path);
   // A netplay run writes everything (NOTE lines, ERROR lines, RESTORE lines) to the net log, the one file tools/rollback/phase4.py reads.
   Sink& sink = (net && module.net_sink != nullptr) ? static_cast<Sink&>(*module.net_sink) : static_cast<Sink&>(*module.sink);
+  sink.Line(Format("NOTE alarm queue watch %s, IOS gate %s (REV3_ALARMCHECK / REV3_RB_IOS_GATE)", options.alarm_check != 0 ? "on" : "off",
+                   options.ios_gate ? "on" : "off"));
   if (net)
   {
     options.restore_log_full = Net::LOG_FULL_LINES;

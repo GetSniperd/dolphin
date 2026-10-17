@@ -79,6 +79,8 @@ Run (set the variables before starting Slippi_Dolphin.exe; the patched game with
 | `REV3_SNAPSHOT_INCLUDE=path` | optional JSON, the very entry formats of `REV3_SYNCTEST_EXCLUDE` (`{"start","end"}` ranges, `{"ptr","size","note"}` pointer entries): these regions are forced INTO the snapshot set at every arm, on top of the learned pages (and of the ef pool). Logged `NOTE include user 0x..-0x.. (n bytes ...)`, `NOTE include ptr entry ..` at start and `NOTE include ptr 0x.. -> 0xS-0xE (n bytes) note=..` / `NOTE include ptr 0x.. skipped: pointer is 0 \| outside MEM1 / MEM2` at arm, then `NOTE forced include: ranges=.. bytes=..; the snapshot set grows by n bytes`. The cuts (hook region, `REV3_SYNCTEST_EXCLUDE`, hardware regions) still win. A bad file turns SyncTest off with an error (like the exclude file). Use it to test a suspicion without rebuilding |
 | `REV3_SNAPSHOT_PAD=n` | 0..16, default 0 = off. Every page the tracker learns also pulls n neighbouring 4 KB pages on each side into the snapshot set (clipped to MEM1 / MEM2, cuts still win; `NOTE learn pad pages=n ..` at start). Costs snapshot bytes (up to 2n pages per learned run), saves relayouts when a game block spans pages that start to change one after the other. Whether it would have helped a run is in `NOTE learned adjacency` (below) |
 | `REV3_EFCHECK=N\|all\|0` | the ef list check around restores (see "Effect pool"): unset = the first 200 restores, `N` = the first N, `all` = every restore, `0` = off |
+| `REV3_ALARMCHECK=0\|1` | the OS alarm queue watch (default 1, see "Alarm queue"): the queue is walked at every capture and around every restore |
+| `REV3_RB_IOS_GATE=1` | a pending IOS IPC event (CoreTiming `IPCEvent` / `IPCInterrupt` / `FinishDICommand`) counts like a disc read in flight (default 0 = only counted, see "Alarm queue") |
 | `REV3_SYNCTEST_LOG=path` | log file (default `<User>\Logs\rev3_synctest.log`), appended, flushed per line |
 
 Hardware regions (computed from Dolphin's emulated hardware when SyncTest arms and re-checked every 600 hook calls; the set
@@ -667,6 +669,43 @@ Tests: `Rev3Rollback.FreezeDump*`, `BackChain*`, `RestoreHwLine*`, `Stall*`, `Sy
 `FreezeDumpPrintsEachThreadsSavedContext`, `FreezeDumpReportsTheUnhandledExceptionTheOsHaltedOn` (a synthetic OSThread holding a DSI context, CPU in
 `PPCHalt` with r25..r28 set; raw stack and stack scan), `FreezeDumpExceptionFallsBackWhenTheArgumentsAreNotUsable` (unusable r25 / r26, a racy dump
 inside `OSReport`, no readable context, no registers).
+
+## Alarm queue (`REV3_ALARMCHECK`, `REV3_RB_IOS_GATE`; Oct 17, 2026, soak `20261016_233913` run 7)
+
+What froze: the host's sound pump thread (0x803D3D80, prio 3) spun for 60 s in `InsertAlarm` (0x80313694, walk 0x80313768..0x8031382C) called from `OSSetAlarm` <- `OSSleepTicks` <- `zz_8018d1c0_`,
+MSR 0x1032 (interrupts off), the main thread READY and never scheduled. The SDK keeps ONE doubly linked list of pending `OSAlarm`s sorted by fire time (head 0x8049DA38, tail 0x8049DA3C;
+OSAlarm: +0 handler, +8 fire s64, +0x10 prev, +0x14 next, +0x18 period s64, +0x28 userData) and `InsertAlarm` walks it from the head until the first node that fires later.
+The period catch-up is one division, not a loop, and the saved LR shows no call after the prologue, so the spin was the list walk: it ends only on a null `next` or a later node, so
+the list was **cyclic** (proven from the disassembly and the registers; the cycle itself is not seen, the dump had no queue lines then).
+
+What a restore does and does not touch (code reading, `Rev3Rollback.cpp`): the whitelist pages and the stack window are written back; the time base only with `REV3_SYNCTEST_TB=1` (run 7 had it off);
+the decrementer (mtdec value and CoreTiming's `DecCallback` event) is never saved or restored; the audio rewind removes and re-adds only DSP / AI events. The walk never reads the time base, and
+`DecrementerExceptionCallback` re-programs the decrementer from the queue head, so a late or early decrementer only shifts when alarms fire; **it cannot create a cycle, and no decrementer
+save/restore was added** (nothing shows it is needed). The candidates left (not proven): (1) an alarm armed while already queued (`OSSetAlarm` on a node that is still in the list): the port in the
+unit tests (`InsertAlarmLikeTheSdk`) shows that re-arming a queued node with another fire time makes a forward cycle in most cases (a scratch simulation: 73 % of random double insertions, and the
+next insert then never ends); IOS replies are the way a restore can cause it: Dolphin's `EmulationKernel::EnqueueIPCReply` writes the reply into guest memory at once and hands it to the PPC
+through the CoreTiming event `IPCEvent` 500 ticks later, the fork gates only on `/dev/di`, so a restore across a pending reply leaves a completion callback (the PlayRecord alarm 0x80465320 is
+re-armed from NAND completions) running against rewound state; (2) a half-rewound queue: a node inside the snapshot, its neighbours or head/tail outside (write tracking with `wt_misses=0` argues against it).
+
+What is added:
+- Freeze dump lines (`DUMP .. time ..`, `alarmq ..`, `playrecord ..`): `time tb=.. dec=.. dec_event=+<cycles>|none|? core_ticks=..` (the fake time base, the decrementer as mfdec reads it, whether CoreTiming
+  has a `DecCallback` pending and when; `?` in a racy dump, which does not read CoreTiming's queue), `alarmq head=.. tail=.. n=.. orphans=.. status=ok|empty|<problems> now=<system time> tps=..` and per
+  node `alarmq[i] at=.. name=.. handler=0x..(Name) fire=.. due=+x.xxxms period=.. prev=.. next=.. user=.. tag=..` (`on_stack_of=<thread>` when the node sits on a thread's stack, as a sleeping thread's does),
+  `alarmq orphan[i]` for nodes only the backward chain from the tail reaches, and the PlayRecord state words (0x8049C9A8 ...). Problems: `cycle(0x.. index n is index m)`, `prev_link`, `order`,
+  `tail`, `head_tail`, `bad_pointer`, `too_long`, `backward_cycle`, `backward_end`. The walk is read-only and bounded (128 nodes), so a dump of a cyclic queue terminates.
+- SyncTest `ALARMCHECK` (default on): `AlarmWatch` at every capture, `AlarmCheck` before and after every restore write-back. A bad queue logs `ALARMCHECK bad capture frame N last_ok_frame=M last_restore=a->b ios=[..]`
+  (only the transition, so the first bad frame is placed between two captures), `ALARMCHECK bad before|after restore a -> b last_ok_frame=.. ios=[..]` and the queue itself as `ALARMCHECK alarmq ..` lines; the first 12 are
+  written, then `ALARMCHECK further failures are only counted`. One `ALARMCHECK ok capture ..` line shows the check ran. The SUMMARY / net summary fields: `alarm_checks alarm_bad_captures alarm_bad_before
+  alarm_bad_after ipc_slots ipc_restores`. Reading it: `bad capture` with a good `last_ok_frame` before = the first run broke the queue; `before` good and `after` bad = the write-back or what it left outside
+  (IOS replies) did it.
+- IOS events: `ipc_slots` / `ipc_restores` count captures and restores made with an `IPCEvent` / `IPCInterrupt` / `FinishDICommand` pending, and the first five restores log `NOTE restore a -> b with IOS events pending: IPCEvent+500,..`.
+  `REV3_RB_IOS_GATE=1` makes them gate like a disc read in flight (the slot is not a rollback target, rollbacks wait while one is pending): an A/B switch for the next soak, off by default because it may
+  postpone rollbacks often.
+
+What to look for in the next soak: `ALARMCHECK bad` lines (frame, `last_ok_frame`, `ios=[..]`, the node that is queued twice), `ipc_restores` against `restores`, and in any freeze dump the `alarmq` block (a cycle shows as
+`status=cycle(..)`, the nodes before it show what armed twice: `name=`, `handler=`, `due=`). If `ALARMCHECK bad before` appears with a non-empty `ios=[..]` the IOS hypothesis is confirmed and the gate is the fix to try.
+
+Tests: `Rev3Alarm.*` (17: queue walk, double insertion and the endless SDK walk, orphans, dump lines, SyncTest ALARMCHECK in the first run and after a half-rewound restore, off switch, IOS counters and gate).
 
 ## Determinism kit (M1)
 

@@ -54,6 +54,12 @@
 //                            snapshot history; 2 = also keep the hash scan and report every page it finds that no fault announced
 //                            ("WRITE TRACK MISS"). Also REV3_RB_DIRTY_LOG=N (name the first N dirty pages with the pc / lr of the store) and
 //                            REV3_RB_WRITE_TRACK_REARM=N (equal rewrites before a page is learned anyway, default 4). REV3.md "Host write tracking"
+//   REV3_ALARMCHECK=0|1      OS alarm queue watch (default 1): every capture and every restore (before / after the write-back) walks the SDK's alarm
+//                            queue (head / tail 0x8049DA38 / 0x8049DA3C) and logs ALARMCHECK lines when it is cyclic or inconsistent (see "THE ALARM
+//                            QUEUE" below; REV3.md "Alarm queue"). 0 = off
+//   REV3_RB_IOS_GATE=1       treat a pending IOS IPC event (CoreTiming IPCEvent / IPCInterrupt / FinishDICommand) like a disc read in flight: slots
+//                            captured with one are not rollback targets and rollbacks wait while one is pending (default 0 = only counted: ipc_slots /
+//                            ipc_restores in the SUMMARY fields)
 //   REV3_RB_HASHCHECK=N      every Nth frame hash ALL of guest memory (4 KB pages) in the first run and again in the resimulation and name the pages that
 //                            differ (HASHCHECK lines; REV3.md "Desync region diff"): state the set misses, or memory the game does not reproduce by itself
 //   SyncTest only runs once armed (both fighters found through the TEAMS pointers); menus and loading screens are never
@@ -98,6 +104,17 @@
 //   they stay in phase with the restored hardware state) and the DSP / AI interrupt bits of the PI. Nothing else of CoreTiming,
 //   the PI or the PPC is touched.
 //
+// THE ALARM QUEUE (REV3_ALARMCHECK, default on; REV3.md "Alarm queue")
+//   The SDK's OSAlarm module keeps ONE doubly linked list of pending alarms sorted by fire time (head 0x8049DA38, tail 0x8049DA3C;
+//   nodes are OSAlarm structs anywhere: statics, heap objects, a sleeping thread's stack). The decrementer interrupt pops the head, and
+//   InsertAlarm walks the list from the head with interrupts off. A node inserted twice, or a node whose memory was rewound while the
+//   neighbours were not, makes the list cyclic and the next InsertAlarm walks it for ever (soak 20261016_233913 run 7: the sound thread
+//   spun in InsertAlarm with MSR.EE off, the main thread READY and never scheduled). The time base and the decrementer are NOT rewound by a
+//   restore, but that cannot make a cycle (the walk never looks at the time base; a late or early decrementer only moves when alarms fire).
+//   ReadAlarmQueue / AlarmQueueLines read the list without side effects: a freeze dump prints it (`alarmq` lines: every node with fire time
+//   relative to now, period, handler, links, the nodes only the backward chain reaches) and SyncTest checks it at every capture (first bad
+//   frame) and around every restore.
+//
 // HOW IT FITS IN
 //   Protocol and field table: GetSniperd/rev3-mod rev3mod/rbhook.py (game side), rev3mod/rbchecksum.py (FIELDS, TEAMS chain),
 //   docs/rollback_fork_plan.md (the change list; SyncTest is its first milestone). The Dolphin glue (HandleCommand, the
@@ -119,6 +136,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -300,6 +318,11 @@ public:
   // True while a disc read is in flight (GC DI registers TSTART, or the Wii IOS /dev/di device has a command executing or queued).
   // Its destination cannot be cut out of the snapshot, so SyncTest postpones rollbacks while this is true. Default: never.
   virtual bool DiscReadInFlight() { return false; }
+  // Wii IOS requests and replies that are still on their way (CoreTiming events IPCEvent / IPCInterrupt / FinishDICommand): the game sent
+  // a request whose answer, and whatever IOS writes into guest memory for it, lands later. A restore across one leaves the game waiting for
+  // a reply that was already delivered, or hands it a reply for a request its restored memory never sent. Returns the count; *what (when
+  // not null) gets "IPCEvent+123,..." (type and remaining cycles). Default: none.
+  virtual u32 IosEventsPending(std::string* /*what*/) { return 0; }
 };
 
 // ---- audio hardware (REV3_SYNCTEST_AUDIO_HW) -------------------------------------------------------------------------------------
@@ -545,12 +568,28 @@ struct DumpHw
   u32 vi_di0 = 0;   // display interrupt 0 register (MMIO 0x0C002030): bit 31 = interrupt flag, bit 28 = enable
 };
 
+// The guest's clocks. The game's notion of "now" (OSGetTime) is the time base; the decrementer is what wakes the alarm module.
+// CoreTiming schedules the decrementer as an event (DecCallback); a decrementer that has fired and not been written again has no event.
+struct DumpClock
+{
+  bool valid = false;
+  u64 tb = 0;               // the time base as mftb reads it now (SystemTimers::GetFakeTimeBase)
+  u32 dec = 0;              // the decrementer as mfdec reads it now (GetFakeDecrementer); >= 0x80000000 = expired / negative
+  bool dec_event_known = false; // dec_event is valid (CoreTiming's queue is read only while the CPU thread is stopped, never in a racy dump)
+  bool dec_event = false;   // CoreTiming has a DecCallback event pending
+  s64 dec_event_cycles = 0; // ... due in this many CPU cycles (only with dec_event)
+  u64 core_ticks = 0;       // CoreTiming's tick counter (CPU cycles since start)
+};
+
 class DumpSource
 {
 public:
   virtual ~DumpSource() = default;
   virtual bool ReadCpu(DumpCpu* out) = 0;
   virtual bool ReadHw(DumpHw* out) = 0;
+  // The time base and the decrementer; false (default) = not available. Plain reads, allowed in a racy dump (the numbers may be torn);
+  // `racy` = the CPU thread is running, so CoreTiming's event queue is not read (dec_event_known stays false).
+  virtual bool ReadClock(DumpClock* /*out*/, bool /*racy*/) { return false; }
   // Extra lines (without the `DUMP <reason> ` prefix): the DSP / AI state and the audio CoreTiming events. Only asked for in a
   // consistent dump (arm, a paused CPU), never in a racy one. Default: none.
   virtual void AudioLines(std::vector<std::string>* /*out*/) {}
@@ -568,6 +607,63 @@ struct StackFrame
 // The PPC back-chain from `sp`: each entry is {sp, *(sp + 4)}; the next sp is *(sp). Stops after `max_frames`, at an unreadable, zero or
 // unaligned sp, or when the next sp does not increase (a loop or a stack end). The last frame found is still listed. Returns the count.
 size_t WalkBackChain(const GuestMemory& memory, u32 sp, size_t max_frames, std::vector<StackFrame>* out);
+
+// ---- the OS alarm queue (REV3_ALARMCHECK; see "THE ALARM QUEUE" at the top) --------------------------------------------------------
+// Addresses and layout are Rev3's (RNEEDA) SDK: decomp InsertAlarm @ 0x80313694 (the walk is 0x80313768..0x8031382C), OSSetAlarm @ 0x803138E4,
+// DecrementerExceptionCallback @ 0x80313AF0 (pops the head), OSCancelAlarm @ 0x803139D8, OSSetAlarmUserData @ 0x80313DF8. OSAlarm:
+//   +0x00 handler  +0x04 tag  +0x08 fire (s64, system time)  +0x10 prev  +0x14 next  +0x18 period (s64)  +0x20 start (s64)  +0x28 userData
+// head / tail are r13 - 0x5EE8 and + 4 (r13 = 0x804A3920). "System time" = the time base + the 64-bit bias at 0x800030D8 (__OSGetSystemTime).
+constexpr u32 ALARM_QUEUE_HEAD = 0x8049DA38;
+constexpr u32 ALARM_QUEUE_TAIL = 0x8049DA3C;
+constexpr u32 OS_SYSTEM_TIME_BIAS = 0x800030D8;  // u64, big endian
+constexpr u32 OS_BUS_CLOCK = 0x800000F8;         // u32 Hz; the time base ticks at a quarter of it (60.75 MHz on a Wii)
+constexpr size_t ALARM_WALK_MAX = 128;           // nodes followed in one walk (a healthy queue holds about a dozen)
+constexpr size_t ALARM_LINES_MAX = 32;           // nodes printed by the dump
+
+struct AlarmNode
+{
+  u32 addr = 0;
+  u32 handler = 0;
+  u32 tag = 0;
+  u32 prev = 0;
+  u32 next = 0;
+  u32 user = 0;
+  s64 fire = 0;
+  s64 period = 0;
+  s64 start = 0;
+  bool prev_ok = true;   // prev is the node before this one in the walk (0 for the head)
+  bool order_ok = true;  // fire >= the fire of the node before it
+};
+
+struct AlarmQueueReport
+{
+  bool readable = false;             // head and tail could be read
+  u32 head = 0;
+  u32 tail = 0;
+  std::vector<AlarmNode> nodes;      // the forward walk from the head, in order (stops at a repeat, a bad pointer or ALARM_WALK_MAX)
+  std::vector<AlarmNode> orphans;    // nodes only the backward chain from the tail reaches (lost from the forward list), at most 8
+  std::vector<std::string> problems; // empty = consistent. Tokens: head_tail, cycle(0x.. index n), bad_pointer(0x.. after index n),
+                                     // too_long, prev_link(index n), order(index n), tail(0x..), backward_cycle(0x..), backward_end(0x..)
+  bool Ok() const { return readable && problems.empty(); }
+  std::string Status() const;        // "ok", "empty" or the problems joined with ';'
+};
+// Walks the list (forward from the head, then backward from the tail) with plain reads: never writes, never follows a pointer twice.
+AlarmQueueReport ReadAlarmQueue(const GuestMemory& memory);
+// `now` = system time (time base + bias) when known; the lines then say how far ahead (+) or overdue (-) each alarm is. `ticks_per_second`
+// converts that to milliseconds. `thread_stacks` = {OSThread address, stack end, stack base} to say which alarm sits on a thread's stack.
+struct AlarmThreadStack
+{
+  u32 thread = 0;
+  u32 stack_end = 0;
+  u32 stack_base = 0;
+};
+std::vector<std::string> AlarmQueueLines(const AlarmQueueReport& report, const std::optional<s64>& now, u32 ticks_per_second,
+                                         const std::vector<AlarmThreadStack>& thread_stacks);
+// The guest's system time right now from the time base `tb` (adds the bias in guest memory); nullopt when the bias is unreadable.
+std::optional<s64> AlarmSystemTime(const GuestMemory& memory, u64 tb);
+// Names of the alarms and handlers of this build that the dump knows ("playrecord", "SleepAlarmHandler"); nullptr for unknown addresses.
+const char* AlarmObjectName(u32 address);
+const char* AlarmHandlerName(u32 address);
 
 class FreezeDump
 {
@@ -897,6 +993,8 @@ struct SyncTestOptions
   u32 learn_pad_pages = 0;        // REV3_SNAPSHOT_PAD: every page the tracker learned also pulls this many 4 KB pages on each side into the set
                                   // (0 = off, 0..16). More bytes per snapshot (see the NOTE learn pad line), fewer late relayouts when a game
                                   // block spans pages that change one after the other. A page that never changes costs only copy time.
+  u32 alarm_check = 1;            // REV3_ALARMCHECK: 1 = walk the OS alarm queue at every capture and around every restore (ALARMCHECK lines), 0 = off
+  bool ios_gate = false;          // REV3_RB_IOS_GATE: a pending IOS IPC event counts as a disc read in flight (HardwareView::IosEventsPending)
   u32 ef_check_restores = 200;    // REV3_EFCHECK: restores (count, not frames) that get the ef list check before / after the write-back;
                                   // 0 = off, EF_CHECK_ALL = every restore. 200 restores = 200 checks of a few thousand reads each (microseconds)
   VerifyOptions verify;           // REV3_RB_VERIFY*: shadow copy of guest memory and a full comparison after restores (see "restore verify" above)
@@ -969,6 +1067,12 @@ struct SyncTestStats
   u32 io_dirty_hw = 0;            // ... of which the hardware / IOS view saw the read
   u32 io_dirty_game = 0;          // ... of which the game's DVD library has a command executing
   u32 io_dirty_skipped = 0;       // SyncTest: rollbacks not made because the slot to restore was dirty (no earlier slot exists to take instead)
+  u32 ipc_slots = 0;              // captures made with an IOS IPC event pending (counted always; they are dirty only with the IOS gate)
+  u32 ipc_restores = 0;           // restores made with an IOS IPC event pending (the gate postpones them; without it they happen)
+  u32 alarm_checks = 0;           // alarm queue walks (captures and restores)
+  u32 alarm_bad_captures = 0;     // captures that found the queue inconsistent (the live state, rolled back or not)
+  u32 alarm_bad_before = 0;       // restores whose live state was already inconsistent before the write-back
+  u32 alarm_bad_after = 0;        // restores that left the queue inconsistent (the write-back or the state outside RAM did it)
   u32 audio_restores = 0;         // restores that also put the audio hardware back
   u64 audio_us_total = 0;         // time of those audio restores (state load + event re-scheduling)
   u64 audio_us_max = 0;
@@ -1224,6 +1328,16 @@ private:
   void ResolveInclusions();
   // The ef list check around a restore (options.ef_check_restores): `when` = "before" / "after". Logs EFCHECK lines.
   void EfCheck(const char* when, u32 from, u32 to);
+  // The alarm queue (options.alarm_check): AlarmWatch at a capture (frame = the captured frame), AlarmCheck around a restore (`when` "before" /
+  // "after"). A bad queue logs ALARMCHECK lines with the queue itself (the first ALARM_BAD_LOGS times, later only counted); the first good
+  // result of each kind is logged once so a log shows the check ran.
+  void AlarmWatch(u32 frame);
+  void AlarmCheck(const char* when, u32 from, u32 to);
+  void AlarmLog(const char* what, const AlarmQueueReport& r);
+  // Pending IOS IPC events (HardwareView::IosEventsPending), 0 without a hardware view.
+  u32 IosPending(std::string* what) const;
+  // " alarm_checks=.. alarm_bad_captures=.. alarm_bad_before=.. alarm_bad_after=.. ipc_slots=.. ipc_restores=.." (leading space).
+  std::string AlarmStatsFields() const;
   void LearnWhileArmed(u32 added);
   // Restore verify: compares all memory with the shadow of `to` after a write-back and logs / counts the result (see VerifyOptions).
   void VerifyAfterRestore(const Slot& s, const Command& command, u32 to);
@@ -1276,6 +1390,13 @@ private:
   u32 m_ef_checks_done = 0;                     // restores that got the check (limit: options.ef_check_restores)
   u32 m_ef_bad_logs = 0;
   u32 m_ef_ok_logs = 0;
+  bool m_alarm_was_bad = false;                 // the previous capture found the queue inconsistent (a transition is what gets logged)
+  u32 m_alarm_last_ok_frame = 0;                // latest captured frame whose queue was consistent
+  u32 m_alarm_bad_logs = 0;                     // ALARMCHECK bad lines written
+  u32 m_alarm_ok_logs = 0;                      // ALARMCHECK ok lines written
+  u32 m_alarm_restore_from = 0;                 // the latest restore (live frame -> target frame), 0 = none yet
+  u32 m_alarm_restore_to = 0;
+  std::string m_alarm_restore_ipc;              // IosEventsPending text at that restore ("" = none)
   u32 m_layout_gen = 0;                         // bumped by every RebuildLayout; a snapshot of another generation is never restored
   u32 m_last_restore_call = 0;                  // m_armed_calls at the latest restore (late-learn detection)
   struct PtrState

@@ -197,9 +197,17 @@ public:
     out->insert(out->end(), list.begin(), list.end());
   }
   bool DiscReadInFlight() override { return disc_busy; }
+  u32 IosEventsPending(std::string* what) override
+  {
+    if (what != nullptr)
+      *what = ios_events != 0 ? ios_text : std::string();
+    return ios_events;
+  }
   std::vector<Exclusion> list;
   int queries = 0;
   bool disc_busy = false;
+  u32 ios_events = 0;                      // IOS IPC events "on their way"
+  std::string ios_text = "IPCEvent+500";  // what IosEventsPending reports for them
 };
 
 // The emulated audio hardware: a counter the "game" advances every frame, a few variable-length bytes (like the HLE mail queue),
@@ -3433,6 +3441,18 @@ public:
     out->push_back("dsp csr=0x0004 fake");
   }
   void ExtraLines(std::vector<std::string>* out, bool racy) override { out->push_back(racy ? "hw di fake racy" : "hw di fake"); }
+  bool ReadClock(DumpClock* out, bool racy) override
+  {
+    last_clock_racy = racy;
+    *out = clock;
+    out->valid = clock_ok;
+    if (racy)
+      out->dec_event_known = false;
+    return clock_ok;
+  }
+  DumpClock clock;
+  bool clock_ok = false;
+  bool last_clock_racy = false;
   DumpCpu cpu;
   bool cpu_ok = true;
   DumpHw hw;
@@ -5332,7 +5352,9 @@ TEST(Rev3Rollback, NetPrepareArmNamesPagesLearnedSinceTheLastArm)
   const size_t summaries = rig.sink.Count("NOTE learned summary");
   rig.test.NetSummaryNote();
   EXPECT_EQ(rig.sink.Count("NOTE learned summary"), summaries);
-  EXPECT_EQ(note, " io_dirty_slots=0 io_dirty_hw=0 io_dirty_game=0 io_dirty_skipped=0");  // no verify, no hiding: only the disc read counters
+  // no verify, no hiding: only the disc read counters and the alarm queue counters (nothing bad, no IOS events in this rig)
+  EXPECT_EQ(note.rfind(" io_dirty_slots=0 io_dirty_hw=0 io_dirty_game=0 io_dirty_skipped=0 alarm_checks=", 0), 0u) << note;
+  EXPECT_NE(note.find(" alarm_bad_captures=0 alarm_bad_before=0 alarm_bad_after=0 ipc_slots=0 ipc_restores=0"), std::string::npos) << note;
 }
 
 TEST(Rev3Rollback, NetModeLearnedSummaryIsWrittenEvenWhenNothingWasLearned)
@@ -7156,4 +7178,419 @@ TEST(Rev3Rollback, KitBotMakesTheRecordHoldTheBotsPadsInOfflineRuns)
   ASSERT_EQ(rig.record.lines.size(), 2u);  // header + the call
   const PadBytes want = bot.generator().FightPad(50);
   EXPECT_EQ(rig.record.lines[1], FormatPadRecordLine(50, {want, rig.Cmd(50).pads[1]}, std::numeric_limits<s32>::min()));
+}
+
+
+// ---- the OS alarm queue: ReadAlarmQueue, the `alarmq` / `time` dump lines, SyncTest ALARMCHECK, the IOS gate ----------------------------
+// The queue is planted by hand in the fake memory with the layout the SDK uses (Rev3Rollback.h "THE ALARM QUEUE"); nothing here comes from the game.
+namespace
+{
+constexpr u32 ALARM_N1 = 0x80470000;  // alarm objects outside the snapshot ...
+constexpr u32 ALARM_N2 = 0x80470100;
+constexpr u32 ALARM_N3 = 0x80470200;
+constexpr u32 ALARM_N4 = 0x80470300;
+constexpr u32 ALARM_IN_SNAPSHOT = STATE_A + 0x40;  // ... and one in the page the FakeGame snapshots (0x2C bytes; the game writes +0 and +0x80 only)
+
+void SetU64(FakeMemory& mem, u32 addr, u64 v)
+{
+  mem.SetU32(addr, static_cast<u32>(v >> 32));
+  mem.SetU32(addr + 4, static_cast<u32>(v));
+}
+
+struct TestAlarm
+{
+  u32 at;
+  s64 fire;
+  u32 handler = 0x8031D128;  // SleepAlarmHandler
+  s64 period = 0;
+};
+
+void PutAlarm(FakeMemory& mem, const TestAlarm& a, u32 prev, u32 next)
+{
+  mem.SetU32(a.at + 0x00, a.handler);
+  SetU64(mem, a.at + 0x08, static_cast<u64>(a.fire));
+  mem.SetU32(a.at + 0x10, prev);
+  mem.SetU32(a.at + 0x14, next);
+  SetU64(mem, a.at + 0x18, static_cast<u64>(a.period));
+}
+
+// A healthy queue: the alarms in the order given (the caller sorts them), linked both ways, head / tail set.
+void BuildAlarmQueue(FakeMemory& mem, const std::vector<TestAlarm>& alarms)
+{
+  for (size_t i = 0; i < alarms.size(); ++i)
+    PutAlarm(mem, alarms[i], i == 0 ? 0 : alarms[i - 1].at, i + 1 < alarms.size() ? alarms[i + 1].at : 0);
+  mem.SetU32(ALARM_QUEUE_HEAD, alarms.empty() ? 0 : alarms.front().at);
+  mem.SetU32(ALARM_QUEUE_TAIL, alarms.empty() ? 0 : alarms.back().at);
+}
+
+std::vector<TestAlarm> FourAlarms()
+{
+  return {{ALARM_N1, 1000, 0x8031E258}, {ALARM_N2, 2000, 0x8020FB2C, 405000}, {ALARM_N3, 3000}, {ALARM_N4, 4000, 0x802887F8}};
+}
+
+// A port of the SDK's InsertAlarm walk (decomp 0x80313694..0x8031382C, period 0 path): start at the head, stop at the first node that fires
+// later (insert before it) or at the end (append at the tail). Returns the steps taken, or -1 when `budget` steps were not enough: the
+// endless walk of soak 20261016_233913 run 7. Everything but the walk (the catch-up division of a periodic alarm, MSR) is left out.
+int InsertAlarmLikeTheSdk(FakeMemory& mem, u32 alarm, s64 fire, int budget = 200)
+{
+  SetU64(mem, alarm + 0x08, static_cast<u64>(fire));
+  u32 cur = mem.U32(ALARM_QUEUE_HEAD);
+  for (int steps = 1; steps <= budget; ++steps)
+  {
+    if (cur == 0)
+    {
+      const u32 tail = mem.U32(ALARM_QUEUE_TAIL);
+      mem.SetU32(alarm + 0x14, 0);
+      mem.SetU32(alarm + 0x10, tail);
+      mem.SetU32(ALARM_QUEUE_TAIL, alarm);
+      mem.SetU32(tail == 0 ? ALARM_QUEUE_HEAD : tail + 0x14, alarm);
+      return steps;
+    }
+    const s64 cur_fire = static_cast<s64>((static_cast<u64>(mem.U32(cur + 8)) << 32) | mem.U32(cur + 12));
+    if (fire < cur_fire)
+    {
+      const u32 prev = mem.U32(cur + 0x10);
+      mem.SetU32(alarm + 0x10, prev);
+      mem.SetU32(cur + 0x10, alarm);
+      mem.SetU32(alarm + 0x14, cur);
+      mem.SetU32(prev == 0 ? ALARM_QUEUE_HEAD : prev + 0x14, alarm);
+      return steps;
+    }
+    cur = mem.U32(cur + 0x14);
+  }
+  return -1;
+}
+
+// The state of soak run 7 in miniature: a queued alarm armed again with an earlier fire time (nothing cancelled it first).
+void DoubleInsert(FakeMemory& mem)
+{
+  BuildAlarmQueue(mem, {{ALARM_N1, 100}, {ALARM_N2, 200}, {ALARM_N3, 300}});
+  ASSERT_GT(InsertAlarmLikeTheSdk(mem, ALARM_N2, 150), 0);
+}
+
+bool AnyLine(const std::vector<std::string>& lines, const std::string& a, const std::string& b = {})
+{
+  return std::any_of(lines.begin(), lines.end(), [&](const std::string& l) { return l.find(a) != std::string::npos && l.find(b) != std::string::npos; });
+}
+}  // namespace
+
+TEST(Rev3Alarm, AnEmptyQueueIsConsistent)
+{
+  FakeMemory mem;
+  const AlarmQueueReport r = ReadAlarmQueue(mem);
+  EXPECT_TRUE(r.readable);
+  EXPECT_TRUE(r.Ok());
+  EXPECT_EQ(r.Status(), "empty");
+  EXPECT_TRUE(r.nodes.empty());
+}
+
+TEST(Rev3Alarm, AHealthyQueueIsWalkedInOrderWithItsFields)
+{
+  FakeMemory mem;
+  BuildAlarmQueue(mem, FourAlarms());
+  const AlarmQueueReport r = ReadAlarmQueue(mem);
+  ASSERT_TRUE(r.Ok()) << r.Status();
+  EXPECT_EQ(r.Status(), "ok");
+  ASSERT_EQ(r.nodes.size(), 4u);
+  EXPECT_EQ(r.head, ALARM_N1);
+  EXPECT_EQ(r.tail, ALARM_N4);
+  EXPECT_EQ(r.nodes[0].addr, ALARM_N1);
+  EXPECT_EQ(r.nodes[1].period, 405000);
+  EXPECT_EQ(r.nodes[1].handler, 0x8020FB2Cu);
+  EXPECT_EQ(r.nodes[3].prev, ALARM_N3);
+  EXPECT_EQ(r.nodes[3].fire, 4000);
+  EXPECT_TRUE(r.orphans.empty());
+}
+
+TEST(Rev3Alarm, EqualFireTimesAreInOrder)
+{
+  FakeMemory mem;
+  BuildAlarmQueue(mem, {{ALARM_N1, 500}, {ALARM_N2, 500}, {ALARM_N3, 500}});  // InsertAlarm puts a new alarm after equal ones
+  EXPECT_TRUE(ReadAlarmQueue(mem).Ok());
+}
+
+TEST(Rev3Alarm, TheQueueLinesNameTheAlarmsAndSayWhenTheyAreDue)
+{
+  FakeMemory mem;
+  const u32 tps = 60750000;  // 243 MHz bus / 4
+  // 527577 ticks after "now" = 8.684 ms (the PlayRecord alarm of soak run 7 against the sound thread's sleep alarm)
+  BuildAlarmQueue(mem, {{0x80465320, 1000000 + 527577, 0x8031E258}, {0x80403870, 1000000 + 700000, 0x8020FB2C, 405000}});
+  const AlarmQueueReport r = ReadAlarmQueue(mem);
+  ASSERT_TRUE(r.Ok()) << r.Status();
+  const std::vector<std::string> lines = AlarmQueueLines(r, std::optional<s64>(1000000), tps, {{0x803D3D80, 0x80465000, 0x80466000}});
+  ASSERT_EQ(lines.size(), 3u);
+  EXPECT_NE(lines[0].find("alarmq head=0x80465320 tail=0x80403870 n=2 orphans=0 status=ok"), std::string::npos) << lines[0];
+  EXPECT_NE(lines[0].find("tps=60750000"), std::string::npos);
+  EXPECT_NE(lines[1].find("alarmq[0] at=0x80465320 name=playrecord"), std::string::npos) << lines[1];
+  EXPECT_NE(lines[1].find("handler=0x8031E258(PlayRecordAlarmCallback)"), std::string::npos) << lines[1];
+  EXPECT_NE(lines[1].find("due=+8.684ms"), std::string::npos) << lines[1];
+  EXPECT_NE(lines[1].find("on_stack_of=0x803D3D80"), std::string::npos) << lines[1];  // 0x80465320 lies in that stack range
+  EXPECT_NE(lines[2].find("name=remote_speaker"), std::string::npos) << lines[2];
+  EXPECT_NE(lines[2].find("period=405000(6.667ms)"), std::string::npos) << lines[2];
+  // Without the time there are no relative times.
+  const std::vector<std::string> bare = AlarmQueueLines(r, std::nullopt, 0, {});
+  EXPECT_NE(bare[0].find("now=?"), std::string::npos);
+  EXPECT_EQ(bare[1].find("due="), std::string::npos);
+}
+
+TEST(Rev3Alarm, TheSystemTimeIsTheTimeBasePlusTheBias)
+{
+  FakeMemory mem;
+  SetU64(mem, OS_SYSTEM_TIME_BIAS, 0x0000000100000010ull);
+  EXPECT_EQ(AlarmSystemTime(mem, 0x20), std::optional<s64>(0x0000000100000030ll));
+}
+
+TEST(Rev3Alarm, ANodeQueuedTwiceMakesACycleTheWalkNamesAndTheSdkWalkNeverEnds)
+{
+  FakeMemory mem;
+  DoubleInsert(mem);  // N1(100) N2(200) N3(300), then N2 armed again for 150
+  // The SDK's own walk would now go on for ever: a new alarm that fires after everything else never finds the end.
+  EXPECT_EQ(InsertAlarmLikeTheSdk(mem, ALARM_N4, 5000, 1000), -1);
+  const AlarmQueueReport r = ReadAlarmQueue(mem);
+  EXPECT_FALSE(r.Ok());
+  EXPECT_NE(r.Status().find("cycle(0x80470100"), std::string::npos) << r.Status();  // N2 reached a second time
+  EXPECT_LE(r.nodes.size(), 3u);
+  const std::vector<std::string> lines = AlarmQueueLines(r, std::nullopt, 0, {});
+  EXPECT_TRUE(AnyLine(lines, "alarmq head=", "status=")) << "cycle";
+  EXPECT_TRUE(AnyLine(lines, "alarmq head=", "cycle("));
+}
+
+TEST(Rev3Alarm, ADoubleInsertionThatLosesANodeIsFoundFromTheTail)
+{
+  FakeMemory mem;
+  BuildAlarmQueue(mem, {{ALARM_N1, 100}, {ALARM_N2, 200}, {ALARM_N3, 300}});
+  ASSERT_GT(InsertAlarmLikeTheSdk(mem, ALARM_N2, 350), 0);  // forward: N1, N2 (N3 is gone); backward from the tail: N2 N3 N2 ...
+  const AlarmQueueReport r = ReadAlarmQueue(mem);
+  EXPECT_FALSE(r.Ok());
+  EXPECT_NE(r.Status().find("prev_link("), std::string::npos) << r.Status();
+  EXPECT_NE(r.Status().find("backward_cycle("), std::string::npos) << r.Status();
+  ASSERT_EQ(r.nodes.size(), 2u);
+  ASSERT_EQ(r.orphans.size(), 1u);
+  EXPECT_EQ(r.orphans[0].addr, ALARM_N3);
+  EXPECT_TRUE(AnyLine(AlarmQueueLines(r, std::nullopt, 0, {}), "alarmq orphan[0] at=0x80470200"));
+}
+
+TEST(Rev3Alarm, AnOutOfOrderNodeAWrongTailAndAWildPointerAreEachNamed)
+{
+  {
+    FakeMemory mem;
+    BuildAlarmQueue(mem, FourAlarms());
+    SetU64(mem, ALARM_N3 + 8, 10);  // fires before N2
+    const AlarmQueueReport r = ReadAlarmQueue(mem);
+    EXPECT_NE(r.Status().find("order(index 2 0x80470200"), std::string::npos) << r.Status();
+    EXPECT_TRUE(AnyLine(AlarmQueueLines(r, std::nullopt, 0, {}), "order_bad"));
+  }
+  {
+    FakeMemory mem;
+    BuildAlarmQueue(mem, FourAlarms());
+    mem.SetU32(ALARM_QUEUE_TAIL, ALARM_N3);  // the walk ends at N4
+    EXPECT_NE(ReadAlarmQueue(mem).Status().find("tail(0x80470200"), std::string::npos);
+  }
+  {
+    FakeMemory mem;
+    BuildAlarmQueue(mem, FourAlarms());
+    mem.SetU32(ALARM_N2 + 0x14, 0x00001234);  // next is not an address
+    const AlarmQueueReport r = ReadAlarmQueue(mem);
+    EXPECT_NE(r.Status().find("bad_pointer(0x00001234 after index 1)"), std::string::npos) << r.Status();
+    EXPECT_EQ(r.nodes.size(), 2u);
+  }
+  {
+    FakeMemory mem;
+    BuildAlarmQueue(mem, FourAlarms());
+    mem.SetU32(ALARM_QUEUE_TAIL, 0);  // head without a tail
+    EXPECT_NE(ReadAlarmQueue(mem).Status().find("head_tail("), std::string::npos);
+  }
+}
+
+TEST(Rev3Alarm, ALongChainStopsAtTheWalkLimitAndOneKindOfProblemIsNotRepeatedWithoutEnd)
+{
+  FakeMemory mem;
+  std::vector<TestAlarm> many;
+  for (u32 i = 0; i < ALARM_WALK_MAX + 20; ++i)
+    many.push_back({0x80480000 + 0x40 * i, static_cast<s64>(i)});
+  BuildAlarmQueue(mem, many);
+  const AlarmQueueReport r = ReadAlarmQueue(mem);
+  EXPECT_NE(r.Status().find("too_long("), std::string::npos) << r.Status();
+  EXPECT_EQ(r.nodes.size(), ALARM_WALK_MAX);
+  // Lines are capped, too.
+  const std::vector<std::string> lines = AlarmQueueLines(r, std::nullopt, 0, {});
+  EXPECT_LE(lines.size(), 1 + ALARM_LINES_MAX + 1 + r.orphans.size());
+  EXPECT_TRUE(AnyLine(lines, "more nodes"));
+}
+
+TEST(Rev3Alarm, TheFreezeDumpPrintsTheClockTheQueueAndThePlayRecordState)
+{
+  FakeMemory mem;
+  MakeFakeOs(mem);
+  BuildAlarmQueue(mem, FourAlarms());
+  mem.SetU32(0x800000F8, 243000000);  // bus clock
+  SetU64(mem, OS_SYSTEM_TIME_BIAS, 0);
+  mem.SetU32(0x8049C9A8, 3);  // PlayRecord state
+  FakeSink sink;
+  FakeDumpSource source;
+  source.clock_ok = true;
+  source.clock.tb = 500;
+  source.clock.dec = 0x00012345;
+  source.clock.dec_event_known = true;
+  source.clock.dec_event = true;
+  source.clock.dec_event_cycles = 4242;
+  source.clock.core_ticks = 99;
+  FreezeDump dump(mem, sink, source);
+  const std::vector<std::string> lines = dump.Lines(false);
+  EXPECT_TRUE(AnyLine(lines, "time tb=0x00000000000001F4 dec=0x00012345 dec_event=+4242 cycles core_ticks=99"));
+  EXPECT_TRUE(AnyLine(lines, "alarmq head=0x80470000 tail=0x80470300 n=4 orphans=0 status=ok now=0x00000000000001F4 tps=60750000"));
+  EXPECT_TRUE(AnyLine(lines, "alarmq[3] at=0x80470300", "WPADiManageHandler0"));
+  EXPECT_TRUE(AnyLine(lines, "playrecord state=3"));
+  // A racy dump does not read CoreTiming's queue: the event is unknown, not "none".
+  const std::vector<std::string> racy = dump.Lines(false, true);
+  EXPECT_TRUE(source.last_clock_racy);
+  EXPECT_TRUE(AnyLine(racy, "time tb=", "dec_event=?"));
+}
+
+TEST(Rev3Alarm, TheFreezeDumpOfACyclicQueueSaysSoAndStillTerminates)
+{
+  FakeMemory mem;
+  MakeFakeOs(mem);
+  DoubleInsert(mem);
+  FakeSink sink;
+  FakeDumpSource source;  // no clock
+  FreezeDump dump(mem, sink, source);
+  const std::vector<std::string> lines = dump.Lines(false);
+  EXPECT_TRUE(AnyLine(lines, "time unavailable"));
+  EXPECT_TRUE(AnyLine(lines, "alarmq head=", "cycle("));
+  EXPECT_TRUE(AnyLine(lines, "alarmq[0] at=0x80470000"));
+}
+
+TEST(Rev3Alarm, ARunWithAHealthyQueueChecksEveryCaptureAndRestoreAndFindsNothing)
+{
+  FakeGame game(false);
+  BuildAlarmQueue(game.Mem(), FourAlarms());
+  FakeSink sink;
+  SyncTest test(AdaptiveOptions(3), {}, game.Mem(), sink, FakeClock());
+  for (int i = 0; i < 700; ++i)
+    game.Frame(test);
+  ASSERT_TRUE(test.Active());
+  EXPECT_GT(test.Stats().rollbacks, 50u);
+  EXPECT_GT(test.Stats().alarm_checks, test.Stats().rollbacks);  // a capture per frame, two checks per restore
+  EXPECT_EQ(test.Stats().alarm_bad_captures, 0u);
+  EXPECT_EQ(test.Stats().alarm_bad_before, 0u);
+  EXPECT_EQ(test.Stats().alarm_bad_after, 0u);
+  EXPECT_TRUE(sink.Contains("ALARMCHECK ok capture frame"));
+  EXPECT_FALSE(sink.Contains("ALARMCHECK bad"));
+  test.Finish();
+  EXPECT_TRUE(sink.Contains("alarm_checks="));
+  EXPECT_TRUE(sink.Contains("alarm_bad_after=0"));
+}
+
+TEST(Rev3Alarm, TheWatchCanBeSwitchedOff)
+{
+  FakeGame game(false);
+  DoubleInsert(game.Mem());
+  FakeSink sink;
+  SyncTestOptions o = AdaptiveOptions(3);
+  o.alarm_check = 0;
+  SyncTest test(o, {}, game.Mem(), sink, FakeClock());
+  for (int i = 0; i < 500; ++i)
+    game.Frame(test);
+  EXPECT_EQ(test.Stats().alarm_checks, 0u);
+  EXPECT_FALSE(sink.Contains("ALARMCHECK"));
+}
+
+TEST(Rev3Alarm, ACycleBornInTheFirstRunIsLoggedOnceWithTheQueueAndTheLastGoodFrame)
+{
+  FakeGame game(false);
+  BuildAlarmQueue(game.Mem(), FourAlarms());
+  FakeSink sink;
+  SyncTest test(AdaptiveOptions(3), {}, game.Mem(), sink, FakeClock());
+  for (int i = 0; i < 340 && !test.Active(); ++i)
+    game.Frame(test);
+  ASSERT_TRUE(test.Active());
+  for (int i = 0; i < 10; ++i)
+    game.Frame(test);
+  const u32 last_good = game.Counter();
+  DoubleInsert(game.Mem());  // outside the snapshot: restores keep it
+  for (int i = 0; i < 400; ++i)
+    game.Frame(test);
+  EXPECT_GE(test.Stats().alarm_bad_captures, 100u);
+  EXPECT_GE(test.Stats().alarm_bad_before, 1u);
+  EXPECT_EQ(sink.Count("ALARMCHECK bad capture frame"), 1u);  // the transition only
+  EXPECT_TRUE(LinesContain(sink, "ALARMCHECK bad capture frame " + std::to_string(last_good), "last_ok_frame=" + std::to_string(last_good - 1)));
+  EXPECT_TRUE(LinesContain(sink, "ALARMCHECK alarmq head=", "cycle("));
+  EXPECT_TRUE(LinesContain(sink, "ALARMCHECK alarmq[0] at=0x80470000", "handler=0x8031D128(SleepAlarmHandler)"));
+  EXPECT_TRUE(sink.Contains("ALARMCHECK bad before restore"));
+  // Bounded: ALARM_BAD_LOGS bad results are written in full, then one line says the rest is only counted.
+  EXPECT_LE(sink.Count("status=cycle("), 12u);  // ALARM_BAD_LOGS in Rev3Rollback.cpp
+  EXPECT_EQ(sink.Count("ALARMCHECK further failures are only counted"), 1u);
+  test.Finish();
+  EXPECT_TRUE(sink.Contains("alarm_bad_captures="));
+}
+
+TEST(Rev3Alarm, ARestoreThatLeavesAHalfRewoundQueueIsReportedAsBadAfterWhileBeforeWasGood)
+{
+  // A node inside the snapshot, its neighbours outside it: the write-back puts back an old prev link that the live list no longer has.
+  FakeGame game(false);
+  FakeMemory& mem = game.Mem();
+  const TestAlarm n1{ALARM_N1, 100};
+  const TestAlarm n2{ALARM_IN_SNAPSHOT, 200};
+  BuildAlarmQueue(mem, {n1, n2});
+  FakeSink sink;
+  SyncTest test(AdaptiveOptions(3), {}, mem, sink, FakeClock());
+  for (int i = 0; i < 340 && !test.Active(); ++i)
+    game.Frame(test);
+  ASSERT_TRUE(test.Active());
+  for (int i = 0; i < 10; ++i)
+    game.Frame(test);
+  ASSERT_EQ(test.Stats().alarm_bad_captures, 0u);
+  ASSERT_EQ(test.Stats().alarm_bad_after, 0u);
+  // The game cancels N1: N2 becomes the head. The snapshots taken from now on have that; the ones before do not.
+  BuildAlarmQueue(mem, {n2});
+  mem.SetU32(ALARM_N1 + 0x14, 0);
+  game.Frame(test);  // this call restores the snapshot of 3 frames ago, which still holds N2.prev = N1
+  EXPECT_GE(test.Stats().alarm_bad_after, 1u);
+  EXPECT_EQ(test.Stats().alarm_bad_before, 0u);
+  EXPECT_TRUE(LinesContain(sink, "ALARMCHECK bad after restore", "prev_link("));
+  EXPECT_TRUE(LinesContain(sink, "ALARMCHECK bad after restore", "ios=["));
+}
+
+TEST(Rev3Alarm, IosEventsAreCountedAtCapturesAndRestoresButOnlyGateWhenAsked)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  FakeHardware hw;
+  hw.ios_events = 2;
+  hw.ios_text = "IPCEvent+500,IPCInterrupt+40";
+  SyncTest test(AdaptiveOptions(3), {}, game.Mem(), sink, FakeClock(), &hw);
+  for (int i = 0; i < 600; ++i)
+    game.Frame(test);
+  ASSERT_TRUE(test.Active());
+  EXPECT_GT(test.Stats().rollbacks, 50u);  // not gated
+  EXPECT_EQ(test.Stats().io_dirty_slots, 0u);
+  EXPECT_GT(test.Stats().ipc_slots, 200u);
+  EXPECT_EQ(test.Stats().ipc_restores, test.Stats().restores);
+  EXPECT_TRUE(sink.Contains("NOTE restore "));
+  EXPECT_TRUE(sink.Contains("with IOS events pending: IPCEvent+500,IPCInterrupt+40"));
+  EXPECT_LE(sink.Count("with IOS events pending"), 5u);
+}
+
+TEST(Rev3Alarm, TheIosGateKeepsRollbacksAwayFromSlotsAndMomentsWithAnIpcEventOnItsWay)
+{
+  FakeGame game(false);
+  FakeSink sink;
+  FakeHardware hw;
+  hw.ios_events = 1;
+  SyncTestOptions o = AdaptiveOptions(3);
+  o.ios_gate = true;
+  SyncTest test(o, {}, game.Mem(), sink, FakeClock(), &hw);
+  for (int i = 0; i < 600; ++i)
+    game.Frame(test);
+  ASSERT_TRUE(test.Active());
+  EXPECT_EQ(test.Stats().rollbacks, 0u);  // an IPC event is always pending: nothing is a target, every attempt is postponed
+  EXPECT_GT(test.Stats().io_postponed, 0u);
+  EXPECT_GT(test.Stats().io_dirty_slots, 100u);
+  EXPECT_TRUE(sink.Contains("ios_events=IPCEvent+500"));
+  // The reply arrives: slots captured from now on are clean, and rollbacks resume once K clean frames exist.
+  hw.ios_events = 0;
+  for (int i = 0; i < 40; ++i)
+    game.Frame(test);
+  EXPECT_GE(test.Stats().rollbacks, 5u);
 }
