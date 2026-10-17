@@ -142,9 +142,14 @@ private:
 struct PeerAddress
 {
   std::string host;  // dotted quad or a host name
-  u16 port = 0;
+  u16 port = 0;      // 0 = any port, accept only (see ParsePeerAddress)
+  bool AcceptOnly() const { return port == 0; }
 };
 // "host:port" (the port after the LAST colon; IPv4 / names only). False with *error on anything else.
+// "host:*" = ACCEPT ONLY: this side never connects out; it takes the first connection that arrives from `host`, whatever its port, and
+// answers to wherever it came from. For the host of a session that runs through a local UDP tunnel (Porthole on Steam, or any port
+// forwarder): the guest connects to the tunnel's port on its own PC, and the packets reach us from the tunnel's proxy at 127.0.0.1:<some
+// port>, which nobody knows in advance. Direct connect (both sides connecting at once from fixed ports) stays the default.
 bool ParsePeerAddress(const std::string& text, PeerAddress* out, std::string* error);
 
 struct NetOptions
@@ -155,7 +160,7 @@ struct NetOptions
   std::vector<std::string> warnings;  // variables that were set but unusable (their default was used)
   Role role = Role::Host;
   u16 listen_port = 2626;  // REV3_NET_PORT: UDP port this side listens on and sends from
-  PeerAddress peer;        // REV3_NET_PEER
+  PeerAddress peer;        // REV3_NET_PEER (<ip>:<port>, or <ip>:* = accept only, for a local tunnel such as Porthole)
   int delay = 2;           // REV3_NET_DELAY: input delay D in frames (the host's value wins)
   bool rollback = false;   // REV3_NET_ROLLBACK=1: the arm gate may open (default 0 = pure lockstep)
   int max_rollback = 5;    // REV3_NET_ROLLBACK_MAX: MAXR, 1..7

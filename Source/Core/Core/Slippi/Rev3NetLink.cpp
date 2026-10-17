@@ -272,19 +272,25 @@ bool ParsePeerAddress(const std::string& text, PeerAddress* out, std::string* er
       return false;
     }
   }
+  if (port_text == "*")  // accept only (a local tunnel's proxy connects from a port nobody knows in advance)
+  {
+    out->host = host;
+    out->port = 0;
+    return true;
+  }
   u32 port = 0;
   for (char c : port_text)
   {
     if (c < '0' || c > '9' || port > 65535)
     {
-      *error = "the port is not a number";
+      *error = "the port is not a number (or * for accept only)";
       return false;
     }
     port = port * 10 + static_cast<u32>(c - '0');
   }
   if (port < 1 || port > 65535)
   {
-    *error = "the port must be 1..65535";
+    *error = "the port must be 1..65535 (or * for accept only)";
     return false;
   }
   out->host = host;

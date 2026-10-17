@@ -6,7 +6,9 @@
 //                    matchmaking, no user / login, no Rust objects, no spectator, no replay writing, no reporting. Direct connect only: both
 //                    emulators connect to each other at the same time from their fixed UDP ports (hole-punching style; the two connections that
 //                    result are both used, duplicates are dropped by the sequence numbers of Rev3NetLink.h). A connection from any other
-//                    address is refused, so a packet capture shows only the peer. PAD / ACK packets: Rev3NetLink.h PadLink. Reliable messages
+//                    address is refused, so a packet capture shows only the peer. Accept-only (peer port 0, REV3_NET_PEER=<ip>:*): this side
+//                    never connects out and takes the first connection from the peer's address at any port: the host of a session through
+//                    a local UDP tunnel (Porthole on Steam), whose proxy reaches us from 127.0.0.1:<unknown port>. PAD / ACK packets: Rev3NetLink.h PadLink. Reliable messages
 //                    0x90..0x93 on channel 0, PAD on channel 1 (unsequenced), ACK on channel 2 (unsequenced), like Slippi. One network thread owns
 //                    the ENet host; the CPU thread talks to it through a mutex-guarded PadLink / inbox / outbox, and a condition variable wakes
 //                    a waiting CPU thread the moment something arrives (WaitActivity).
@@ -59,7 +61,7 @@ public:
     Role role = Role::Host;
     u16 local_port = 2626;
     std::string peer_host;
-    u16 peer_port = 2627;
+    u16 peer_port = 2627;  // 0 = accept only: never connect out, take the first connection from peer_host at any port (PeerAddress::AcceptOnly)
     u32 connect_timeout_ms = 120000;
     NetSimConfig netsim;  // REV3_NETSIM; inactive = messages are processed as they arrive
   };

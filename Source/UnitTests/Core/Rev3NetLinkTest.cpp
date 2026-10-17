@@ -537,6 +537,27 @@ TEST(Rev3NetLink, PeerAddressParsing)
   }
   ASSERT_TRUE(ParsePeerAddress("10.0.0.1:65535", &a, &error));
   EXPECT_EQ(a.port, 65535);
+  EXPECT_FALSE(a.AcceptOnly());
+}
+
+TEST(Rev3NetLink, PeerAddressAcceptOnly)
+{
+  // "<ip>:*" = accept only: the host of a session through a local tunnel (Porthole) waits for the proxy's connection from any port.
+  PeerAddress a;
+  std::string error;
+  ASSERT_TRUE(ParsePeerAddress("127.0.0.1:*", &a, &error));
+  EXPECT_EQ(a.host, "127.0.0.1");
+  EXPECT_EQ(a.port, 0);
+  EXPECT_TRUE(a.AcceptOnly());
+  for (const char* bad : {"127.0.0.1:**", "127.0.0.1:*1", "127.0.0.1:0", ":*"})
+  {
+    EXPECT_FALSE(ParsePeerAddress(bad, &a, &error)) << bad;
+    EXPECT_NE(error.find("port"), std::string::npos) << bad;
+  }
+  const NetOptions o = ParseNetOptions(EnvOf({{"REV3_NET_ROLE", "host"}, {"REV3_NET_PEER", "127.0.0.1:*"}}));
+  ASSERT_TRUE(o.ok) << o.error;
+  EXPECT_TRUE(o.peer.AcceptOnly());
+  EXPECT_EQ(o.peer.host, "127.0.0.1");
 }
 
 TEST(Rev3NetLink, UnsetRoleMeansNoNetplay)
