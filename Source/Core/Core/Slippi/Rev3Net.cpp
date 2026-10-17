@@ -129,6 +129,8 @@ EnetTransport::~EnetTransport()
 
 std::string EnetTransport::PeerText() const
 {
+  if (m_cfg.peer_port == 0)
+    return Fmt("%s:* (accept only)", m_cfg.peer_host.c_str());
   return Fmt("%s:%u", m_cfg.peer_host.c_str(), static_cast<unsigned>(m_cfg.peer_port));
 }
 
@@ -306,6 +308,10 @@ void EnetTransport::ThreadMain()
   bool ever_connected = false;
   bool duplicate_noted = false;
   u32 attempts = 0;
+  const bool accept_only = m_cfg.peer_port == 0;  // REV3_NET_PEER=<ip>:* : wait for the peer (a tunnel's proxy), never connect out
+  if (accept_only)
+    PushEvent(Fmt("NET accept only: waiting for the peer to connect from %s (any port) on UDP %u", m_cfg.peer_host.c_str(),
+                  static_cast<unsigned>(m_cfg.local_port)));
   const u64 start_ms = Common::Timer::NowMs();
   u64 next_attempt_ms = start_ms;
   // REV3_NETSIM: every received message waits here until its release time. The ENet connect handshake is below this layer.
@@ -353,7 +359,7 @@ void EnetTransport::ThreadMain()
         notify();
         break;
       }
-      if ((connecting == nullptr || connecting->state == ENET_PEER_STATE_DISCONNECTED) && now_ms >= next_attempt_ms)
+      if (!accept_only && (connecting == nullptr || connecting->state == ENET_PEER_STATE_DISCONNECTED) && now_ms >= next_attempt_ms)
       {
         connecting = enet_host_connect(m_host, &peer_address, CHANNEL_COUNT, 0);
         next_attempt_ms = now_ms + RECONNECT_MS;
